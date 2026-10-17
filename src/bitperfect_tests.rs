@@ -47,20 +47,50 @@ fn ffmpeg(args: &[&str]) {
 
 /// Opens `path` through a throttled Download, as if it were streaming from Plex.
 fn stream(path: &Path) -> Download {
+    stream_flaky(path, &[])
+}
+
+/// Like `stream`, but the first connections fail after the given numbers of
+/// bytes (an error, or a silent early close for odd counts), forcing resumes.
+fn stream_flaky(path: &Path, failures: &[u64]) -> Download {
+    use std::io::{Seek, SeekFrom};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     let p = path.to_path_buf();
     let ext = p.extension().unwrap().to_string_lossy().to_string();
-    Download::start(&ext, move || {
-        struct Slow(std::fs::File);
+    let failures: Vec<u64> = failures.to_vec();
+    let calls = Arc::new(AtomicUsize::new(0));
+    Download::start(&ext, move |offset| {
+        struct Slow {
+            f: std::fs::File,
+            fail_after: Option<u64>,
+            sent: u64,
+        }
         impl Read for Slow {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 std::thread::sleep(std::time::Duration::from_micros(200));
-                let n = buf.len().min(7919); // odd chunk size to hit boundaries
-                self.0.read(&mut buf[..n])
+                let mut n = buf.len().min(7919); // odd chunk size to hit boundaries
+                if let Some(limit) = self.fail_after {
+                    if self.sent >= limit {
+                        return if limit % 2 == 0 {
+                            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+                        } else {
+                            Ok(0) // connection closed early without an error
+                        };
+                    }
+                    n = n.min((limit - self.sent) as usize);
+                }
+                let got = self.f.read(&mut buf[..n])?;
+                self.sent += got as u64;
+                Ok(got)
             }
         }
-        let f = std::fs::File::open(&p)?;
+        let call = calls.fetch_add(1, Ordering::Relaxed);
+        let mut f = std::fs::File::open(&p)?;
         let len = f.metadata()?.len();
-        Ok((Box::new(Slow(f)) as Box<dyn Read + Send>, Some(len)))
+        f.seek(SeekFrom::Start(offset))?;
+        let fail_after = failures.get(call).copied();
+        Ok((Box::new(Slow { f, fail_after, sent: 0 }) as Box<dyn Read + Send>, Some(len)))
     })
     .unwrap()
 }
@@ -200,6 +230,80 @@ fn alsa_output_writes_source_bits_unchanged() {
     assert_eq!(got.len(), original.len(), "captured length");
     assert!(got == original, "bytes sent to ALSA differ from the source PCM");
     for p in [&raw, &flac, &captured] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A connection that drops (twice) mid-file must not cut the track short:
+/// the download resumes and the output is still bit-identical.
+#[test]
+fn dropped_connection_resumes_bit_perfect() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let raw = tmp("resume.raw");
+    let flac = tmp("resume.flac");
+    make_noise_raw(&raw, 24, 96_000, 2, 3.0);
+    ffmpeg(&[
+        "-f", "s24le", "-ar", "96000", "-ac", "2", "-i", raw.to_str().unwrap(),
+        "-c:a", "flac", "-sample_fmt", "s32", flac.to_str().unwrap(),
+    ]);
+    // First connection resets after 300 000 bytes; the resumed one closes
+    // quietly after another 400 001; the third finishes the file.
+    let dl = stream_flaky(&flac, &[300_000, 400_001]);
+    let mut dec = Decoder::open(Box::new(dl.reader().unwrap()), Some("flac")).unwrap();
+    let mut ours = Vec::new();
+    while let Some(chunk) = dec.next_chunk().unwrap() {
+        SampleFmt::S24Packed.encode(chunk, &mut ours);
+    }
+    let original = std::fs::read(&raw).unwrap();
+    assert_eq!(ours.len(), original.len(), "track was cut short");
+    assert!(ours == original, "resumed download changed the audio");
+    for p in [&raw, &flac] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A damaged spot in the middle of a file must not end the track: the decoder
+/// skips the bad frames and plays the rest.
+#[test]
+fn damaged_frames_are_skipped_not_fatal() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let raw = tmp("damaged.raw");
+    let flac = tmp("damaged.flac");
+    make_noise_raw(&raw, 16, 44_100, 2, 6.0);
+    ffmpeg(&[
+        "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", raw.to_str().unwrap(),
+        "-c:a", "flac", flac.to_str().unwrap(),
+    ]);
+    // Overwrite 20 kB in the middle of the file with garbage.
+    let mut bytes = std::fs::read(&flac).unwrap();
+    let mid = bytes.len() / 2;
+    let mut x: u32 = 12345;
+    for b in &mut bytes[mid..mid + 20_000] {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        *b = (x >> 16) as u8;
+    }
+    std::fs::write(&flac, &bytes).unwrap();
+
+    let dl = stream(&flac);
+    let mut dec = Decoder::open(Box::new(dl.reader().unwrap()), Some("flac")).unwrap();
+    let mut frames = 0usize;
+    loop {
+        match dec.next_chunk() {
+            Ok(Some(chunk)) => frames += chunk.len() / 2,
+            Ok(None) => break,
+            Err(e) => panic!("damaged frames ended the track: {}", e),
+        }
+    }
+    let secs = frames as f64 / 44_100.0;
+    // ~6 s of audio; losing the damaged region costs well under a second.
+    assert!(secs > 5.0, "only {:.2}s decoded", secs);
+    for p in [&raw, &flac] {
         let _ = std::fs::remove_file(p);
     }
 }

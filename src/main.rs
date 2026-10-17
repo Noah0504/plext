@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod decode;
 mod download;
+mod log;
 mod output;
 mod player;
 mod plex;
@@ -77,6 +78,9 @@ fn real_main() -> Result<()> {
             match &cfg.library {
                 Some(l) => println!("Library:     {}", l.title),
                 None => println!("Library:     not set"),
+            }
+            if let Some(p) = log::path() {
+                println!("Log file:    {}", p.display());
             }
             match &cfg.device {
                 Some(d) => println!("Device:      {}", d),

@@ -57,6 +57,9 @@ plext                # start playing
 
 If no device is set, Plext picks the first USB audio device it finds.
 You can also choose one for a single session with `plext --device hw:1,0`.
+If a track is skipped or something goes wrong, the details are written to
+`~/.local/state/plext/plext.log`.
+
 `plext status` shows the current settings, and `plext inspect "Artist Name"` shows what your
 server reports about an artist's releases (useful if a release type looks wrong).
 

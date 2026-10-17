@@ -44,9 +44,12 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Download {
     /// Starts copying `open()`'s reader into a temp file on a background thread.
+    /// `open(offset)` must return a reader positioned at byte `offset` of the
+    /// file, plus the file's total size if known. It is called again to resume
+    /// if the connection drops.
     pub fn start<F>(ext: &str, open: F) -> Result<Download>
     where
-        F: FnOnce() -> Result<(Box<dyn Read + Send>, Option<u64>)> + Send + 'static,
+        F: Fn(u64) -> Result<(Box<dyn Read + Send>, Option<u64>)> + Send + 'static,
     {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
@@ -108,29 +111,67 @@ impl Drop for Download {
     }
 }
 
+/// Attempts in a row without receiving any data before giving up.
+const MAX_ATTEMPTS: u32 = 6;
+
 fn copy<F>(s: &Shared, mut file: File, open: F) -> Result<()>
 where
-    F: FnOnce() -> Result<(Box<dyn Read + Send>, Option<u64>)>,
+    F: Fn(u64) -> Result<(Box<dyn Read + Send>, Option<u64>)>,
 {
-    let (mut src, len) = open()?;
-    if let Some(len) = len {
-        s.total.store(len, Ordering::Relaxed);
-    }
     let mut buf = vec![0u8; 256 * 1024];
+    let mut written: u64 = 0;
+    let mut failures: u32 = 0;
     loop {
         if s.cancel.load(Ordering::Relaxed) {
             anyhow::bail!("cancelled");
         }
-        let n = match src.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        };
-        file.write_all(&buf[..n])?;
-        let mut p = s.progress.lock().unwrap();
-        p.written += n as u64;
-        s.cond.notify_all();
+        let before = written;
+        let result: Result<()> = (|| {
+            let (mut src, total) = open(written)?;
+            if let Some(t) = total {
+                s.total.store(t, Ordering::Relaxed);
+            }
+            loop {
+                if s.cancel.load(Ordering::Relaxed) {
+                    anyhow::bail!("cancelled");
+                }
+                let n = match src.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                file.write_all(&buf[..n])?;
+                written += n as u64;
+                let mut p = s.progress.lock().unwrap();
+                p.written = written;
+                s.cond.notify_all();
+            }
+            // A connection that closes early looks like a normal end of data.
+            let total = s.total.load(Ordering::Relaxed);
+            if total > 0 && written < total {
+                anyhow::bail!("connection closed after {} of {} bytes", written, total);
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => break,
+            Err(e) => {
+                if s.cancel.load(Ordering::Relaxed) {
+                    return Err(e);
+                }
+                // Any progress means the server is reachable: start counting afresh.
+                failures = if written > before { 1 } else { failures + 1 };
+                if failures >= MAX_ATTEMPTS {
+                    return Err(e.context(format!("download failed after {} attempts", failures)));
+                }
+                crate::log::write(&format!(
+                    "download interrupted at byte {} ({}); resuming",
+                    written, e
+                ));
+                std::thread::sleep(Duration::from_millis(250 * (1 << failures.min(4))));
+            }
+        }
     }
     file.flush()?;
     Ok(())

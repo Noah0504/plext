@@ -520,25 +520,42 @@ impl Server {
         Ok(tracks)
     }
 
-    /// Opens the original media file for streaming (no transcoding).
-    /// Returns the reader and the content length if the server reported one.
-    pub fn open_media(&self, part_key: &str) -> Result<(Box<dyn Read + Send>, Option<u64>)> {
+    /// Opens the original media file for streaming (no transcoding), starting
+    /// at byte `offset` (used to resume after a dropped connection).
+    /// Returns a reader positioned at `offset` and the file's total size if known.
+    pub fn open_media(&self, part_key: &str, offset: u64) -> Result<(Box<dyn Read + Send>, Option<u64>)> {
         let url = format!("{}{}", self.base, part_key);
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(60))
+            .timeout_read(Duration::from_secs(30))
             .build();
-        let resp = agent
+        let mut req = agent
             .get(&url)
             .set("X-Plex-Token", &self.token)
             .set("X-Plex-Client-Identifier", &self.plex.client_id)
-            .set("X-Plex-Product", PRODUCT)
-            .call()
-            .map_err(describe)?;
-        let len = resp
-            .header("Content-Length")
-            .and_then(|s| s.parse::<u64>().ok());
-        Ok((Box::new(resp.into_reader()), len))
+            .set("X-Plex-Product", PRODUCT);
+        if offset > 0 {
+            req = req.set("Range", &format!("bytes={}-", offset));
+        }
+        let resp = req.call().map_err(describe)?;
+        let partial = resp.status() == 206;
+        let total = if partial {
+            // "Content-Range: bytes 1000-1999/2000"
+            resp.header("Content-Range")
+                .and_then(|r| r.rsplit('/').next())
+                .and_then(|t| t.trim().parse::<u64>().ok())
+        } else {
+            resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok())
+        };
+        let mut reader: Box<dyn Read + Send> = Box::new(resp.into_reader());
+        if offset > 0 && !partial {
+            // The server ignored the range request: skip what we already have.
+            let skipped = std::io::copy(&mut (&mut reader).take(offset), &mut std::io::sink())?;
+            if skipped < offset {
+                return Err(anyhow!("file is shorter than expected"));
+            }
+        }
+        Ok((reader, total))
     }
 }
 

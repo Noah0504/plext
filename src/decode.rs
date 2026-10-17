@@ -34,6 +34,9 @@ pub struct Decoder {
     pub info: SourceInfo,
     sample_buf: Option<SampleBuffer<i32>>,
     time_base: Option<TimeBase>,
+    /// Damaged packets skipped so far, and the last reason given.
+    pub skipped: u32,
+    pub last_problem: Option<String>,
 }
 
 impl Decoder {
@@ -128,11 +131,16 @@ impl Decoder {
                 duration_secs,
             },
             sample_buf: None,
+            skipped: 0,
+            last_problem: None,
         })
     }
 
     /// Decodes the next chunk. Returns `None` at the end of the stream.
     pub fn next_chunk(&mut self) -> Result<Option<&[i32]>> {
+        // Consecutive unreadable packets; a damaged spot in a file is skipped,
+        // but a stream that is nothing but errors is given up on.
+        let mut bad = 0u32;
         loop {
             let packet = match self.format.next_packet() {
                 Ok(p) => p,
@@ -140,6 +148,14 @@ impl Decoder {
                     return Ok(None)
                 }
                 Err(SymError::ResetRequired) => return Ok(None),
+                // A corrupt frame header or lost sync: the reader resynchronises
+                // on the next call, so carry on with the rest of the track.
+                Err(SymError::DecodeError(msg)) if bad < 200 => {
+                    bad += 1;
+                    self.skipped += 1;
+                    self.last_problem = Some(msg.to_string());
+                    continue;
+                }
                 Err(e) => return Err(anyhow!("read error: {}", e)),
             };
             if packet.track_id() != self.track_id {
@@ -164,7 +180,12 @@ impl Decoder {
                     return Ok(Some(self.sample_buf.as_ref().unwrap().samples()));
                 }
                 // A corrupt packet: skip it rather than stopping the track.
-                Err(SymError::DecodeError(_)) => continue,
+                Err(SymError::DecodeError(msg)) if bad < 200 => {
+                    bad += 1;
+                    self.skipped += 1;
+                    self.last_problem = Some(msg.to_string());
+                    continue;
+                }
                 Err(e) => return Err(anyhow!("decode error: {}", e)),
             }
         }
