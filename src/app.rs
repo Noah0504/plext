@@ -57,6 +57,8 @@ pub struct App {
     header: HeaderInfo,
     player: Player,
     _reporter: Option<Reporter>,
+    /// Show release-type headings under an expanded artist.
+    group_releases: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 
@@ -89,6 +91,7 @@ impl App {
         header: HeaderInfo,
         device: String,
         report_playback: bool,
+        group_releases: bool,
     ) -> App {
         let (tx, rx) = mpsc::channel();
         let player = Player::spawn(server.clone(), device);
@@ -101,6 +104,7 @@ impl App {
         });
         let mut app = App {
             _reporter: reporter,
+            group_releases,
             server,
             library_key,
             header,
@@ -243,16 +247,22 @@ impl App {
             let key = &artists[i].key;
             if self.expanded.get(key).copied().unwrap_or(false) {
                 if let Some(Loadable::Ready(albums)) = self.albums.get(key) {
-                    // Albums arrive sorted by release type. Group them under
-                    // headings, unless the artist only has regular albums.
-                    let only_albums = albums.iter().all(|a| a.kind == ReleaseKind::Album);
-                    let mut current: Option<ReleaseKind> = None;
-                    for (j, al) in albums.iter().enumerate() {
-                        if !only_albums && current != Some(al.kind) {
-                            rows.push(Row::Heading(i, al.kind));
-                            current = Some(al.kind);
+                    if self.group_releases {
+                        // Albums arrive sorted by release type: put a heading
+                        // before the first release of each type.
+                        let mut current: Option<ReleaseKind> = None;
+                        for (j, al) in albums.iter().enumerate() {
+                            if current != Some(al.kind) {
+                                rows.push(Row::Heading(i, al.kind));
+                                current = Some(al.kind);
+                            }
+                            rows.push(Row::Album(i, j));
                         }
-                        rows.push(Row::Album(i, j));
+                    } else {
+                        // One list in release order, oldest first.
+                        let mut order: Vec<usize> = (0..albums.len()).collect();
+                        order.sort_by_key(|&j| (albums[j].year.unwrap_or(u32::MAX), albums[j].title.to_lowercase()));
+                        rows.extend(order.into_iter().map(|j| Row::Album(i, j)));
                     }
                 }
             }

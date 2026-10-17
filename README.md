@@ -88,6 +88,16 @@ To turn reporting off, add this to `~/.config/plext/config.toml`:
 report_playback = false
 ```
 
+## Options
+
+Settings live in `~/.config/plext/config.toml` (`plext status` shows the path).
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `device` | first USB DAC | ALSA output device; set it with `plext device <name>` |
+| `report_playback` | `true` | Report playback to Plex (dashboard, history, webhooks) |
+| `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |
+
 ## Bit-perfect notes
 
 - **Exclusive access.** While Plext is playing, the DAC is reserved for it. Other sounds won't play
