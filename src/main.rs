@@ -114,7 +114,14 @@ fn run(cfg: &mut Config, device_override: Option<String>) -> Result<()> {
     };
 
     let mut terminal = ratatui::init();
-    let result = app::App::new(server, library.key, header, device, cfg.report_playback.unwrap_or(true)).run(&mut terminal);
+    let result = app::App::new(
+        server,
+        library.key,
+        header,
+        device,
+        cfg.report_playback.unwrap_or(true),
+        cfg.group_releases.unwrap_or(true),
+    ).run(&mut terminal);
     ratatui::restore();
     result
 }

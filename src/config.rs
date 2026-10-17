@@ -19,6 +19,8 @@ pub struct Config {
     pub device: Option<String>,
     /// Report playback to Plex (now playing, play counts, webhooks). Default: on.
     pub report_playback: Option<bool>,
+    /// Group an artist's releases under headings (Albums, EPs, Live…). Default: on.
+    pub group_releases: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 //! Terminal user interface: artist/album tree, track list and now-playing bar.
 
 use crate::player::{Cmd, PlayState, Player, Status};
-use crate::plex::{khz, Album, Artist, Server, Track};
+use crate::plex::{khz, Album, Artist, ReleaseKind, Server, Track};
 use crate::report::Reporter;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -40,6 +40,8 @@ enum Focus {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Row {
     Artist(usize),
+    /// A release-type heading ("Albums", "EPs", …) under an expanded artist.
+    Heading(usize, ReleaseKind),
     Album(usize, usize),
 }
 
@@ -55,6 +57,8 @@ pub struct App {
     header: HeaderInfo,
     player: Player,
     _reporter: Option<Reporter>,
+    /// Show release-type headings under an expanded artist.
+    group_releases: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 
@@ -87,6 +91,7 @@ impl App {
         header: HeaderInfo,
         device: String,
         report_playback: bool,
+        group_releases: bool,
     ) -> App {
         let (tx, rx) = mpsc::channel();
         let player = Player::spawn(server.clone(), device);
@@ -99,6 +104,7 @@ impl App {
         });
         let mut app = App {
             _reporter: reporter,
+            group_releases,
             server,
             library_key,
             header,
@@ -241,8 +247,22 @@ impl App {
             let key = &artists[i].key;
             if self.expanded.get(key).copied().unwrap_or(false) {
                 if let Some(Loadable::Ready(albums)) = self.albums.get(key) {
-                    for j in 0..albums.len() {
-                        rows.push(Row::Album(i, j));
+                    if self.group_releases {
+                        // Albums arrive sorted by release type: put a heading
+                        // before the first release of each type.
+                        let mut current: Option<ReleaseKind> = None;
+                        for (j, al) in albums.iter().enumerate() {
+                            if current != Some(al.kind) {
+                                rows.push(Row::Heading(i, al.kind));
+                                current = Some(al.kind);
+                            }
+                            rows.push(Row::Album(i, j));
+                        }
+                    } else {
+                        // One list in release order, oldest first.
+                        let mut order: Vec<usize> = (0..albums.len()).collect();
+                        order.sort_by_key(|&j| (albums[j].year.unwrap_or(u32::MAX), albums[j].title.to_lowercase()));
+                        rows.extend(order.into_iter().map(|j| Row::Album(i, j)));
                     }
                 }
             }
@@ -298,8 +318,19 @@ impl App {
         if n == 0 {
             return;
         }
+        let rows = self.rows();
         let cur = self.tree_state.selected().unwrap_or(0) as i64;
-        let next = (cur + delta).clamp(0, n - 1);
+        let mut next = (cur + delta).clamp(0, n - 1);
+        // Headings can't be selected: keep going the same way, or turn back at the ends.
+        let step = if delta < 0 { -1 } else { 1 };
+        while matches!(rows.get(next as usize), Some(Row::Heading(..))) {
+            let further = next + step;
+            if further < 0 || further >= n {
+                next -= step;
+            } else {
+                next = further;
+            }
+        }
         self.tree_state.select(Some(next as usize));
         self.sync_shown_album();
     }
@@ -391,7 +422,7 @@ impl App {
                     self.sync_shown_album();
                     self.focus = Focus::Tracks;
                 }
-                None => {}
+                None | Some(Row::Heading(..)) => {}
             },
             KeyCode::Left | KeyCode::Char('h') => match self.current_row() {
                 Some(Row::Artist(i)) => self.set_expanded(i, false),
@@ -401,7 +432,7 @@ impl App {
                     let pos = rows.iter().position(|r| *r == Row::Artist(i));
                     self.tree_state.select(pos);
                 }
-                None => {}
+                None | Some(Row::Heading(..)) => {}
             },
             KeyCode::Enter => match self.current_row() {
                 Some(Row::Artist(i)) => {
@@ -422,7 +453,7 @@ impl App {
                         }
                     }
                 }
-                None => {}
+                None | Some(Row::Heading(..)) => {}
             },
             _ => {}
         }
@@ -524,6 +555,13 @@ impl App {
 
         let playing_album = self.player.status().track.map(|t| t.album);
         let rows = self.rows();
+        let grouped_artists: std::collections::HashSet<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Heading(i, _) => Some(*i),
+                _ => None,
+            })
+            .collect();
         let items: Vec<ListItem> = match &self.artists {
             Loadable::Loading => vec![ListItem::new(Span::styled(" Loading artists…", Style::default().fg(DIM)))],
             Loadable::Failed(e) => vec![ListItem::new(Span::styled(
@@ -552,19 +590,21 @@ impl App {
                         }
                         ListItem::new(Line::from(spans))
                     }
+                    Row::Heading(_, kind) => ListItem::new(Line::from(Span::styled(
+                        format!("    {}", kind.group_title()),
+                        Style::default().fg(FAINT).add_modifier(Modifier::BOLD),
+                    ))),
                     Row::Album(i, j) => {
                         let al = self.album(i, j).unwrap();
                         let playing = playing_album.as_deref() == Some(al.title.as_str());
-                        let mut spans = vec![Span::raw("    ")];
+                        let grouped = grouped_artists.contains(&i);
+                        let mut spans = vec![Span::raw(if grouped { "      " } else { "    " })];
                         if playing {
                             spans.push(Span::styled("♪ ", Style::default().fg(ACCENT)));
                         }
                         spans.push(Span::styled(al.title.clone(), Style::default().fg(DIM)));
                         if let Some(y) = al.year {
                             spans.push(Span::styled(format!(" ({})", y), Style::default().fg(FAINT)));
-                        }
-                        if let Some(kind) = al.kind.label() {
-                            spans.push(Span::styled(format!(" · {}", kind), Style::default().fg(FAINT)));
                         }
                         ListItem::new(Line::from(spans))
                     }

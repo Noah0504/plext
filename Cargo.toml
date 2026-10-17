@@ -1,6 +1,6 @@
 [package]
 name = "plext"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "A terminal music player for Plex with bit-perfect playback straight to your DAC"
 repository = "https://github.com/Noah0504/plext"
