@@ -37,6 +37,21 @@ pub enum ReleaseKind {
 }
 
 impl ReleaseKind {
+    /// Heading for a group of releases of this type in the artist tree.
+    pub fn group_title(self) -> &'static str {
+        match self {
+            ReleaseKind::Album => "Albums",
+            ReleaseKind::Ep => "EPs",
+            ReleaseKind::Single => "Singles",
+            ReleaseKind::Live => "Live",
+            ReleaseKind::Compilation => "Compilations",
+            ReleaseKind::Soundtrack => "Soundtracks",
+            ReleaseKind::Demo => "Demos",
+            ReleaseKind::Remix => "Remixes",
+            ReleaseKind::Other => "Other",
+        }
+    }
+
     /// Short label shown after the album title; none for regular albums.
     pub fn label(self) -> Option<&'static str> {
         match self {

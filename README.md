@@ -28,8 +28,9 @@ all from a single static binary for Linux.
   **◆ BIT-PERFECT** only when every bit reaches the DAC unaltered.
 - **Gapless playback** between tracks of the same format; the next track is pre-fetched.
 - **Formats:** FLAC, ALAC, WAV, AIFF (lossless), plus MP3, AAC, Vorbis.
-- **All release types**: albums, EPs, singles, live albums, compilations and more, labeled in the
-  artist tree.
+- **All release types**: albums, EPs, singles, live albums, compilations and more, grouped under
+  headings when you expand an artist (using the release types Plex reads from your tags, the same
+  classification MusicBrainz uses).
 - **Reports playback to Plex** like official players do, so plays show up in Plex's dashboard and
   history, count toward play counts, and trigger webhooks (`media.play`, `media.pause`,
   `media.resume`, `media.stop`, `media.scrobble`).
