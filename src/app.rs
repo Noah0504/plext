@@ -13,7 +13,7 @@ use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ACCENT: Color = Color::Rgb(0xe5, 0xa0, 0x0d);
 const FG: Color = Color::Rgb(0xc9, 0xd1, 0xd9);
@@ -77,6 +77,9 @@ pub struct App {
     /// Album to start playing as soon as its tracks arrive.
     play_when_loaded: Option<(String, usize)>,
     quit: bool,
+    /// The last error we've seen from the player, and when it appeared.
+    seen_error_seq: u64,
+    error_since: Option<Instant>,
 }
 
 pub struct HeaderInfo {
@@ -123,6 +126,8 @@ impl App {
             shown_album: None,
             play_when_loaded: None,
             quit: false,
+            seen_error_seq: 0,
+            error_since: None,
         };
         app.load_artists();
         app
@@ -134,6 +139,10 @@ impl App {
                 self.on_msg(m);
             }
             let status = self.player.status();
+            if status.error_seq != self.seen_error_seq {
+                self.seen_error_seq = status.error_seq;
+                self.error_since = Some(Instant::now());
+            }
             terminal.draw(|f| self.draw(f, &status))?;
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(k) = event::read()? {
@@ -501,7 +510,11 @@ impl App {
             .split(outer[1]);
         self.draw_tree(f, main[0]);
         self.draw_tracks(f, main[1], st);
-        draw_now_playing(f, outer[2], st);
+        // Errors stay up long enough to read, even if the next track has started.
+        let show_error = self
+            .error_since
+            .map_or(false, |t| t.elapsed() < Duration::from_secs(15));
+        draw_now_playing(f, outer[2], st, show_error);
         self.draw_keys(f, outer[3]);
     }
 
@@ -753,7 +766,7 @@ fn track_line(num: &str, title: &str, fmt: &str, time: &str, width: usize, style
     ))
 }
 
-fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status) {
+fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, show_error: bool) {
     let active = matches!(st.state, PlayState::Playing | PlayState::Paused | PlayState::Loading);
     let edge = if st.state == PlayState::Playing { ACCENT } else if active { DIM } else { BORDER };
     let mut block = Block::default()
@@ -848,7 +861,7 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status) {
     );
 
     // Line 3: source and output details, or the last error.
-    if let Some(e) = &st.error {
+    if let (Some(e), true) = (&st.error, show_error) {
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ⚠ {}", e), Style::default().fg(WARN))),
             rows[2],

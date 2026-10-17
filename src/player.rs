@@ -40,6 +40,8 @@ pub struct Status {
     pub queue_pos: usize,
     pub queue_len: usize,
     pub error: Option<String>,
+    /// Increases with every new error, so the UI can tell a new one apart.
+    pub error_seq: u64,
 }
 
 impl Status {
@@ -148,6 +150,14 @@ impl Engine {
         }
     }
 
+    /// Shows an error in the UI and records it in the log file.
+    fn fail(&self, msg: String) {
+        crate::log::write(&format!("error: {}", msg));
+        let mut s = self.status.lock().unwrap();
+        s.error = Some(msg);
+        s.error_seq += 1;
+    }
+
     fn set<F: FnOnce(&mut Status)>(&self, f: F) {
         f(&mut self.status.lock().unwrap());
     }
@@ -159,13 +169,12 @@ impl Engine {
             .ok_or_else(|| format!("\"{}\" has no media file", track.title))?;
         let ext = track.container.clone().unwrap_or_default();
         let server = self.server.clone();
-        Download::start(&ext, move || server.open_media(&part)).map_err(|e| e.to_string())
+        Download::start(&ext, move |off| server.open_media(&part, off)).map_err(|e| e.to_string())
     }
 
     /// Plays the queue from `idx`. Returns a command that interrupted it, if any.
     fn play_queue(&mut self, queue: Vec<Track>, mut idx: usize) -> Option<Cmd> {
         let mut prefetch: Option<(usize, Download)> = None;
-        self.set(|s| s.error = None);
         let pending = loop {
             if idx >= queue.len() {
                 // Natural end of the queue: let the last notes ring out.
@@ -179,7 +188,7 @@ impl Engine {
                 _ => match self.start_download(&queue[idx]) {
                     Ok(d) => d,
                     Err(e) => {
-                        self.set(|s| s.error = Some(e));
+                        self.fail(e);
                         idx += 1;
                         continue;
                     }
@@ -199,11 +208,11 @@ impl Engine {
                 End::Restart => self.flush(),
                 End::Skip(e) => {
                     self.flush();
-                    self.set(|s| s.error = Some(e));
+                    self.fail(format!("{} (skipped to the next track)", e));
                     idx += 1;
                 }
                 End::Fatal(e) => {
-                    self.set(|s| s.error = Some(e));
+                    self.fail(e);
                     break None;
                 }
                 End::Stop => {
@@ -286,8 +295,11 @@ impl Engine {
             s.output = Some(out.info.clone());
             s.dur = dur;
             s.state = PlayState::Playing;
-            s.error = None;
         }
+        crate::log::write(&format!(
+            "playing \"{}\" — {} ({} {}-bit/{} Hz)",
+            track.title, track.artist, dec.info.codec, dec.info.bits, dec.info.rate
+        ));
 
         let rate = spec.rate as f64;
         let channels = spec.channels as usize;
@@ -375,7 +387,7 @@ impl Engine {
                 if let Some(part) = next.part_key.clone() {
                     let ext = next.container.clone().unwrap_or_default();
                     let server = self.server.clone();
-                    if let Ok(d) = Download::start(&ext, move || server.open_media(&part)) {
+                    if let Ok(d) = Download::start(&ext, move |off| server.open_media(&part, off)) {
                         *prefetch = Some((idx + 1, d));
                     }
                 }
@@ -390,7 +402,28 @@ impl Engine {
                     frames += n as u64;
                     self.status.lock().unwrap().pos = pos_of(base, frames, out);
                 }
-                Ok(None) => return End::Finished,
+                Ok(None) => {
+                    let pos = pos_of(base, frames, out);
+                    if dec.skipped > 0 {
+                        crate::log::write(&format!(
+                            "\"{}\": skipped {} damaged frame(s) (last: {})",
+                            track.title,
+                            dec.skipped,
+                            dec.last_problem.as_deref().unwrap_or("?")
+                        ));
+                    }
+                    // Ending well before the expected length means data went missing.
+                    let decoded = base + frames as f64 / rate;
+                    if let Some(d) = dur {
+                        if decoded + 3.0 < d {
+                            crate::log::write(&format!(
+                                "\"{}\" ended early: decoded {:.1}s of {:.1}s (heard to {:.1}s)",
+                                track.title, decoded, d, pos
+                            ));
+                        }
+                    }
+                    return End::Finished;
+                }
                 Err(e) => return End::Skip(format!("{}: {}", track.title, e)),
             }
         }
