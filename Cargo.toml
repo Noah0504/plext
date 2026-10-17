@@ -3,6 +3,7 @@ name = "plext"
 version = "0.3.0"
 edition = "2021"
 description = "A terminal music player for Plex with bit-perfect playback straight to your DAC"
+license = "MIT"
 repository = "https://github.com/Noah0504/plext"
 readme = "README.md"
 
