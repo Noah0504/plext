@@ -39,7 +39,8 @@ jobs:
         shell: bash
         env:
           PKG_CONFIG_ALL_STATIC: "1"
-          RUSTFLAGS: "-C target-feature=+crt-static"
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           set -o pipefail
           if ! cargo test --release --locked 2>&1 | tee test.log; then
@@ -52,20 +53,21 @@ jobs:
       - name: Build
         env:
           PKG_CONFIG_ALL_STATIC: "1"
-          RUSTFLAGS: "-C target-feature=+crt-static"
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           cargo build --release --locked
-          file target/release/plext
+          file target/x86_64-unknown-linux-musl/release/plext
           # Fail if the binary depends on any shared library.
-          if file target/release/plext | grep -q "dynamically linked"; then
+          if file target/x86_64-unknown-linux-musl/release/plext | grep -q "dynamically linked"; then
             echo "binary is not static"; exit 1
           fi
-          ./target/release/plext --version
+          ./target/x86_64-unknown-linux-musl/release/plext --version
 
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/plext dist/
+          cp target/x86_64-unknown-linux-musl/release/plext dist/
           cp README.md dist/
           tar -C dist -czf plext-x86_64-linux.tar.gz plext README.md
           sha256sum plext-x86_64-linux.tar.gz > plext-x86_64-linux.tar.gz.sha256
