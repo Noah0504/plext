@@ -1,0 +1,78 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ALSA_VERSION: "1.2.13"
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    # Alpine uses musl, which lets us produce a fully static binary that runs on any distro.
+    container: rust:alpine
+    steps:
+      - name: Install build tools
+        run: apk add --no-cache build-base musl-dev pkgconf linux-headers curl tar bzip2 file ffmpeg git
+
+      - uses: actions/checkout@v4
+
+      # Alpine doesn't ship a static libasound, so build one.
+      - name: Build static alsa-lib ${{ env.ALSA_VERSION }}
+        run: |
+          curl -fsSL "https://www.alsa-project.org/files/pub/lib/alsa-lib-${ALSA_VERSION}.tar.bz2" | tar xj -C /tmp
+          cd /tmp/alsa-lib-${ALSA_VERSION}
+          ./configure --prefix=/usr --sysconfdir=/etc --with-configdir=/usr/share/alsa \
+            --enable-static --disable-shared --disable-python --disable-topology \
+            --disable-ucm --disable-aload --without-debug
+          make -j"$(nproc)"
+          make install
+
+      - name: Test
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo test --release --locked
+
+      - name: Build
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build --release --locked
+          file target/release/plext
+          # Fail if the binary depends on any shared library.
+          if file target/release/plext | grep -q "dynamically linked"; then
+            echo "binary is not static"; exit 1
+          fi
+          ./target/release/plext --version
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/plext dist/
+          cp README.md dist/
+          tar -C dist -czf plext-x86_64-linux.tar.gz plext README.md
+          sha256sum plext-x86_64-linux.tar.gz > plext-x86_64-linux.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plext-x86_64-linux
+          path: |
+            plext-x86_64-linux.tar.gz
+            plext-x86_64-linux.tar.gz.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            plext-x86_64-linux.tar.gz
+            plext-x86_64-linux.tar.gz.sha256

@@ -1,0 +1,26 @@
+[package]
+name = "plext"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal music player for Plex with bit-perfect playback straight to your DAC"
+repository = "https://github.com/Noah0504/plext"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+alsa = "0.9"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symphonia = { version = "0.5", features = ["all"] }
+toml = "0.8"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
