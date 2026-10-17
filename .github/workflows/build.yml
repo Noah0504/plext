@@ -20,7 +20,7 @@ jobs:
     container: rust:alpine
     steps:
       - name: Install build tools
-        run: apk add --no-cache build-base musl-dev pkgconf linux-headers curl tar bzip2 file ffmpeg git
+        run: apk add --no-cache build-base musl-dev pkgconf linux-headers curl tar bzip2 file ffmpeg git bash
 
       - uses: actions/checkout@v4
 
@@ -36,10 +36,18 @@ jobs:
           make install
 
       - name: Test
+        shell: bash
         env:
           PKG_CONFIG_ALL_STATIC: "1"
           RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo test --release --locked
+        run: |
+          set -o pipefail
+          if ! cargo test --release --locked 2>&1 | tee test.log; then
+            # Surface the failure as an annotation so it's visible without downloading logs.
+            msg=$(grep -vE '^\s+(Compiling|Downloaded|Downloading) ' test.log | tail -60 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
+            echo "::error title=cargo test failed::${msg}"
+            exit 1
+          fi
 
       - name: Build
         env:
