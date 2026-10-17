@@ -124,3 +124,19 @@ cargo test --release   # bit-perfect tests; needs ffmpeg
 The tests encode random audio with ffmpeg, stream it through Plext's download, decode and
 output path (including the real ALSA output code, captured with ALSA's `file` device), and check
 every byte matches the source.
+
+## License
+
+Plext is released under the [MIT License](LICENSE). The release binary also includes
+third-party libraries under their own licenses, listed in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md). If you change Plext's dependencies,
+regenerate that file with `cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md`
+(install with `cargo install cargo-about --features cli`).
+
+## About this project
+
+Plext was built with Claude, Anthropic's AI model, under the direction of Noah Duffy, and is
+tested on real hardware. The bit-perfect claims are backed by the automated tests described
+above, which run on every build.
+
+Plext is an independent project and is not affiliated with or endorsed by Plex, Inc.
