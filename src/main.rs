@@ -5,6 +5,7 @@ mod download;
 mod output;
 mod player;
 mod plex;
+mod report;
 
 #[cfg(test)]
 mod bitperfect_tests;
@@ -103,14 +104,14 @@ fn run(cfg: &mut Config, device_override: Option<String>) -> Result<()> {
         .or_else(output::guess_device)
         .unwrap_or_else(|| "default".to_string());
 
-    let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token);
+    let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token, &server_cfg.machine_id);
     let header = app::HeaderInfo {
         server_name: server_cfg.name.clone(),
         library_title: library.title.clone(),
     };
 
     let mut terminal = ratatui::init();
-    let result = app::App::new(server, library.key, header, device).run(&mut terminal);
+    let result = app::App::new(server, library.key, header, device, cfg.report_playback.unwrap_or(true)).run(&mut terminal);
     ratatui::restore();
     result
 }
@@ -194,7 +195,7 @@ fn login(cfg: &mut Config) -> Result<()> {
     });
 
     // Library
-    let server = Server::new(plex_client, &url, &res.token);
+    let server = Server::new(plex_client, &url, &res.token, &res.machine_id);
     let libs = server.music_libraries()?;
     if libs.is_empty() {
         bail!("\"{}\" has no music libraries", res.name);

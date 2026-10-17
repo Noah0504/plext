@@ -89,6 +89,11 @@ impl Player {
         let _ = self.tx.send(cmd);
     }
 
+    /// Shared handle to the live status (used by the Plex progress reporter).
+    pub fn status_handle(&self) -> Arc<Mutex<Status>> {
+        self.status.clone()
+    }
+
     pub fn status(&self) -> Status {
         self.status.lock().unwrap().clone()
     }
@@ -289,6 +294,7 @@ impl Engine {
         let mut base = 0.0_f64; // position (s) where `frames` started counting
         let mut frames: u64 = 0;
         let mut paused = false;
+        let mut resume_from: Option<f64> = None;
         let pos_of = |base: f64, frames: u64, out: &Output| -> f64 {
             base + (frames as i64 - out.delay()).max(0) as f64 / rate
         };
@@ -312,10 +318,22 @@ impl Engine {
                 match cmd {
                     Cmd::TogglePause => {
                         paused = !paused;
-                        out.set_paused(paused);
-                        let st = if paused { PlayState::Paused } else { PlayState::Playing };
-                        self.status.lock().unwrap().state = st;
-                        if !paused {
+                        if paused {
+                            let heard = pos_of(base, frames, out);
+                            if !out.set_paused(true) {
+                                // The DAC can't pause, so its buffer was discarded.
+                                resume_from = Some(heard);
+                            }
+                            let mut s = self.status.lock().unwrap();
+                            s.state = PlayState::Paused;
+                            s.pos = heard;
+                        } else {
+                            out.set_paused(false);
+                            if let Some(p) = resume_from.take() {
+                                base = dec.seek(p).unwrap_or(p);
+                                frames = 0;
+                            }
+                            self.status.lock().unwrap().state = PlayState::Playing;
                             break;
                         }
                     }
@@ -334,6 +352,7 @@ impl Engine {
                             target = target.min((dur - 1.0).max(0.0));
                         }
                         out.flush();
+                        resume_from = None;
                         if paused {
                             paused = false;
                             self.status.lock().unwrap().state = PlayState::Playing;

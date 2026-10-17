@@ -17,6 +17,8 @@ pub struct Config {
     pub library: Option<LibraryConfig>,
     /// ALSA output device, e.g. "hw:CARD=DAC,DEV=0" or "hw:1,0".
     pub device: Option<String>,
+    /// Report playback to Plex (now playing, play counts, webhooks). Default: on.
+    pub report_playback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +77,7 @@ impl Config {
     }
 }
 
-fn new_client_id() -> String {
+pub fn new_client_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

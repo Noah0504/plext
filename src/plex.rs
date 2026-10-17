@@ -19,12 +19,77 @@ pub struct Album {
     pub key: String,
     pub title: String,
     pub year: Option<u32>,
+    pub kind: ReleaseKind,
+}
+
+/// Plex's release types, in the order an artist's releases are listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReleaseKind {
+    Album,
+    Ep,
+    Single,
+    Live,
+    Compilation,
+    Soundtrack,
+    Demo,
+    Remix,
+    Other,
+}
+
+impl ReleaseKind {
+    /// Short label shown after the album title; none for regular albums.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            ReleaseKind::Album => None,
+            ReleaseKind::Ep => Some("EP"),
+            ReleaseKind::Single => Some("Single"),
+            ReleaseKind::Live => Some("Live"),
+            ReleaseKind::Compilation => Some("Compilation"),
+            ReleaseKind::Soundtrack => Some("Soundtrack"),
+            ReleaseKind::Demo => Some("Demo"),
+            ReleaseKind::Remix => Some("Remix"),
+            ReleaseKind::Other => Some("Other"),
+        }
+    }
+
+    /// Reads the release type from an album's `Format` and `Subformat` tags
+    /// (e.g. Format "EP", Subformat "Live").
+    fn from_metadata(m: &Value) -> ReleaseKind {
+        let tags: Vec<String> = ["Format", "Subformat"]
+            .iter()
+            .flat_map(|k| m[*k].as_array().into_iter().flatten())
+            .filter_map(|t| t["tag"].as_str())
+            .map(|t| t.to_lowercase())
+            .collect();
+        let has = |w: &str| tags.iter().any(|t| t.contains(w));
+        if has("live") {
+            ReleaseKind::Live
+        } else if has("compilation") {
+            ReleaseKind::Compilation
+        } else if has("soundtrack") {
+            ReleaseKind::Soundtrack
+        } else if has("demo") {
+            ReleaseKind::Demo
+        } else if has("remix") {
+            ReleaseKind::Remix
+        } else if has("ep") && !has("album") {
+            ReleaseKind::Ep
+        } else if has("single") {
+            ReleaseKind::Single
+        } else if tags.is_empty() || has("album") {
+            ReleaseKind::Album
+        } else {
+            ReleaseKind::Other
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Track {
     pub key: String,
     pub title: String,
+    /// Rating key of the album this track belongs to.
+    pub album_key: Option<String>,
     /// Track artist (falls back to the album artist).
     pub artist: String,
     pub album: String,
@@ -228,15 +293,95 @@ pub struct Server {
     plex: Plex,
     pub base: String,
     pub token: String,
+    pub machine_id: String,
+}
+
+/// A play queue created on the server, so Plex can track what we're playing.
+#[derive(Debug, Clone)]
+pub struct PlayQueue {
+    pub id: u64,
+    /// Track rating key -> playQueueItemID
+    pub items: Vec<(String, u64)>,
+}
+
+impl PlayQueue {
+    pub fn item_id(&self, track_key: &str) -> Option<u64> {
+        self.items.iter().find(|(k, _)| k == track_key).map(|(_, id)| *id)
+    }
+}
+
+/// One progress report for the server ("timeline"). Plex derives its
+/// now-playing sessions, play counts and webhooks from these.
+pub struct Timeline<'a> {
+    pub track: &'a Track,
+    pub state: &'static str, // "playing" | "paused" | "stopped"
+    pub time_ms: u64,
+    pub queue: Option<&'a PlayQueue>,
 }
 
 impl Server {
-    pub fn new(plex: Plex, base: &str, token: &str) -> Server {
+    pub fn new(plex: Plex, base: &str, token: &str, machine_id: &str) -> Server {
         Server {
             plex,
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            machine_id: machine_id.to_string(),
         }
+    }
+
+    /// Creates a play queue for an album on the server.
+    pub fn create_play_queue(&self, album_key: &str) -> Result<PlayQueue> {
+        let uri = format!(
+            "server://{}/com.plexapp.plugins.library/library/metadata/{}",
+            self.machine_id, album_key
+        );
+        let url = format!(
+            "{}/playQueues?type=audio&shuffle=0&repeat=0&continuous=0&own=1&uri={}",
+            self.base,
+            encode(&uri)
+        );
+        let resp = self
+            .plex
+            .req("POST", &url, Some(&self.token))
+            .call()
+            .map_err(describe)?;
+        let v: Value = resp.into_json()?;
+        let id = v["MediaContainer"]["playQueueID"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("no playQueueID in response"))?;
+        let items = items(&v, "Metadata")
+            .filter_map(|m| Some((str_of(&m["ratingKey"]), m["playQueueItemID"].as_u64()?)))
+            .collect();
+        Ok(PlayQueue { id, items })
+    }
+
+    /// Reports playback progress to the server.
+    pub fn report_timeline(&self, t: &Timeline, session_id: &str) -> Result<()> {
+        let mut url = format!(
+            "{}/:/timeline?ratingKey={}&key={}&state={}&time={}&hasMDE=1",
+            self.base,
+            encode(&t.track.key),
+            encode(&format!("/library/metadata/{}", t.track.key)),
+            t.state,
+            t.time_ms,
+        );
+        if let Some(d) = t.track.duration_ms {
+            url.push_str(&format!("&duration={}", d));
+        }
+        if let Some(q) = t.queue {
+            url.push_str(&format!("&containerKey={}", encode(&format!("/playQueues/{}", q.id))));
+            if let Some(item) = q.item_id(&t.track.key) {
+                url.push_str(&format!("&playQueueItemID={}", item));
+            }
+        }
+        self.plex
+            .req("GET", &url, Some(&self.token))
+            .set("X-Plex-Provides", "player")
+            .set("X-Plex-Session-Identifier", session_id)
+            .timeout(Duration::from_secs(5))
+            .call()
+            .map_err(describe)?;
+        Ok(())
     }
 
     fn get(&self, path: &str) -> Result<Value> {
@@ -265,17 +410,49 @@ impl Server {
             .collect())
     }
 
-    pub fn albums(&self, artist_key: &str) -> Result<Vec<Album>> {
-        let v = self.get(&format!("/library/metadata/{}/children", artist_key))?;
-        let mut albums: Vec<Album> = items(&v, "Metadata")
-            .filter(|m| m["type"].as_str().map_or(true, |t| t == "album"))
-            .map(|m| Album {
-                key: str_of(&m["ratingKey"]),
-                title: str_of(&m["title"]),
-                year: m["year"].as_u64().map(|y| y as u32),
-            })
-            .collect();
-        albums.sort_by_key(|a| a.year.unwrap_or(u32::MAX));
+    /// All releases by an artist: albums, EPs, singles, live albums, compilations…
+    pub fn albums(&self, library_key: &str, artist_key: &str) -> Result<Vec<Album>> {
+        let parse = |v: &Value| -> Vec<Album> {
+            items(v, "Metadata")
+                .filter(|m| m["type"].as_str().map_or(true, |t| t == "album"))
+                .map(|m| Album {
+                    key: str_of(&m["ratingKey"]),
+                    title: str_of(&m["title"]),
+                    year: m["year"].as_u64().map(|y| y as u32),
+                    kind: ReleaseKind::from_metadata(m),
+                })
+                .collect()
+        };
+        // Filtering the library by artist returns every release type; an artist's
+        // "children" may list only regular albums on servers that group releases.
+        let filtered = self
+            .get(&format!(
+                "/library/sections/{}/all?type=9&artist.id={}",
+                library_key, artist_key
+            ))
+            .map(|v| parse(&v));
+        let children = self
+            .get(&format!("/library/metadata/{}/children", artist_key))
+            .map(|v| parse(&v));
+        let mut albums = match (filtered, children) {
+            (Err(e), Err(_)) => return Err(e),
+            (a, b) => {
+                let mut all = a.unwrap_or_default();
+                for al in b.unwrap_or_default() {
+                    match all.iter_mut().find(|x| x.key == al.key) {
+                        // Keep the more specific release type if the two disagree.
+                        Some(x) if x.kind == ReleaseKind::Album => x.kind = al.kind,
+                        Some(_) => {}
+                        None => all.push(al),
+                    }
+                }
+                all
+            }
+        };
+        albums.sort_by(|a, b| {
+            (a.kind, a.year.unwrap_or(u32::MAX), a.title.to_lowercase())
+                .cmp(&(b.kind, b.year.unwrap_or(u32::MAX), b.title.to_lowercase()))
+        });
         Ok(albums)
     }
 
@@ -326,6 +503,7 @@ fn merge(base: Track, full: Track) -> Track {
     Track {
         key: base.key,
         title: if full.title.is_empty() { base.title } else { full.title },
+        album_key: full.album_key.or(base.album_key),
         artist: if full.artist.is_empty() { base.artist } else { full.artist },
         album: if full.album.is_empty() { base.album } else { full.album },
         index: full.index.or(base.index),
@@ -369,6 +547,7 @@ fn parse_track(m: &Value) -> Track {
     Track {
         key: str_of(&m["ratingKey"]),
         title: str_of(&m["title"]),
+        album_key: Some(str_of(&m["parentRatingKey"])).filter(|s| !s.is_empty()),
         artist,
         album: str_of(&m["parentTitle"]),
         index: m["index"].as_u64().map(|n| n as u32),
@@ -388,6 +567,18 @@ fn parse_track(m: &Value) -> Track {
             .or_else(|| media.and_then(|md| md["container"].as_str()))
             .map(String::from),
     }
+}
+
+/// Percent-encodes a value for use in a query string.
+fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 fn items<'a>(v: &'a Value, kind: &str) -> impl Iterator<Item = &'a Value> {

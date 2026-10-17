@@ -16,7 +16,7 @@ all from a single static binary for Linux.
 ╭───────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ▶ PLAYING  Northbound   Delta Quartet — Northbound Winter                             ◆ BIT-PERFECT   │
 │ 3:12    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────────────────────────────────     7:31   │
-│ FLAC · 24-bit / 192 kHz · stereo         out: hw:CARD=DAC,DEV=0 · S24_3LE · exclusive · no resample │
+│ FLAC · 24-bit / 192 kHz · stereo               out: USB DAC · S24_3LE · exclusive · no resample │
 ╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -28,6 +28,11 @@ all from a single static binary for Linux.
   **◆ BIT-PERFECT** only when every bit reaches the DAC unaltered.
 - **Gapless playback** between tracks of the same format; the next track is pre-fetched.
 - **Formats:** FLAC, ALAC, WAV, AIFF (lossless), plus MP3, AAC, Vorbis.
+- **All release types**: albums, EPs, singles, live albums, compilations and more, labeled in the
+  artist tree.
+- **Reports playback to Plex** like official players do, so plays show up in Plex's dashboard and
+  history, count toward play counts, and trigger webhooks (`media.play`, `media.pause`,
+  `media.resume`, `media.stop`, `media.scrobble`).
 - **Plex sign-in with a link code**, automatic server discovery, LAN and remote connections.
 - **Single static binary**: no dependencies to install.
 
@@ -68,6 +73,18 @@ You can also choose one for a single session with `plext --device hw:1,0`.
 | `Tab` | Switch pane |
 | `/` | Filter artists (`Esc` clears) |
 | `q` | Quit |
+
+## Plex integration
+
+While you listen, Plext reports progress to your server every 10 seconds and whenever you play,
+pause, skip or stop. Plex marks a track as played (and sends `media.scrobble`) once you're about
+90% of the way through. Webhooks require Plex Pass and are configured on the server.
+
+To turn reporting off, add this to `~/.config/plext/config.toml`:
+
+```toml
+report_playback = false
+```
 
 ## Bit-perfect notes
 

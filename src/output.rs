@@ -107,7 +107,8 @@ pub struct StreamSpec {
 
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
-    pub device: String,
+    /// Human-friendly name, e.g. the DAC's card name.
+    pub label: String,
     pub rate: u32,
     pub fmt: SampleFmt,
     /// Direct hardware access (no ALSA plugin layer).
@@ -165,7 +166,7 @@ impl Output {
 
         Ok(Output {
             info: OutputInfo {
-                device: device.to_string(),
+                label: friendly_name(device),
                 rate: spec.rate,
                 fmt,
                 direct: is_direct(device),
@@ -199,18 +200,19 @@ impl Output {
         Ok(())
     }
 
-    pub fn set_paused(&mut self, paused: bool) {
-        if self.can_pause {
-            if self.pcm.pause(paused).is_ok() {
-                return;
-            }
+    /// Pauses or resumes. Returns false if the hardware can't pause and the
+    /// queued audio was discarded instead (the caller should then resume by
+    /// seeking back to the position that was actually heard).
+    pub fn set_paused(&mut self, paused: bool) -> bool {
+        if self.can_pause && self.pcm.pause(paused).is_ok() {
+            return true;
         }
-        // Hardware without pause support: stop now, restart on resume.
         if paused {
             let _ = self.pcm.drop();
         } else {
             let _ = self.pcm.prepare();
         }
+        false
     }
 
     /// Discards whatever is still queued in the hardware buffer (skip/seek/stop).
@@ -251,6 +253,24 @@ fn configure(pcm: &PCM, spec: StreamSpec, fmt: SampleFmt) -> Result<()> {
     let _ = hwp.set_period_time_near(50_000, ValueOr::Nearest);
     pcm.hw_params(&hwp)?;
     Ok(())
+}
+
+/// The sound card's name for a device string: "hw:CARD=D90,DEV=0" or "hw:1,0"
+/// becomes e.g. "Topping D90". Other device strings are returned unchanged.
+pub fn friendly_name(device: &str) -> String {
+    let spec = device
+        .strip_prefix("hw:")
+        .or_else(|| device.strip_prefix("plughw:"));
+    let card = spec.map(|s| {
+        let first = s.split(',').next().unwrap_or("");
+        first.strip_prefix("CARD=").unwrap_or(first).to_string()
+    });
+    card.and_then(|c| std::ffi::CString::new(c).ok())
+        .and_then(|c| alsa::card::Card::from_str(&c).ok())
+        .and_then(|c| c.get_name().ok())
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| device.to_string())
 }
 
 fn is_direct(device: &str) -> bool {

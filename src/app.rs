@@ -2,6 +2,7 @@
 
 use crate::player::{Cmd, PlayState, Player, Status};
 use crate::plex::{khz, Album, Artist, Server, Track};
+use crate::report::Reporter;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -53,6 +54,7 @@ pub struct App {
     library_key: String,
     header: HeaderInfo,
     player: Player,
+    _reporter: Option<Reporter>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 
@@ -79,10 +81,24 @@ pub struct HeaderInfo {
 }
 
 impl App {
-    pub fn new(server: Server, library_key: String, header: HeaderInfo, device: String) -> App {
+    pub fn new(
+        server: Server,
+        library_key: String,
+        header: HeaderInfo,
+        device: String,
+        report_playback: bool,
+    ) -> App {
         let (tx, rx) = mpsc::channel();
         let player = Player::spawn(server.clone(), device);
+        let reporter = report_playback.then(|| {
+            Reporter::spawn(
+                server.clone(),
+                player.status_handle(),
+                crate::config::new_client_id().replacen("plext-", "plext-session-", 1),
+            )
+        });
         let mut app = App {
+            _reporter: reporter,
             server,
             library_key,
             header,
@@ -140,8 +156,9 @@ impl App {
         }
         self.albums.insert(artist_key.to_string(), Loadable::Loading);
         let (s, k, tx) = (self.server.clone(), artist_key.to_string(), self.tx.clone());
+        let lib = self.library_key.clone();
         thread::spawn(move || {
-            let r = s.albums(&k).map_err(|e| e.to_string());
+            let r = s.albums(&lib, &k).map_err(|e| e.to_string());
             let _ = tx.send(Msg::Albums(k, r));
         });
     }
@@ -546,6 +563,9 @@ impl App {
                         if let Some(y) = al.year {
                             spans.push(Span::styled(format!(" ({})", y), Style::default().fg(FAINT)));
                         }
+                        if let Some(kind) = al.kind.label() {
+                            spans.push(Span::styled(format!(" · {}", kind), Style::default().fg(FAINT)));
+                        }
                         ListItem::new(Line::from(spans))
                     }
                 })
@@ -570,6 +590,9 @@ impl App {
                 ];
                 if let Some(y) = al.year {
                     t.push(Span::styled(format!(" · {}", y), Style::default().fg(DIM)));
+                }
+                if let Some(kind) = al.kind.label() {
+                    t.push(Span::styled(format!(" · {}", kind), Style::default().fg(DIM)));
                 }
                 t.push(Span::raw(" "));
                 let right = match self.tracks.get(&al.key) {
@@ -691,12 +714,33 @@ fn track_line(num: &str, title: &str, fmt: &str, time: &str, width: usize, style
 }
 
 fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status) {
-    let block = Block::default()
+    let active = matches!(st.state, PlayState::Playing | PlayState::Paused | PlayState::Loading);
+    let edge = if st.state == PlayState::Playing { ACCENT } else if active { DIM } else { BORDER };
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER));
+        .border_style(Style::default().fg(edge))
+        .title(Line::from(Span::styled(
+            " Now Playing ",
+            Style::default().fg(if active { ACCENT } else { DIM }).add_modifier(Modifier::BOLD),
+        )));
+    if active && st.queue_len > 0 {
+        block = block.title(
+            Line::from(Span::styled(
+                format!(" track {} of {} ", st.queue_pos + 1, st.queue_len),
+                Style::default().fg(DIM),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // A column of breathing room inside the frame.
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
@@ -775,7 +819,7 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status) {
     let out_text = match (&st.output, playing) {
         (Some(o), true) => {
             let mode = if o.direct { "exclusive · no resample · vol: DAC" } else { "via ALSA plugins" };
-            Some((o.device.clone(), format!(" · {} · {} ", o.fmt.name(), mode)))
+            Some((o.label.clone(), format!(" · {} · {} ", o.fmt.name(), mode)))
         }
         _ => None,
     };
