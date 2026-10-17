@@ -20,7 +20,9 @@ const FG: Color = Color::Rgb(0xc9, 0xd1, 0xd9);
 const BRIGHT: Color = Color::Rgb(0xe6, 0xed, 0xf3);
 const DIM: Color = Color::Rgb(0x8b, 0x94, 0x9e);
 const FAINT: Color = Color::Rgb(0x6e, 0x76, 0x81);
-const BORDER: Color = Color::Rgb(0x30, 0x36, 0x3d);
+/// Unfocused pane edges. Light enough to stay visible on dark terminal
+/// backgrounds (the old #30363d vanished against themes like Nord).
+const BORDER: Color = Color::Rgb(0x54, 0x5c, 0x66);
 const SEL_BG: Color = Color::Rgb(0x1f, 0x26, 0x30);
 const GOOD: Color = Color::Rgb(0x7e, 0xe7, 0x87);
 const WARN: Color = Color::Rgb(0xf0, 0x88, 0x3e);
@@ -68,6 +70,8 @@ pub struct App {
     tracks: HashMap<String, Loadable<Vec<Track>>>,
 
     tree_state: ListState,
+    /// Rows visible in the artist pane at the last draw, for PageUp/PageDown.
+    tree_page: usize,
     track_state: ListState,
     focus: Focus,
     filter: String,
@@ -119,6 +123,7 @@ impl App {
             expanded: HashMap::new(),
             tracks: HashMap::new(),
             tree_state: ListState::default().with_selected(Some(0)),
+            tree_page: 15,
             track_state: ListState::default().with_selected(Some(0)),
             focus: Focus::Tree,
             filter: String::new(),
@@ -421,8 +426,8 @@ impl App {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.move_tree(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_tree(1),
-            KeyCode::PageUp => self.move_tree(-15),
-            KeyCode::PageDown => self.move_tree(15),
+            KeyCode::PageUp => self.move_tree(-(self.tree_page.max(1) as i64)),
+            KeyCode::PageDown => self.move_tree(self.tree_page.max(1) as i64),
             KeyCode::Home | KeyCode::Char('g') => self.move_tree(-1_000_000),
             KeyCode::End | KeyCode::Char('G') => self.move_tree(1_000_000),
             KeyCode::Right | KeyCode::Char('l') => match self.current_row() {
@@ -496,7 +501,8 @@ impl App {
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(1), // header
+                Constraint::Length(1), // breathing room under the header
                 Constraint::Min(5),
                 Constraint::Length(5),
                 Constraint::Length(1),
@@ -507,15 +513,15 @@ impl App {
         let main = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-            .split(outer[1]);
+            .split(outer[2]);
         self.draw_tree(f, main[0]);
         self.draw_tracks(f, main[1], st);
         // Errors stay up long enough to read, even if the next track has started.
         let show_error = self
             .error_since
             .map_or(false, |t| t.elapsed() < Duration::from_secs(15));
-        draw_now_playing(f, outer[2], st, show_error);
-        self.draw_keys(f, outer[3]);
+        draw_now_playing(f, outer[3], st, show_error);
+        self.draw_keys(f, outer[4]);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -557,14 +563,29 @@ impl App {
         } else {
             " / filter ".into()
         };
-        let block = self.pane(
-            Line::from(Span::styled(
-                " Album Artists ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
+        let mut block = self.pane(
+            Line::from(Span::styled(" Album Artists ", title_style(self.focus == Focus::Tree))),
             filter_label,
             self.focus == Focus::Tree,
         );
+        // Where you are in the (possibly filtered) artist list.
+        let visible = self.visible_artists();
+        if !visible.is_empty() {
+            let cur_artist = match self.current_row() {
+                Some(Row::Artist(i)) | Some(Row::Heading(i, _)) | Some(Row::Album(i, _)) => Some(i),
+                None => None,
+            };
+            if let Some(pos) = cur_artist.and_then(|i| visible.iter().position(|&v| v == i)) {
+                block = block.title_bottom(
+                    Line::from(Span::styled(
+                        format!(" {} of {} ", pos + 1, visible.len()),
+                        Style::default().fg(FAINT),
+                    ))
+                    .alignment(Alignment::Right),
+                );
+            }
+        }
+        self.tree_page = area.height.saturating_sub(3) as usize;
 
         let playing_album = self.player.status().track.map(|t| t.album);
         let rows = self.rows();
@@ -592,9 +613,12 @@ impl App {
                         let style = if open {
                             Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(DIM)
+                            Style::default().fg(FG)
                         };
-                        let mut spans = vec![Span::styled(format!("{}{}", marker, a.title), style)];
+                        let mut spans = vec![
+                            Span::styled(marker, Style::default().fg(if open { ACCENT } else { FAINT })),
+                            Span::styled(a.title.clone(), style),
+                        ];
                         if loading {
                             spans.push(Span::styled("  …", Style::default().fg(FAINT)));
                         }
@@ -624,12 +648,16 @@ impl App {
                 })
                 .collect(),
         };
-        let list = List::new(items).block(block).highlight_style(
-            Style::default()
-                .bg(SEL_BG)
-                .fg(BRIGHT)
-                .add_modifier(if self.focus == Focus::Tree { Modifier::BOLD } else { Modifier::empty() }),
-        );
+        let list = List::new(items)
+            .block(block)
+            // Keep a few rows of context visible above and below the cursor.
+            .scroll_padding(3)
+            .highlight_style(
+                Style::default()
+                    .bg(SEL_BG)
+                    .fg(BRIGHT)
+                    .add_modifier(if self.focus == Focus::Tree { Modifier::BOLD } else { Modifier::empty() }),
+            );
         f.render_stateful_widget(list, area, &mut self.tree_state);
     }
 
@@ -638,7 +666,7 @@ impl App {
             Some((artist, al)) => {
                 let mut t = vec![
                     Span::raw(" "),
-                    Span::styled(al.title.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(al.title.clone(), title_style(self.focus == Focus::Tracks)),
                     Span::styled(format!(" · {}", artist), Style::default().fg(DIM)),
                 ];
                 if let Some(y) = al.year {
@@ -664,67 +692,77 @@ impl App {
                 (Line::from(t), right)
             }
             None => (
-                Line::from(Span::styled(" Tracks ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(" Tracks ", title_style(self.focus == Focus::Tracks))),
                 String::new(),
             ),
         };
         let block = self.pane(title, right, self.focus == Focus::Tracks);
-        let inner_w = area.width.saturating_sub(2) as usize;
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let inner_w = inner.width as usize;
 
-        let items: Vec<ListItem> = match self.shown_album.as_ref().and_then(|(_, al)| self.tracks.get(&al.key)) {
-            None => vec![ListItem::new(Span::styled(
-                " Select an album on the left (→ to expand an artist).",
-                Style::default().fg(DIM),
-            ))],
-            Some(Loadable::Loading) => vec![ListItem::new(Span::styled(" Loading tracks…", Style::default().fg(DIM)))],
-            Some(Loadable::Failed(e)) => vec![ListItem::new(Span::styled(
-                format!(" Couldn't load tracks: {}", e),
-                Style::default().fg(WARN),
-            ))],
-            Some(Loadable::Ready(tracks)) => {
-                let multi_disc = tracks.iter().any(|t| t.disc.unwrap_or(1) > 1);
-                let playing_key = st.track.as_ref().map(|t| t.key.clone());
-                let mut items = vec![ListItem::new(track_line(
-                    "#", "Title", "Format", "Time", inner_w, Style::default().fg(FAINT),
-                ))];
-                for t in tracks {
-                    let playing = playing_key.as_deref() == Some(t.key.as_str()) && st.state != PlayState::Stopped;
-                    let num = if playing {
-                        "▶".to_string()
-                    } else if multi_disc {
-                        format!("{}-{}", t.disc.unwrap_or(1), t.index.unwrap_or(0))
-                    } else {
-                        t.index.map(|i| i.to_string()).unwrap_or_default()
-                    };
-                    let style = if playing {
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(DIM)
-                    };
-                    let time = t.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
-                    items.push(ListItem::new(track_line(
-                        &num,
-                        &t.title,
-                        &t.format_label(),
-                        &time,
-                        inner_w,
-                        style,
-                    )));
-                }
-                items
+        let message = |text: String, color: Color| List::new(vec![ListItem::new(Span::styled(text, Style::default().fg(color)))]);
+        let tracks = match self.shown_album.as_ref().and_then(|(_, al)| self.tracks.get(&al.key)) {
+            None => {
+                f.render_widget(message(" Select an album on the left (→ to expand an artist).".into(), DIM), inner);
+                return;
             }
+            Some(Loadable::Loading) => {
+                f.render_widget(message(" Loading tracks…".into(), DIM), inner);
+                return;
+            }
+            Some(Loadable::Failed(e)) => {
+                f.render_widget(message(format!(" Couldn't load tracks: {}", e), WARN), inner);
+                return;
+            }
+            Some(Loadable::Ready(t)) => t,
         };
-        // Offset selection by one for the header row.
-        let mut state = ListState::default()
-            .with_selected(self.track_state.selected().map(|i| i + 1))
-            .with_offset(self.track_state.offset());
-        let list = List::new(items).block(block).highlight_style(
+
+        // Column headings stay put while the track list scrolls beneath them.
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        let head = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
+        f.render_widget(Paragraph::new(track_line("#", "Title", "Format", "Time", inner_w, [head; 4])), parts[0]);
+        f.render_widget(
+            Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(BORDER))),
+            parts[1],
+        );
+
+        let multi_disc = tracks.iter().any(|t| t.disc.unwrap_or(1) > 1);
+        let playing_key = st.track.as_ref().map(|t| t.key.clone());
+        let items: Vec<ListItem> = tracks
+            .iter()
+            .map(|t| {
+                let playing = playing_key.as_deref() == Some(t.key.as_str()) && st.state != PlayState::Stopped;
+                let num = if playing {
+                    "▶".to_string()
+                } else if multi_disc {
+                    format!("{}-{}", t.disc.unwrap_or(1), t.index.unwrap_or(0))
+                } else {
+                    t.index.map(|i| i.to_string()).unwrap_or_default()
+                };
+                let styles = if playing {
+                    [Style::default().fg(ACCENT).add_modifier(Modifier::BOLD); 4]
+                } else {
+                    [
+                        Style::default().fg(FAINT),
+                        Style::default().fg(FG),
+                        Style::default().fg(DIM),
+                        Style::default().fg(DIM),
+                    ]
+                };
+                let time = t.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
+                ListItem::new(track_line(&num, &t.title, &t.format_label(), &time, inner_w, styles))
+            })
+            .collect();
+        let list = List::new(items).scroll_padding(2).highlight_style(
             Style::default()
                 .bg(if self.focus == Focus::Tracks { SEL_BG } else { Color::Reset })
                 .fg(BRIGHT),
         );
-        f.render_stateful_widget(list, area, &mut state);
-        *self.track_state.offset_mut() = state.offset();
+        f.render_stateful_widget(list, parts[2], &mut self.track_state);
     }
 
     fn draw_keys(&self, f: &mut Frame, area: Rect) {
@@ -748,22 +786,24 @@ impl App {
     }
 }
 
-fn track_line(num: &str, title: &str, fmt: &str, time: &str, width: usize, style: Style) -> Line<'static> {
+/// Pane titles light up in the accent colour only on the focused pane.
+fn title_style(focused: bool) -> Style {
+    Style::default().fg(if focused { ACCENT } else { BRIGHT }).add_modifier(Modifier::BOLD)
+}
+
+/// One row of the track table. `styles` colours the number, title, format and
+/// time columns separately so the title stands out from the details.
+fn track_line(num: &str, title: &str, fmt: &str, time: &str, width: usize, styles: [Style; 4]) -> Line<'static> {
     let num_w = 5;
     let fmt_w = 12;
     let time_w = 7;
     let title_w = width.saturating_sub(num_w + fmt_w + time_w + 2).max(8);
-    let title = truncate(title, title_w);
-    Line::from(Span::styled(
-        format!(
-            " {:<num_w$}{:<title_w$}{:<fmt_w$}{:>time_w$}",
-            truncate(num, num_w - 1),
-            title,
-            truncate(fmt, fmt_w - 1),
-            time,
-        ),
-        style,
-    ))
+    Line::from(vec![
+        Span::styled(format!(" {:<num_w$}", truncate(num, num_w - 1)), styles[0]),
+        Span::styled(format!("{:<title_w$}", truncate(title, title_w)), styles[1]),
+        Span::styled(format!("{:<fmt_w$}", truncate(fmt, fmt_w - 1)), styles[2]),
+        Span::styled(format!("{:>time_w$}", time), styles[3]),
+    ])
 }
 
 fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, show_error: bool) {
