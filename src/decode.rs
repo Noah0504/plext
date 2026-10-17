@@ -75,13 +75,21 @@ impl Decoder {
         // Some containers (e.g. ALAC in M4A) only reveal these once the decoder
         // has parsed its codec-specific setup, so fall back to the decoder's view.
         let dparams = decoder.codec_params();
-        // (M4A stores the rate in a 16-bit field, so rates above 65535 Hz read as 0 there.)
-        let rate = params
+        // The decoder's own spec comes from the codec's setup data (FLAC STREAMINFO,
+        // the ALAC cookie), which is authoritative. The container's value can be
+        // wrong: M4A stores the rate in a 16-bit field, so 88.2/96/176.4/192 kHz
+        // ALAC files carry 0 or a bogus value there.
+        let decoder_rate = Some(decoder.last_decoded().spec().rate).filter(|&r| r > 0);
+        let container_rate = params
             .sample_rate
             .filter(|&r| r > 0)
-            .or(dparams.sample_rate.filter(|&r| r > 0))
-            .or_else(|| Some(decoder.last_decoded().spec().rate).filter(|&r| r > 0))
-            .ok_or_else(|| anyhow!("unknown sample rate"))?;
+            .or(dparams.sample_rate.filter(|&r| r > 0));
+        let rate = if params.codec == CODEC_TYPE_ALAC {
+            decoder_rate.or(container_rate)
+        } else {
+            container_rate.or(decoder_rate)
+        }
+        .ok_or_else(|| anyhow!("unknown sample rate"))?;
         let channels = params
             .channels
             .or(dparams.channels)
