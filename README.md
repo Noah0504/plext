@@ -4,21 +4,7 @@ A terminal music player for Plex with bit-perfect playback straight to your DAC.
 Browse your album artists and albums, stream lossless and high-res audio untouched,
 all from a single static binary for Linux.
 
-```
- ▶ plext   server: Home NAS   library: Music                                412 artists ● connected
-╭ Album Artists ──────── / filter ╮╭ Northbound Winter · Delta Quartet · 2022 ── FLAC 24/192 · 8 tracks ╮
-│▸ Cassia Moreau Trio             ││ #    Title                                   Format         Time  │
-│▾ Delta Quartet                  ││ 1    First Frost                             24/192         6:12  │
-│    Low Light Sessions (2019)    ││ 2    Lantern Road                            24/192         5:48  │
-│    ♪ Northbound Winter (2022)   ││ ▶    Northbound                              24/192         7:31  │
-│▸ Echo Harbor                    ││ 4    The Quiet Platform                      24/192         4:56  │
-╰─────────────────────────────────╯╰───────────────────────────────────────────────────────────────────╯
-╭───────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ▶ PLAYING  Northbound   Delta Quartet — Northbound Winter                             ◆ BIT-PERFECT   │
-│ 3:12    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────────────────────────────────     7:31   │
-│ FLAC · 24-bit / 192 kHz · stereo               out: USB DAC · S24_3LE · exclusive · no resample │
-╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯
-```
+![Plext playing a 24-bit/192 kHz album bit-perfect](docs/screenshot.png)
 
 ## Features
 
@@ -37,6 +23,13 @@ all from a single static binary for Linux.
 - **Plex sign-in with a link code**, automatic server discovery, LAN and remote connections.
 - **Single static binary**: no dependencies to install.
 
+## Requirements
+
+- Linux on x86_64 (any distribution; the binary has no dependencies)
+- A Plex Media Server with a music library, and a Plex account
+- For bit-perfect playback, a USB DAC or other sound card that Plext can access directly
+- Plex Pass only if you want Plex webhooks; everything else works without it
+
 ## Install
 
 Download `plext-x86_64-linux.tar.gz` from the [Releases](../../releases) page, then:
@@ -45,6 +38,8 @@ Download `plext-x86_64-linux.tar.gz` from the [Releases](../../releases) page, t
 tar xzf plext-x86_64-linux.tar.gz
 sudo install plext /usr/local/bin/
 ```
+
+To upgrade, download the new release and run the same two commands; your settings are kept.
 
 ## Getting started
 
@@ -56,28 +51,36 @@ plext                # start playing
 ```
 
 If no device is set, Plext picks the first USB audio device it finds.
-You can also choose one for a single session with `plext --device hw:1,0`.
-If a track is skipped or something goes wrong, the details are written to
-`~/.local/state/plext/plext.log`.
 
-`plext status` shows the current settings, and `plext inspect "Artist Name"` shows what your
-server reports about an artist's releases (useful if a release type looks wrong).
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `plext` | Start the player (runs `login` first if you haven't signed in) |
+| `plext login` | Sign in at plex.tv/link and choose a server and music library |
+| `plext logout` | Forget the saved Plex sign-in |
+| `plext device` | List output devices; `plext device <name>` sets the default |
+| `plext status` | Show the server, library, device, and config and log file locations |
+| `plext inspect "Artist"` | Show what your server reports about an artist's releases |
+| `plext --device <name>` | Play through a different device for this session only |
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
 | `↑` `↓` / `j` `k` | Move |
-| `→` / `l` | Expand artist / open album's tracks |
+| `PgUp` `PgDn` | Move a page |
+| `Home` `End` / `g` `G` | Jump to the top / bottom |
+| `→` / `l` | Expand an artist; on an album, move to its track list |
 | `←` / `h` | Collapse / back to the artist list |
-| `Enter` | Play album (from the selected track in the track list) |
+| `Enter` | Play the album (in the track list, from the selected track) |
 | `Space` | Pause / resume |
-| `n` / `p` | Next / previous track |
-| `.` / `,` | Seek forward / back 10 s |
+| `n` / `p` | Next / previous track (`p` restarts the track if you're more than 3 s in) |
+| `.` `]` / `,` `[` | Seek forward / back 10 s |
 | `s` | Stop |
 | `Tab` | Switch pane |
 | `/` | Filter artists (`Esc` clears) |
-| `q` | Quit |
+| `q` / `Ctrl+C` | Quit |
 
 ## Plex integration
 
@@ -93,7 +96,8 @@ report_playback = false
 
 ## Options
 
-Settings live in `~/.config/plext/config.toml` (`plext status` shows the path).
+Settings live in `~/.config/plext/config.toml` (`plext status` shows the path). The file also
+holds your Plex sign-in token, so Plext keeps it readable only by you.
 
 | Option | Default | What it does |
 | --- | --- | --- |
@@ -105,14 +109,25 @@ Settings live in `~/.config/plext/config.toml` (`plext status` shows the path).
 
 - **Exclusive access.** While Plext is playing, the DAC is reserved for it. Other sounds won't play
   through it, and Plext releases the device when playback stops.
-- **"Device is busy."** Your desktop sound server (PipeWire or PulseAudio) is holding the DAC.
-  Stop other audio, or set the DAC's profile to *Off* in your sound settings
-  (e.g. `pavucontrol` → Configuration) while you listen.
 - **Volume** stays at full digital scale; use your DAC's or amplifier's volume control.
 - **Narrower DAC containers.** 16-bit sources sent to a 32-bit-only DAC are padded with zero bits,
   which preserves every original bit. If a DAC can't accept a source's bit depth or sample rate
   natively, Plext tells you rather than converting silently.
+- **Lossy files** (MP3, AAC, Vorbis) play normally but are never shown as bit-perfect.
 - **DSD** isn't supported yet.
+
+## Troubleshooting
+
+- **"Device is busy."** Your desktop sound server (PipeWire or PulseAudio) is holding the DAC.
+  Stop other audio, or set the DAC's profile to *Off* in your sound settings
+  (e.g. `pavucontrol` → Configuration) while you listen.
+- **A track was skipped, or something flashed by.** Errors stay on screen for 15 seconds and are
+  written to `~/.local/state/plext/plext.log`, along with each track played and any dropped
+  connections Plext recovered from.
+- **Can't reach the server.** Plext tries the server's other addresses automatically. If your
+  server moved or your sign-in expired, run `plext login` again.
+- **A release is in the wrong group.** Plext uses the release type Plex reads from your tags.
+  `plext inspect "Artist"` shows what the server reports for each release.
 
 ## Building from source
 
