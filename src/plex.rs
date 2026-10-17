@@ -410,6 +410,18 @@ impl Server {
             .collect())
     }
 
+    /// Raw metadata for each of an artist's releases (for `plext inspect`).
+    pub fn album_details_raw(&self, library_key: &str, artist_key: &str) -> Result<Vec<Value>> {
+        let albums = self.albums(library_key, artist_key)?;
+        let keys: Vec<String> = albums.iter().map(|a| a.key.clone()).collect();
+        let mut out = Vec::new();
+        for chunk in keys.chunks(50) {
+            let v = self.get(&format!("/library/metadata/{}", chunk.join(",")))?;
+            out.extend(items(&v, "Metadata").cloned());
+        }
+        Ok(out)
+    }
+
     /// All releases by an artist: albums, EPs, singles, live albums, compilations…
     pub fn albums(&self, library_key: &str, artist_key: &str) -> Result<Vec<Album>> {
         let parse = |v: &Value| -> Vec<Album> {
@@ -449,6 +461,22 @@ impl Server {
                 all
             }
         };
+        // List responses usually omit the Format/Subformat tags that carry the
+        // release type; a batched metadata request returns them.
+        let keys: Vec<String> = albums.iter().map(|a| a.key.clone()).collect();
+        for chunk in keys.chunks(50) {
+            if let Ok(v) = self.get(&format!("/library/metadata/{}", chunk.join(","))) {
+                for m in items(&v, "Metadata") {
+                    let key = str_of(&m["ratingKey"]);
+                    let kind = ReleaseKind::from_metadata(m);
+                    if let Some(al) = albums.iter_mut().find(|a| a.key == key) {
+                        if al.kind == ReleaseKind::Album {
+                            al.kind = kind;
+                        }
+                    }
+                }
+            }
+        }
         albums.sort_by(|a, b| {
             (a.kind, a.year.unwrap_or(u32::MAX), a.title.to_lowercase())
                 .cmp(&(b.kind, b.year.unwrap_or(u32::MAX), b.title.to_lowercase()))

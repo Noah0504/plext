@@ -56,7 +56,8 @@ plext                # start playing
 
 If no device is set, Plext picks the first USB audio device it finds.
 You can also choose one for a single session with `plext --device hw:1,0`.
-`plext status` shows the current settings.
+`plext status` shows the current settings, and `plext inspect "Artist Name"` shows what your
+server reports about an artist's releases (useful if a release type looks wrong).
 
 ## Keys
 

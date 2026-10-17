@@ -38,6 +38,8 @@ enum Command {
     Device { name: Option<String> },
     /// Show the current configuration
     Status,
+    /// Show what the server reports about an artist's releases (for troubleshooting)
+    Inspect { artist: String },
 }
 
 fn main() {
@@ -85,6 +87,7 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Inspect { artist }) => inspect(&mut cfg, &artist),
         None => run(&mut cfg, cli.device),
     }
 }
@@ -142,6 +145,38 @@ fn connect(plex_client: &Plex, cfg: &mut Config) -> Result<ServerConfig> {
     cfg.server = Some(updated.clone());
     cfg.save()?;
     Ok(updated)
+}
+
+fn inspect(cfg: &mut Config, name: &str) -> Result<()> {
+    let plex_client = Plex::new(&cfg.client_id);
+    let server_cfg = connect(&plex_client, cfg)?;
+    let library = cfg.library.clone().context("no library chosen; run `plext login`")?;
+    let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token, &server_cfg.machine_id);
+    let artists = server.artists(&library.key)?;
+    let wanted = name.to_lowercase();
+    let artist = artists
+        .iter()
+        .find(|a| a.title.to_lowercase() == wanted)
+        .or_else(|| artists.iter().find(|a| a.title.to_lowercase().contains(&wanted)))
+        .with_context(|| format!("no artist matching \"{}\"", name))?;
+    println!("{} (ratingKey {})\n", artist.title, artist.key);
+    let albums = server.albums(&library.key, &artist.key)?;
+    let raw = server.album_details_raw(&library.key, &artist.key)?;
+    for al in &albums {
+        println!("{} ({})  → shown as: {}", al.title, al.year.map(|y| y.to_string()).unwrap_or_default(),
+            al.kind.label().unwrap_or("Album"));
+        if let Some(m) = raw.iter().find(|m| m["ratingKey"].as_str() == Some(al.key.as_str())) {
+            if let Some(obj) = m.as_object() {
+                for (k, v) in obj {
+                    let kl = k.to_lowercase();
+                    if kl.contains("format") || kl.contains("type") || kl.contains("release") || kl == "subtype" {
+                        println!("    {}: {}", k, v);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn login(cfg: &mut Config) -> Result<()> {
