@@ -4,7 +4,7 @@ A terminal music player for Plex with bit-perfect playback straight to your DAC.
 Browse your album artists and albums, stream lossless and high-res audio untouched,
 all from a single static binary for Linux.
 
-![Plext playing a 16-bit/44.1 kHz FLAC EP bit-perfect through a USB DAC, with track ratings](docs/screenshot.png)
+![Plext playing a 16-bit/44.1 kHz FLAC album bit-perfect through a USB DAC, with the album cover as pixel art and the next two tracks up next](docs/screenshot.png)
 
 ## Features
 
@@ -22,6 +22,8 @@ all from a single static binary for Linux.
   `media.resume`, `media.stop`, `media.scrobble`).
 - **Track ratings.** See and set your Plex star ratings (half stars included) in the track list
   and the now-playing bar. Ratings are shared with Plex and Plexamp.
+- **Album art as pixel art.** The playing album's cover, drawn right in the terminal beside
+  what's playing, square in whatever font you use.
 - **Desktop media controls (MPRIS).** Plext shows up in your desktop's media controls (GNOME's
   top bar and lock screen, KDE's media applet) with the track and album cover, and the keyboard's
   play/pause, next and previous keys control it.
@@ -102,6 +104,31 @@ To turn reporting off, add this to `~/.config/plext/config.toml`:
 report_playback = false
 ```
 
+## Album art
+
+The now-playing area shows the album's cover as pixel art, drawn with half-block characters
+(two pixels per character cell). It is 16 pixels tall, and as many wide as your font needs for
+the picture to come out square: Plext asks the terminal how tall its character cells are
+compared with their width (a narrow font needs more columns). Plext asks your server for the
+cover, averages it down and cuts it to a 16-color palette for a crisp, hand-made look. Covers are cached in
+`~/.cache/plext/covers`, the same cache the desktop's media controls use.
+
+Beside the cover are the title and your rating, the artist, and the album with its year and
+release type; then the progress bar and a line with the source format and where it's playing
+(◆ BIT-PERFECT → your DAC). With room to spare, an "up next" column lists the next two tracks.
+
+The layout follows the size of your terminal:
+
+| Terminal size | Now-playing area |
+| --- | --- |
+| under 90×30 (e.g. the usual 80×24 default) | compact three-line bar |
+| 90×30 and larger | cover, track details, progress, format and output |
+| about 100 columns and wider | the above, plus "up next" |
+
+It looks best in a terminal with 24-bit color (GNOME Terminal, Konsole, kitty, WezTerm,
+Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors. With
+`album_art = false`, Plext always uses the compact bar.
+
 ## Media keys and desktop controls
 
 While Plext runs, it registers with your desktop as a media player over MPRIS, the standard
@@ -151,6 +178,7 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 | `device` | first USB DAC | ALSA output device; set it with `plext device <name>` |
 | `report_playback` | `true` | Report playback to Plex (dashboard, history, webhooks) |
 | `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |
+| `album_art` | `true` | Show the album cover as pixel art in a taller now-playing area |
 | `mpris` | `true` | Show in the desktop's media controls and obey media keys |
 
 ## Bit-perfect notes

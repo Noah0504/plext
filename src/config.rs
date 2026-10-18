@@ -23,6 +23,8 @@ pub struct Config {
     pub group_releases: Option<bool>,
     /// Show in the desktop's media controls and obey media keys (MPRIS). Default: on.
     pub mpris: Option<bool>,
+    /// Show the album cover as pixel art beside what's playing. Default: on.
+    pub album_art: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

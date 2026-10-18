@@ -67,6 +67,16 @@ impl ReleaseKind {
         }
     }
 
+    /// The type to show beside a release's name: every known type, albums
+    /// included, so they all read the same way; nothing when Plex doesn't know.
+    pub fn display_label(self) -> Option<&'static str> {
+        match self {
+            ReleaseKind::Album => Some("Album"),
+            ReleaseKind::Other => None,
+            k => k.label(),
+        }
+    }
+
     /// Reads the release type from an album's `Format` and `Subformat` tags
     /// (e.g. Format "EP", Subformat "Live").
     fn from_metadata(m: &Value) -> ReleaseKind {

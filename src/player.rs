@@ -45,6 +45,8 @@ pub struct Status {
     pub output: Option<OutputInfo>,
     pub queue_pos: usize,
     pub queue_len: usize,
+    /// The next tracks in the queue (up to two), for "up next".
+    pub next: Vec<Track>,
     pub error: Option<String>,
     /// Increases with every new error, so the UI can tell a new one apart.
     pub error_seq: u64,
@@ -273,6 +275,7 @@ impl Engine {
             s.dur = track.duration_ms.map(|d| d as f64 / 1000.0);
             s.queue_pos = idx;
             s.queue_len = queue.len();
+            s.next = queue[idx + 1..].iter().take(2).cloned().collect();
         });
 
         let reader = match dl.reader() {
