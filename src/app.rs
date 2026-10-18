@@ -263,7 +263,7 @@ impl App {
             if let Some(y) = a.year {
                 parts.push(y.to_string());
             }
-            if let Some(l) = a.kind.label() {
+            if let Some(l) = a.kind.display_label() {
                 parts.push(l.to_string());
             }
         }
@@ -957,7 +957,7 @@ impl App {
                 if let Some(y) = al.year {
                     extra.push(Span::styled(format!(" · {}", y), Style::default().fg(DIM)));
                 }
-                if let Some(kind) = al.kind.label() {
+                if let Some(kind) = al.kind.display_label() {
                     extra.push(Span::styled(format!(" · {}", kind), Style::default().fg(DIM)));
                 }
                 let rights = match self.tracks.get(&al.key) {
@@ -2010,6 +2010,32 @@ mod tests {
         assert!(details.contains("  out: Schiit Modi+"), "{}", details);
         assert!(!details.contains('…'), "{}", details);
         assert!(inside(details).ends_with("exclusive") || inside(details).ends_with("vol: DAC") || inside(details).ends_with("Modi+"), "{}", details);
+    }
+
+    #[test]
+    fn release_type_shows_for_albums_too_but_not_when_unknown() {
+        let t = track("1", 1, "One", None);
+        for (kind, want) in [(ReleaseKind::Album, Some("Album")), (ReleaseKind::Ep, Some("EP")), (ReleaseKind::Other, None)] {
+            let mut app = app_with_album(vec![t.clone()]);
+            app.album_art = true;
+            if let Some((_, a)) = app.shown_album.as_mut() {
+                a.kind = kind;
+            }
+            let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
+            let screen: Vec<String> = (0..40).map(|y| row_text(&buf, y)).collect();
+            let heading = screen.iter().find(|l| l.contains("You Are Free · Cat Power")).unwrap();
+            let album_line = &tall_rows(&mut app, &playing_status(&t), 140)[2];
+            match want {
+                Some(label) => {
+                    assert!(heading.contains(&format!("· 2003 · {} ", label)), "{}", heading);
+                    assert!(album_line.contains(&format!("You Are Free · 2003 · {}", label)), "{}", album_line);
+                }
+                None => {
+                    assert!(heading.contains("· 2003 ") && !heading.contains("Other"), "{}", heading);
+                    assert!(inside(album_line).ends_with("You Are Free · 2003"), "{}", album_line);
+                }
+            }
+        }
     }
 
     #[test]
