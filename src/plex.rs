@@ -119,6 +119,9 @@ pub struct Track {
     /// Path of the original media file on the server, e.g. "/library/parts/123/456/file.flac".
     pub part_key: Option<String>,
     pub container: Option<String>,
+    /// Your rating in Plex's units: 1-10, where 2 is one star (so odd numbers
+    /// are half stars). `None` when the track isn't rated.
+    pub rating: Option<u8>,
 }
 
 impl Track {
@@ -399,6 +402,23 @@ impl Server {
         Ok(())
     }
 
+    /// Sets your rating for an item (1-10, two per star), or clears it with `None`.
+    pub fn rate(&self, key: &str, rating: Option<u8>) -> Result<()> {
+        let value = rating.map(|r| r.min(10) as i32).unwrap_or(-1);
+        let url = format!(
+            "{}/:/rate?key={}&identifier=com.plexapp.plugins.library&rating={}",
+            self.base,
+            encode(key),
+            value
+        );
+        self.plex
+            .req("PUT", &url, Some(&self.token))
+            .timeout(Duration::from_secs(10))
+            .call()
+            .map_err(describe)?;
+        Ok(())
+    }
+
     fn get(&self, path: &str) -> Result<Value> {
         self.plex
             .get_json(&format!("{}{}", self.base, path), Some(&self.token))
@@ -576,6 +596,7 @@ fn merge(base: Track, full: Track) -> Track {
         bitrate_kbps: full.bitrate_kbps.or(base.bitrate_kbps),
         part_key: full.part_key.or(base.part_key),
         container: full.container.or(base.container),
+        rating: full.rating.or(base.rating),
     }
 }
 
@@ -626,7 +647,20 @@ fn parse_track(m: &Value) -> Track {
             .and_then(|p| p["container"].as_str())
             .or_else(|| media.and_then(|md| md["container"].as_str()))
             .map(String::from),
+        rating: parse_rating(&m["userRating"]),
     }
+}
+
+/// Plex sends `userRating` as a number from 0 to 10 (e.g. `7.0` for 3.5 stars),
+/// and leaves it out for unrated tracks. A rating of 0 counts as unrated.
+fn parse_rating(v: &Value) -> Option<u8> {
+    let r = match v {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => s.parse().ok()?,
+        _ => return None,
+    };
+    let r = r.round().clamp(0.0, 10.0) as u8;
+    (r > 0).then_some(r)
 }
 
 /// Percent-encodes a value for use in a query string.
@@ -667,4 +701,21 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Linux".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn user_rating_parses_to_half_star_steps() {
+        assert_eq!(parse_rating(&json!(7.0)), Some(7));
+        assert_eq!(parse_rating(&json!(10)), Some(10));
+        assert_eq!(parse_rating(&json!("8.0")), Some(8));
+        assert_eq!(parse_rating(&json!(0.0)), None);
+        assert_eq!(parse_rating(&Value::Null), None);
+        assert_eq!(parse_track(&json!({"ratingKey": 5, "title": "Free", "userRating": 9.0})).rating, Some(9));
+        assert_eq!(parse_track(&json!({"ratingKey": 5, "title": "Free"})).rating, None);
+    }
 }

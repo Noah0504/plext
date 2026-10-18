@@ -20,6 +20,8 @@ all from a single static binary for Linux.
 - **Reports playback to Plex** like official players do, so plays show up in Plex's dashboard and
   history, count toward play counts, and trigger webhooks (`media.play`, `media.pause`,
   `media.resume`, `media.stop`, `media.scrobble`).
+- **Track ratings.** See and set your Plex star ratings (half stars included) in the track list
+  and the now-playing bar. Ratings are shared with Plex and Plexamp.
 - **Plex sign-in with a link code**, automatic server discovery, LAN and remote connections.
 - **Single static binary**: no dependencies to install.
 
@@ -78,6 +80,9 @@ If no device is set, Plext picks the first USB audio device it finds.
 | `n` / `p` | Next / previous track (`p` restarts the track if you're more than 3 s in) |
 | `.` `]` / `,` `[` | Seek forward / back 10 s |
 | `s` | Stop |
+| `1`–`5` | Rate the track that many stars |
+| `-` / `=` | Take away / add half a star (`+` works too) |
+| `0` | Clear the track's rating |
 | `Tab` | Switch pane |
 | `/` | Filter artists (`Esc` clears) |
 | `q` / `Ctrl+C` | Quit |
@@ -93,6 +98,23 @@ To turn reporting off, add this to `~/.config/plext/config.toml`:
 ```toml
 report_playback = false
 ```
+
+## Ratings
+
+Plext shows your rating for each track in the track list and next to the title in the
+now-playing bar, on Plex's five-star scale. A dimmer star is a half star, so ★★★★ with a dim
+fifth star is 4½. Unrated tracks have a blank rating column.
+
+The rating keys apply to the highlighted track while the track list has focus, and to the
+playing track while the artist list has focus. The stars change straight away and the rating is
+saved to Plex in the background; if Plex can't save it, the old rating comes back and the error
+shows in the now-playing bar.
+
+Ratings live on your server, so they're the same in Plex, Plexamp and Plext. Plexamp's
+"One Star" (like/dislike) rating style isn't supported. Each time you open an album, Plext
+fetches its tracks again, so ratings changed elsewhere show up. Plex also shares one rating
+between copies of the same recording (for example a song on its album and on a compilation),
+and you'll see that too.
 
 ## Options
 
@@ -136,7 +158,7 @@ Requires Rust and the ALSA development package (`libasound2-dev` on Debian/Ubunt
 
 ```sh
 cargo build --release
-cargo test --release   # bit-perfect tests; needs ffmpeg
+cargo test --release   # bit-perfect and interface tests; needs ffmpeg
 ```
 
 The tests encode random audio with ffmpeg, stream it through Plext's download, decode and
