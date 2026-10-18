@@ -1,8 +1,10 @@
 mod app;
 mod config;
+mod covers;
 mod decode;
 mod download;
 mod log;
+mod mpris;
 mod output;
 mod player;
 mod plex;
@@ -125,6 +127,7 @@ fn run(cfg: &mut Config, device_override: Option<String>) -> Result<()> {
         device,
         cfg.report_playback.unwrap_or(true),
         cfg.group_releases.unwrap_or(true),
+        cfg.mpris.unwrap_or(true),
     ).run(&mut terminal);
     ratatui::restore();
     result

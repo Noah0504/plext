@@ -1,5 +1,7 @@
 //! Terminal user interface: artist/album tree, track list and now-playing bar.
 
+use crate::covers::Covers;
+use crate::mpris::Mpris;
 use crate::player::{Cmd, PlayState, Player, Status};
 use crate::plex::{khz, Album, Artist, ReleaseKind, Server, Track};
 use crate::report::Reporter;
@@ -78,6 +80,7 @@ pub struct App {
     header: HeaderInfo,
     player: Player,
     _reporter: Option<Reporter>,
+    _mpris: Option<Mpris>,
     /// Show release-type headings under an expanded artist.
     group_releases: bool,
     tx: Sender<Msg>,
@@ -130,6 +133,7 @@ impl App {
         device: String,
         report_playback: bool,
         group_releases: bool,
+        mpris: bool,
     ) -> App {
         let (tx, rx) = mpsc::channel();
         let player = Player::spawn(server.clone(), device);
@@ -140,9 +144,13 @@ impl App {
                 crate::config::new_client_id().replacen("plext-", "plext-session-", 1),
             )
         });
+        let mpris = mpris.then(|| {
+            Mpris::spawn(player.status_handle(), player.commander(), Covers::open(server.clone()))
+        });
         let rate_tx = spawn_rater(server.clone(), tx.clone());
         let mut app = App {
             _reporter: reporter,
+            _mpris: mpris,
             group_releases,
             server,
             library_key,
@@ -1285,6 +1293,7 @@ mod tests {
             part_key: None,
             container: None,
             rating,
+            thumb: None,
         }
     }
 
@@ -1296,7 +1305,7 @@ mod tests {
             server_name: "Home".into(),
             library_title: "Music".into(),
         };
-        let mut app = App::new(server, "1".into(), header, "null".into(), false, true);
+        let mut app = App::new(server, "1".into(), header, "null".into(), false, true, false);
         let album = Album {
             key: "100".into(),
             title: "You Are Free".into(),

@@ -13,10 +13,16 @@ use std::time::Duration;
 pub enum Cmd {
     Play { queue: Vec<Track>, index: usize },
     TogglePause,
+    /// Pause if playing (does nothing when already paused).
+    Pause,
+    /// Resume if paused (does nothing when already playing).
+    Resume,
     Next,
     Prev,
     Stop,
     SeekBy(f64),
+    /// Seek to an absolute position in the current track, in seconds.
+    SeekTo(f64),
     Quit,
 }
 
@@ -42,6 +48,9 @@ pub struct Status {
     pub error: Option<String>,
     /// Increases with every new error, so the UI can tell a new one apart.
     pub error_seq: u64,
+    /// Increases whenever the position jumps (a seek, or restarting the
+    /// track), so observers can tell a jump from normal progress.
+    pub seek_seq: u64,
 }
 
 impl Status {
@@ -89,6 +98,11 @@ impl Player {
 
     pub fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(cmd);
+    }
+
+    /// A sender for other threads that control playback (e.g. MPRIS).
+    pub fn commander(&self) -> Sender<Cmd> {
+        self.tx.clone()
     }
 
     /// Shared handle to the live status (used by the Plex progress reporter).
@@ -205,7 +219,10 @@ impl Engine {
                     self.flush();
                     idx = idx.saturating_sub(1);
                 }
-                End::Restart => self.flush(),
+                End::Restart => {
+                    self.flush();
+                    self.set(|s| s.seek_seq += 1);
+                }
                 End::Skip(e) => {
                     self.flush();
                     self.fail(format!("{} (skipped to the next track)", e));
@@ -328,8 +345,16 @@ impl Engine {
                     }
                 };
                 match cmd {
-                    Cmd::TogglePause => {
-                        paused = !paused;
+                    Cmd::TogglePause | Cmd::Pause | Cmd::Resume => {
+                        let want_paused = match cmd {
+                            Cmd::Pause => true,
+                            Cmd::Resume => false,
+                            _ => !paused,
+                        };
+                        if want_paused == paused {
+                            continue;
+                        }
+                        paused = want_paused;
                         if paused {
                             let heard = pos_of(base, frames, out);
                             if !out.set_paused(true) {
@@ -357,9 +382,14 @@ impl Engine {
                         return End::Prev;
                     }
                     Cmd::Stop => return End::Stop,
-                    Cmd::SeekBy(d) => {
+                    Cmd::SeekBy(_) | Cmd::SeekTo(_) => {
                         let cur = pos_of(base, frames, out);
-                        let mut target = (cur + d).max(0.0);
+                        let mut target = match cmd {
+                            Cmd::SeekBy(d) => cur + d,
+                            Cmd::SeekTo(t) => t,
+                            _ => unreachable!(),
+                        }
+                        .max(0.0);
                         if let Some(dur) = dur {
                             target = target.min((dur - 1.0).max(0.0));
                         }
@@ -374,7 +404,9 @@ impl Engine {
                             Err(_) => base = cur,
                         }
                         frames = 0;
-                        self.status.lock().unwrap().pos = base;
+                        let mut s = self.status.lock().unwrap();
+                        s.pos = base;
+                        s.seek_seq += 1;
                         break;
                     }
                     c @ (Cmd::Play { .. } | Cmd::Quit) => return End::Command(c),
