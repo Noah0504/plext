@@ -8,25 +8,37 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Pixels per side.
+/// Pixel rows (two per terminal row). The width in pixels (one per column)
+/// is chosen to suit the terminal's font, so the picture comes out square.
 pub const SIZE: usize = 16;
+/// How much taller a character cell is than wide, when the terminal doesn't
+/// say: typical of today's monospace fonts.
+pub const DEFAULT_CELL_RATIO: f64 = 2.2;
 /// Colors in the reduced palette.
 const COLORS: usize = 16;
 
-/// A `SIZE`×`SIZE` image, row by row, as sRGB colors.
+/// A `width`×`SIZE` image, row by row, as sRGB colors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PixelArt {
+    pub width: usize,
     pub pixels: Vec<[u8; 3]>,
 }
 
 impl PixelArt {
     pub fn at(&self, x: usize, y: usize) -> [u8; 3] {
-        self.pixels[y * SIZE + x]
+        self.pixels[y * self.width + x]
     }
 }
 
-/// Reads an image file (JPEG or PNG) and makes pixel art from it.
-pub fn from_file(path: &Path) -> Result<PixelArt> {
+/// Columns the cover needs to look square when each cell is `cell_ratio`
+/// times taller than wide (it is `SIZE / 2` rows tall).
+pub fn columns_for(cell_ratio: f64) -> usize {
+    let r = if cell_ratio.is_finite() && cell_ratio > 0.0 { cell_ratio } else { DEFAULT_CELL_RATIO };
+    ((SIZE as f64 / 2.0) * r).round().clamp(12.0, 28.0) as usize
+}
+
+/// Reads an image file (JPEG or PNG) and makes pixel art `width` pixels wide.
+pub fn from_file(path: &Path, width: usize) -> Result<PixelArt> {
     let img = image::ImageReader::open(path)
         .with_context(|| format!("opening {}", path.display()))?
         .with_guessed_format()?
@@ -37,13 +49,16 @@ pub fn from_file(path: &Path) -> Result<PixelArt> {
     if w == 0 || h == 0 {
         anyhow::bail!("empty image");
     }
-    Ok(from_rgb(w as usize, h as usize, img.as_raw()))
+    Ok(from_rgb(w as usize, h as usize, img.as_raw(), width))
 }
 
-/// Makes pixel art from raw RGB bytes (`w`×`h`, 3 bytes per pixel).
-pub fn from_rgb(w: usize, h: usize, rgb: &[u8]) -> PixelArt {
-    let small = shrink(w, h, rgb);
+/// Makes pixel art `width` pixels wide from raw RGB bytes (`w`×`h`, 3 bytes
+/// per pixel). The centre square of the image fills the whole grid.
+pub fn from_rgb(w: usize, h: usize, rgb: &[u8], width: usize) -> PixelArt {
+    let width = width.max(1);
+    let small = shrink(w, h, rgb, width, SIZE);
     PixelArt {
+        width,
         pixels: median_cut(&small, COLORS),
     }
 }
@@ -65,16 +80,16 @@ fn to_srgb(l: f32) -> u8 {
     (c * 255.0).round() as u8
 }
 
-/// Crops the centre square and averages it down to `SIZE`×`SIZE`.
-fn shrink(w: usize, h: usize, rgb: &[u8]) -> Vec<[u8; 3]> {
+/// Crops the centre square and averages it down to `out_w`×`out_h`.
+fn shrink(w: usize, h: usize, rgb: &[u8], out_w: usize, out_h: usize) -> Vec<[u8; 3]> {
     let lut: Vec<f32> = (0..=255u8).map(to_linear).collect();
     let side = w.min(h);
     let (ox, oy) = ((w - side) / 2, (h - side) / 2);
-    let mut out = Vec::with_capacity(SIZE * SIZE);
-    for py in 0..SIZE {
-        let (y0, y1) = (oy + py * side / SIZE, oy + ((py + 1) * side / SIZE).max(py * side / SIZE + 1));
-        for px in 0..SIZE {
-            let (x0, x1) = (ox + px * side / SIZE, ox + ((px + 1) * side / SIZE).max(px * side / SIZE + 1));
+    let mut out = Vec::with_capacity(out_w * out_h);
+    for py in 0..out_h {
+        let (y0, y1) = (oy + py * side / out_h, oy + ((py + 1) * side / out_h).max(py * side / out_h + 1));
+        for px in 0..out_w {
+            let (x0, x1) = (ox + px * side / out_w, ox + ((px + 1) * side / out_w).max(px * side / out_w + 1));
             let mut sum = [0f32; 3];
             let mut n = 0f32;
             for y in y0..y1.min(h) {
@@ -216,8 +231,9 @@ mod tests {
     #[test]
     fn a_flat_color_stays_that_color() {
         let rgb = image(512, 512, |_, _| [200, 40, 90]);
-        let art = from_rgb(512, 512, &rgb);
+        let art = from_rgb(512, 512, &rgb, SIZE);
         assert_eq!(art.pixels.len(), SIZE * SIZE);
+        assert_eq!(art.width, SIZE);
         assert!(art.pixels.iter().all(|p| *p == [200, 40, 90]));
     }
 
@@ -225,7 +241,7 @@ mod tests {
     fn halves_land_in_the_right_pixels() {
         // Left half red, right half blue.
         let rgb = image(320, 320, |x, _| if x < 160 { [255, 0, 0] } else { [0, 0, 255] });
-        let art = from_rgb(320, 320, &rgb);
+        let art = from_rgb(320, 320, &rgb, SIZE);
         assert_eq!(art.at(0, 0), [255, 0, 0]);
         assert_eq!(art.at(7, 15), [255, 0, 0]);
         assert_eq!(art.at(8, 0), [0, 0, 255]);
@@ -236,7 +252,7 @@ mod tests {
     fn averaging_is_done_in_linear_light() {
         // A fine black/white checkerboard averages to sRGB ~188, not 128.
         let rgb = image(64, 64, |x, y| if (x + y) % 2 == 0 { [0, 0, 0] } else { [255, 255, 255] });
-        let art = from_rgb(64, 64, &rgb);
+        let art = from_rgb(64, 64, &rgb, SIZE);
         let v = art.at(3, 3)[0];
         assert!((180..=195).contains(&v), "got {}", v);
     }
@@ -249,14 +265,14 @@ mod tests {
             100..=199 => [0, 255, 0],
             _ => [0, 0, 255],
         });
-        let art = from_rgb(300, 100, &rgb);
+        let art = from_rgb(300, 100, &rgb, SIZE);
         assert!(art.pixels.iter().all(|p| *p == [0, 255, 0]));
     }
 
     #[test]
     fn a_gradient_is_cut_to_at_most_the_palette_size() {
         let rgb = image(256, 256, |x, y| [x as u8, y as u8, ((x + y) / 2) as u8]);
-        let art = from_rgb(256, 256, &rgb);
+        let art = from_rgb(256, 256, &rgb, SIZE);
         let mut colors: Vec<[u8; 3]> = art.pixels.clone();
         colors.sort();
         colors.dedup();
@@ -270,9 +286,24 @@ mod tests {
         let path = dir.join("cover.png");
         let img = image::RgbImage::from_pixel(40, 40, image::Rgb([10, 120, 230]));
         img.save(&path).unwrap();
-        let art = from_file(&path).unwrap();
+        let art = from_file(&path, SIZE).unwrap();
         assert!(art.pixels.iter().all(|p| *p == [10, 120, 230]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wider_art_for_taller_cells_keeps_the_picture_square() {
+        // 2:1 cells need 16 columns; taller fonts need more.
+        assert_eq!(columns_for(2.0), 16);
+        assert_eq!(columns_for(2.2), 18);
+        assert_eq!(columns_for(2.5), 20);
+        assert_eq!(columns_for(f64::NAN), 18);
+        // Left half red, right half blue, drawn 20 wide: the split stays centred.
+        let rgb = image(200, 200, |x, _| if x < 100 { [255, 0, 0] } else { [0, 0, 255] });
+        let art = from_rgb(200, 200, &rgb, 20);
+        assert_eq!((art.width, art.pixels.len()), (20, 20 * SIZE));
+        assert_eq!(art.at(9, 0), [255, 0, 0]);
+        assert_eq!(art.at(10, 15), [0, 0, 255]);
     }
 
     #[test]

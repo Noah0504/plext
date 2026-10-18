@@ -37,7 +37,8 @@ const RATING_W: usize = 7;
 
 enum Msg {
     /// A cover finished turning into pixel art (keyed by its Plex thumb path).
-    Art(String, Result<PixelArt, String>),
+    /// The third value is the width in columns it was made for.
+    Art(String, usize, Result<PixelArt, String>),
     Artists(Result<Vec<Artist>, String>),
     Albums(String, Result<Vec<Album>, String>),
     Tracks(String, Result<Vec<Track>, String>),
@@ -60,6 +61,8 @@ struct RateJob {
 /// The playing album's cover, on its way to the screen.
 struct ArtSlot {
     thumb: String,
+    /// Width in columns of the art being made (or made).
+    cols: usize,
     state: ArtState,
 }
 
@@ -103,6 +106,9 @@ pub struct App {
     album_art: bool,
     truecolor: bool,
     art: Option<ArtSlot>,
+    /// Width of the cover in columns, chosen so it looks square in this
+    /// terminal's font.
+    art_cols: usize,
     /// Show release-type headings under an expanded artist.
     group_releases: bool,
     tx: Sender<Msg>,
@@ -177,6 +183,7 @@ impl App {
             album_art,
             truecolor: pixelart::truecolor(),
             art: None,
+            art_cols: art_columns(),
             group_releases,
             server,
             library_key,
@@ -215,6 +222,8 @@ impl App {
                 self.on_msg(m);
             }
             let status = self.player.status();
+            // Cheap to ask, and the font size can change while we run.
+            self.art_cols = art_columns();
             self.update_art(&status);
             if status.error_seq != self.seen_error_seq {
                 self.seen_error_seq = status.error_seq;
@@ -281,17 +290,23 @@ impl App {
             covers.request(&thumb);
             self.art = Some(ArtSlot {
                 thumb: thumb.clone(),
+                cols: self.art_cols,
                 state: ArtState::Waiting,
             });
         }
+        let cols = self.art_cols;
         let slot = self.art.as_mut().unwrap();
-        if matches!(slot.state, ArtState::Waiting) {
+        // Make it when the cover arrives, and again if the font or its size
+        // changed and the art needs a different width to stay square.
+        let resized = slot.cols != cols && matches!(slot.state, ArtState::Ready(_) | ArtState::Failed);
+        if matches!(slot.state, ArtState::Waiting) || resized {
             if let Some(path) = covers.cached(&thumb) {
                 slot.state = ArtState::Decoding;
+                slot.cols = cols;
                 let tx = self.tx.clone();
                 thread::spawn(move || {
-                    let r = pixelart::from_file(&path).map_err(|e| e.to_string());
-                    let _ = tx.send(Msg::Art(thumb, r));
+                    let r = pixelart::from_file(&path, cols).map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::Art(thumb, cols, r));
                 });
             }
         }
@@ -350,8 +365,8 @@ impl App {
 
     fn on_msg(&mut self, m: Msg) {
         match m {
-            Msg::Art(thumb, r) => {
-                if let Some(slot) = self.art.as_mut().filter(|a| a.thumb == thumb) {
+            Msg::Art(thumb, cols, r) => {
+                if let Some(slot) = self.art.as_mut().filter(|a| a.thumb == thumb && a.cols == cols) {
                     slot.state = match r {
                         Ok(art) => ArtState::Ready(art),
                         Err(e) => {
@@ -788,6 +803,7 @@ impl App {
                 Some(ArtState::Ready(p)) => Some(p),
                 _ => None,
             },
+            cols: self.art_cols as u16,
             truecolor: self.truecolor,
             album_line: st.track.as_ref().map(|t| self.album_line(t)),
         });
@@ -1168,6 +1184,8 @@ const TALL_MIN_H: u16 = 30;
 /// What the cover area shows in the tall layout.
 pub struct ArtView<'a> {
     pub art: Option<&'a PixelArt>,
+    /// Columns to give the cover.
+    pub cols: u16,
     pub truecolor: bool,
     /// "Album · 2019 · EP", when the album's details are known.
     pub album_line: Option<String>,
@@ -1242,7 +1260,7 @@ fn draw_now_playing(
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(pixelart::SIZE as u16),
+            Constraint::Length(art.cols),
             Constraint::Length(2),
             Constraint::Min(10),
         ])
@@ -1576,6 +1594,18 @@ fn draw_split_line(f: &mut Frame, area: Rect, sources: &[String], rights: Vec<Ve
     }
 }
 
+/// How many columns the cover needs to look square, from the size of a
+/// character cell in pixels. Most terminals report it; when one doesn't,
+/// a typical font's proportions are assumed.
+fn art_columns() -> usize {
+    let ratio = ratatui::crossterm::terminal::window_size()
+        .ok()
+        .filter(|w| w.width > 0 && w.height > 0 && w.columns > 0 && w.rows > 0)
+        .map(|w| (w.height as f64 / w.rows as f64) / (w.width as f64 / w.columns as f64))
+        .unwrap_or(pixelart::DEFAULT_CELL_RATIO);
+    pixelart::columns_for(ratio)
+}
+
 fn art_color(rgb: [u8; 3], truecolor: bool) -> Color {
     if truecolor {
         Color::Rgb(rgb[0], rgb[1], rgb[2])
@@ -1588,7 +1618,7 @@ fn art_color(rgb: [u8; 3], truecolor: bool) -> Color {
 /// and its background the lower one. Without a cover, a quiet placeholder.
 fn draw_cover(f: &mut Frame, area: Rect, view: &ArtView) {
     let buf = f.buffer_mut();
-    let w = (pixelart::SIZE as u16).min(area.width);
+    let w = view.art.map(|a| a.width as u16).unwrap_or(view.cols).min(view.cols).min(area.width);
     let h = ((pixelart::SIZE / 2) as u16).min(area.height);
     for cy in 0..h {
         for cx in 0..w {
@@ -1797,11 +1827,12 @@ mod tests {
         let mut app = app_with_album(vec![t.clone()]);
         app.album_art = true;
         app.truecolor = true;
+        app.art_cols = 16;
         // Top half of each pixel pair red, bottom half blue: rows alternate.
         let pixels = (0..pixelart::SIZE * pixelart::SIZE)
             .map(|i| if (i / pixelart::SIZE) % 2 == 0 { [200, 0, 0] } else { [0, 0, 200] })
             .collect();
-        app.art = Some(ArtSlot { thumb: "/thumb".into(), state: ArtState::Ready(PixelArt { pixels }) });
+        app.art = Some(ArtSlot { thumb: "/thumb".into(), cols: 16, state: ArtState::Ready(PixelArt { width: 16, pixels }) });
         let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
         let (x0, y0) = cover_origin(&buf);
         for cy in 0..(pixelart::SIZE / 2) as u16 {
@@ -1887,13 +1918,31 @@ mod tests {
     }
 
     #[test]
+    fn the_cover_takes_as_many_columns_as_the_font_needs() {
+        let t = track("1", 1, "Northbound", None);
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = true;
+        app.art_cols = 20;
+        let pixels = vec![[9, 9, 9]; 20 * pixelart::SIZE];
+        app.art = Some(ArtSlot { thumb: "/thumb".into(), cols: 20, state: ArtState::Ready(PixelArt { width: 20, pixels }) });
+        let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
+        let (x0, y0) = cover_origin(&buf);
+        assert_eq!(buf[(x0 + 19, y0)].symbol(), "▀");
+        assert_ne!(buf[(x0 + 20, y0)].symbol(), "▀");
+        // The text starts two columns after the cover.
+        assert!(row_text(&buf, y0)[..].contains("▶ Northbound"));
+        assert_eq!(buf[(x0 + 22, y0)].symbol(), "▶");
+    }
+
+    #[test]
     fn without_truecolor_the_cover_uses_the_256_color_palette() {
         let t = track("1", 1, "Northbound", None);
         let mut app = app_with_album(vec![t.clone()]);
         app.album_art = true;
         app.truecolor = false;
+        app.art_cols = 16;
         let pixels = vec![[255, 0, 0]; pixelart::SIZE * pixelart::SIZE];
-        app.art = Some(ArtSlot { thumb: "/thumb".into(), state: ArtState::Ready(PixelArt { pixels }) });
+        app.art = Some(ArtSlot { thumb: "/thumb".into(), cols: 16, state: ArtState::Ready(PixelArt { width: 16, pixels }) });
         let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
         let (x0, y0) = cover_origin(&buf);
         assert_eq!(buf[(x0, y0)].fg, Color::Indexed(196));

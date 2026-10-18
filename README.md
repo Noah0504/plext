@@ -22,8 +22,8 @@ all from a single static binary for Linux.
   `media.resume`, `media.stop`, `media.scrobble`).
 - **Track ratings.** See and set your Plex star ratings (half stars included) in the track list
   and the now-playing bar. Ratings are shared with Plex and Plexamp.
-- **Album art as pixel art.** The playing album's cover, shrunk to 16×16 and drawn right in the
-  terminal beside what's playing.
+- **Album art as pixel art.** The playing album's cover, drawn right in the terminal beside
+  what's playing, square in whatever font you use.
 - **Desktop media controls (MPRIS).** Plext shows up in your desktop's media controls (GNOME's
   top bar and lock screen, KDE's media applet) with the track and album cover, and the keyboard's
   play/pause, next and previous keys control it.
@@ -106,9 +106,11 @@ report_playback = false
 
 ## Album art
 
-The now-playing area shows the album's cover as 16×16 pixel art, drawn with half-block
-characters (two pixels per character cell). Plext asks your server for the cover, averages it
-down and cuts it to a 16-color palette for a crisp, hand-made look. Covers are cached in
+The now-playing area shows the album's cover as pixel art, drawn with half-block characters
+(two pixels per character cell). It is 16 pixels tall, and as many wide as your font needs for
+the picture to come out square: Plext asks the terminal how tall its character cells are
+compared with their width (a narrow font needs more columns). Plext asks your server for the
+cover, averages it down and cuts it to a 16-color palette for a crisp, hand-made look. Covers are cached in
 `~/.cache/plext/covers`, the same cache the desktop's media controls use.
 
 Beside the cover are the title and your rating, the artist, and the album with its year and
