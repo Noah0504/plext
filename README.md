@@ -4,7 +4,7 @@ A terminal music player for Plex with bit-perfect playback straight to your DAC.
 Browse your album artists and albums, stream lossless and high-res audio untouched,
 all from a single static binary for Linux.
 
-![Plext playing a 16-bit/44.1 kHz FLAC album bit-perfect through a USB DAC](docs/screenshot.png)
+![Plext playing a 16-bit/44.1 kHz FLAC EP bit-perfect through a USB DAC, with track ratings](docs/screenshot.png)
 
 ## Features
 
