@@ -12,8 +12,8 @@ use std::path::Path;
 /// is chosen to suit the terminal's font, so the picture comes out square.
 pub const SIZE: usize = 16;
 /// How much taller a character cell is than wide, when the terminal doesn't
-/// say: typical of today's monospace fonts.
-pub const DEFAULT_CELL_RATIO: f64 = 2.2;
+/// say: typical of today's monospace fonts (e.g. GNOME's Adwaita Mono, 8×17).
+pub const DEFAULT_CELL_RATIO: f64 = 2.1;
 /// Colors in the reduced palette.
 const COLORS: usize = 16;
 
@@ -297,7 +297,8 @@ mod tests {
         assert_eq!(columns_for(2.0), 16);
         assert_eq!(columns_for(2.2), 18);
         assert_eq!(columns_for(2.5), 20);
-        assert_eq!(columns_for(f64::NAN), 18);
+        assert_eq!(columns_for(f64::NAN), 17);
+        assert_eq!(columns_for(17.0 / 8.0), 17);
         // Left half red, right half blue, drawn 20 wide: the split stays centred.
         let rgb = image(200, 200, |x, _| if x < 100 { [255, 0, 0] } else { [0, 0, 255] });
         let art = from_rgb(200, 200, &rgb, 20);
