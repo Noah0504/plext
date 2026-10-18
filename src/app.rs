@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,11 +26,30 @@ const BORDER: Color = Color::Rgb(0x54, 0x5c, 0x66);
 const SEL_BG: Color = Color::Rgb(0x1f, 0x26, 0x30);
 const GOOD: Color = Color::Rgb(0x7e, 0xe7, 0x87);
 const WARN: Color = Color::Rgb(0xf0, 0x88, 0x3e);
+/// A half star: the accent at about half strength, so 4½ stars reads as
+/// "almost five" while still lining up in any terminal font.
+const HALF_STAR: Color = Color::Rgb(0x8a, 0x6a, 0x2a);
+/// Width of the rating column: five stars and a gap before the format.
+const RATING_W: usize = 7;
 
 enum Msg {
     Artists(Result<Vec<Artist>, String>),
     Albums(String, Result<Vec<Album>, String>),
     Tracks(String, Result<Vec<Track>, String>),
+    /// A rating change finished saving to Plex (or failed to).
+    Rated {
+        key: String,
+        wanted: Option<u8>,
+        previous: Option<u8>,
+        result: Result<(), String>,
+    },
+}
+
+/// A rating change waiting to be saved to Plex.
+struct RateJob {
+    key: String,
+    wanted: Option<u8>,
+    previous: Option<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +87,18 @@ pub struct App {
     albums: HashMap<String, Loadable<Vec<Album>>>,
     expanded: HashMap<String, bool>,
     tracks: HashMap<String, Loadable<Vec<Track>>>,
+    /// Albums whose track list is being re-fetched in the background.
+    refreshing: HashSet<String>,
+    /// The latest rating we know of for each track, by rating key. This wins
+    /// over the copy inside a `Track`, which may be older (e.g. the player's).
+    ratings: HashMap<String, Option<u8>>,
+    /// Rating changes still being saved, per track. While any are pending,
+    /// a refreshed track list mustn't overwrite what you just chose.
+    pending_ratings: HashMap<String, u32>,
+    /// Rating changes go to one worker so they reach Plex in the order made.
+    rate_tx: Sender<RateJob>,
+    /// An error from the UI side (e.g. a rating that didn't save) and when it appeared.
+    notice: Option<(String, Instant)>,
 
     tree_state: ListState,
     /// Rows visible in the artist pane at the last draw, for PageUp/PageDown.
@@ -109,6 +140,7 @@ impl App {
                 crate::config::new_client_id().replacen("plext-", "plext-session-", 1),
             )
         });
+        let rate_tx = spawn_rater(server.clone(), tx.clone());
         let mut app = App {
             _reporter: reporter,
             group_releases,
@@ -122,6 +154,11 @@ impl App {
             albums: HashMap::new(),
             expanded: HashMap::new(),
             tracks: HashMap::new(),
+            refreshing: HashSet::new(),
+            ratings: HashMap::new(),
+            pending_ratings: HashMap::new(),
+            rate_tx,
+            notice: None,
             tree_state: ListState::default().with_selected(Some(0)),
             tree_page: 15,
             track_state: ListState::default().with_selected(Some(0)),
@@ -195,6 +232,25 @@ impl App {
         });
     }
 
+    /// Fetches an album's tracks again so ratings changed elsewhere (in Plexamp,
+    /// or on another copy of the same recording) show up. The list on screen
+    /// stays put until the fresh one arrives.
+    fn refresh_tracks(&mut self, album_key: &str) {
+        match self.tracks.get(album_key) {
+            Some(Loadable::Ready(_)) => {}
+            Some(Loadable::Loading) => return,
+            _ => return self.load_tracks(album_key),
+        }
+        if !self.refreshing.insert(album_key.to_string()) {
+            return;
+        }
+        let (s, k, tx) = (self.server.clone(), album_key.to_string(), self.tx.clone());
+        thread::spawn(move || {
+            let r = s.tracks(&k).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Tracks(k, r));
+        });
+    }
+
     fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::Artists(r) => {
@@ -214,6 +270,25 @@ impl App {
                 self.sync_shown_album();
             }
             Msg::Tracks(k, r) => {
+                let was_refresh = self.refreshing.remove(&k);
+                if was_refresh && r.is_err() {
+                    // Keep showing what we had; the next visit will try again.
+                    return;
+                }
+                if let Ok(tracks) = &r {
+                    for t in tracks {
+                        if self.pending_ratings.get(&t.key).copied().unwrap_or(0) == 0 {
+                            self.ratings.insert(t.key.clone(), t.rating);
+                        }
+                    }
+                    let shown = self.shown_album.as_ref().map(|(_, a)| a.key == k).unwrap_or(false);
+                    if shown {
+                        let last = tracks.len().saturating_sub(1);
+                        if let Some(sel) = self.track_state.selected() {
+                            self.track_state.select(Some(sel.min(last)));
+                        }
+                    }
+                }
                 let ready = r.is_ok();
                 self.tracks.insert(
                     k.clone(),
@@ -231,7 +306,69 @@ impl App {
                     }
                 }
             }
+            Msg::Rated { key, wanted, previous, result } => {
+                if let Some(n) = self.pending_ratings.get_mut(&key) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        self.pending_ratings.remove(&key);
+                    }
+                }
+                if let Err(e) = result {
+                    crate::log::write(&format!("error: couldn't save rating for track {}: {}", key, e));
+                    // Put the old rating back, unless you've changed it again since.
+                    if self.ratings.get(&key).copied().flatten() == wanted {
+                        self.ratings.insert(key, previous);
+                    }
+                    self.notice = Some((format!("Couldn't save rating: {}", e), Instant::now()));
+                }
+            }
         }
+    }
+
+    // ---------- ratings ----------
+
+    /// The latest rating we know of for a track.
+    fn rating_of(&self, t: &Track) -> Option<u8> {
+        self.ratings.get(&t.key).copied().unwrap_or(t.rating)
+    }
+
+    /// The track a rating key applies to: the highlighted track when the
+    /// track list has focus, otherwise the one playing.
+    fn rating_target(&self) -> Option<(String, Option<u8>)> {
+        match self.focus {
+            Focus::Tracks => {
+                let t = self.shown_tracks()?.get(self.track_state.selected()?)?;
+                Some((t.key.clone(), self.rating_of(t)))
+            }
+            Focus::Tree => {
+                let st = self.player.status();
+                if st.state == PlayState::Stopped {
+                    return None;
+                }
+                let t = st.track?;
+                Some((t.key.clone(), self.rating_of(&t)))
+            }
+        }
+    }
+
+    fn rate(&mut self, code: KeyCode) {
+        let Some((key, current)) = self.rating_target() else {
+            return;
+        };
+        let wanted = match rating_for_key(code, current) {
+            Some(w) => w,
+            None => return,
+        };
+        if wanted == current {
+            return;
+        }
+        self.ratings.insert(key.clone(), wanted);
+        *self.pending_ratings.entry(key.clone()).or_insert(0) += 1;
+        let _ = self.rate_tx.send(RateJob {
+            key,
+            wanted,
+            previous: current,
+        });
     }
 
     // ---------- tree ----------
@@ -310,7 +447,7 @@ impl App {
             if let (Some(ar), Some(al)) = (self.artist(i).cloned(), self.album(i, j).cloned()) {
                 let changed = self.shown_album.as_ref().map(|(_, a)| a.key != al.key).unwrap_or(true);
                 if changed {
-                    self.load_tracks(&al.key);
+                    self.refresh_tracks(&al.key);
                     self.shown_album = Some((ar.title, al));
                     self.track_state.select(Some(0));
                 }
@@ -415,6 +552,9 @@ impl App {
             KeyCode::Char('s') => self.player.send(Cmd::Stop),
             KeyCode::Char('.') | KeyCode::Char(']') => self.player.send(Cmd::SeekBy(10.0)),
             KeyCode::Char(',') | KeyCode::Char('[') => self.player.send(Cmd::SeekBy(-10.0)),
+            KeyCode::Char('0'..='5') | KeyCode::Char('-') | KeyCode::Char('=') | KeyCode::Char('+') => {
+                self.rate(k.code)
+            }
             _ => match self.focus {
                 Focus::Tree => self.tree_key(k.code),
                 Focus::Tracks => self.tracks_key(k.code),
@@ -517,10 +657,24 @@ impl App {
         self.draw_tree(f, main[0]);
         self.draw_tracks(f, main[1], st);
         // Errors stay up long enough to read, even if the next track has started.
-        let show_error = self
-            .error_since
-            .map_or(false, |t| t.elapsed() < Duration::from_secs(15));
-        draw_now_playing(f, outer[3], st, show_error);
+        let recent = |t: Instant| t.elapsed() < Duration::from_secs(15);
+        let player_error = st
+            .error
+            .as_deref()
+            .zip(self.error_since)
+            .filter(|(_, t)| recent(*t));
+        let notice = self
+            .notice
+            .as_ref()
+            .map(|(m, t)| (m.as_str(), *t))
+            .filter(|(_, t)| recent(*t));
+        // Show whichever error is newer.
+        let error = match (player_error, notice) {
+            (Some(p), Some(n)) => Some(if n.1 > p.1 { n.0 } else { p.0 }),
+            (p, n) => p.or(n).map(|(m, _)| m),
+        };
+        let rating = st.track.as_ref().map(|t| self.rating_of(t));
+        draw_now_playing(f, outer[3], st, error, rating);
         self.draw_keys(f, outer[4]);
     }
 
@@ -724,7 +878,11 @@ impl App {
             .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
             .split(inner);
         let head = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
-        f.render_widget(Paragraph::new(track_line("#", "Title", "Format", "Time", inner_w, [head; 4])), parts[0]);
+        let rating_head = vec![Span::styled("Rating", head)];
+        f.render_widget(
+            Paragraph::new(track_line("#", "Title", rating_head, "Format", "Time", inner_w, [head; 4])),
+            parts[0],
+        );
         f.render_widget(
             Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(BORDER))),
             parts[1],
@@ -732,9 +890,12 @@ impl App {
 
         let multi_disc = tracks.iter().any(|t| t.disc.unwrap_or(1) > 1);
         let playing_key = st.track.as_ref().map(|t| t.key.clone());
+        let focused = self.focus == Focus::Tracks;
+        let selected = self.track_state.selected();
         let items: Vec<ListItem> = tracks
             .iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(i, t)| {
                 let playing = playing_key.as_deref() == Some(t.key.as_str()) && st.state != PlayState::Stopped;
                 let num = if playing {
                     "▶".to_string()
@@ -745,6 +906,10 @@ impl App {
                 };
                 let styles = if playing {
                     [Style::default().fg(ACCENT).add_modifier(Modifier::BOLD); 4]
+                } else if selected == Some(i) {
+                    // The highlight only sets the background (so the stars keep
+                    // their colours); brighten the text here instead.
+                    [Style::default().fg(BRIGHT); 4]
                 } else {
                     [
                         Style::default().fg(FAINT),
@@ -754,14 +919,17 @@ impl App {
                     ]
                 };
                 let time = t.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
-                ListItem::new(track_line(&num, &t.title, &t.format_label(), &time, inner_w, styles))
+                // Unrated tracks leave the column blank to keep the list calm.
+                let stars = match self.rating_of(t) {
+                    Some(r) => star_spans(r, if playing { DIM } else { FAINT }),
+                    None => Vec::new(),
+                };
+                ListItem::new(track_line(&num, &t.title, stars, &t.format_label(), &time, inner_w, styles))
             })
             .collect();
-        let list = List::new(items).scroll_padding(2).highlight_style(
-            Style::default()
-                .bg(if self.focus == Focus::Tracks { SEL_BG } else { Color::Reset })
-                .fg(BRIGHT),
-        );
+        let list = List::new(items)
+            .scroll_padding(2)
+            .highlight_style(Style::default().bg(if focused { SEL_BG } else { Color::Reset }));
         f.render_stateful_widget(list, parts[2], &mut self.track_state);
     }
 
@@ -773,6 +941,7 @@ impl App {
             ("space", "pause"),
             ("n/p", "next/prev"),
             (",/.", "seek"),
+            ("0-5", "rate"),
             ("tab", "switch pane"),
             ("/", "search"),
             ("q", "quit"),
@@ -792,21 +961,90 @@ fn title_style(focused: bool) -> Style {
 }
 
 /// One row of the track table. `styles` colours the number, title, format and
-/// time columns separately so the title stands out from the details.
-fn track_line(num: &str, title: &str, fmt: &str, time: &str, width: usize, styles: [Style; 4]) -> Line<'static> {
+/// time columns separately so the title stands out from the details; the
+/// rating column brings its own colours.
+fn track_line(
+    num: &str,
+    title: &str,
+    rating: Vec<Span<'static>>,
+    fmt: &str,
+    time: &str,
+    width: usize,
+    styles: [Style; 4],
+) -> Line<'static> {
     let num_w = 5;
     let fmt_w = 12;
     let time_w = 7;
-    let title_w = width.saturating_sub(num_w + fmt_w + time_w + 2).max(8);
-    Line::from(vec![
+    let title_w = width.saturating_sub(num_w + RATING_W + fmt_w + time_w + 2).max(8);
+    let rating_used: usize = rating.iter().map(|s| s.content.chars().count()).sum();
+    let mut spans = vec![
         Span::styled(format!(" {:<num_w$}", truncate(num, num_w - 1)), styles[0]),
-        Span::styled(format!("{:<title_w$}", truncate(title, title_w)), styles[1]),
-        Span::styled(format!("{:<fmt_w$}", truncate(fmt, fmt_w - 1)), styles[2]),
-        Span::styled(format!("{:>time_w$}", time), styles[3]),
-    ])
+        // Leave a gap so a long title never runs into the stars.
+        Span::styled(format!("{:<title_w$}", truncate(title, title_w.saturating_sub(2))), styles[1]),
+    ];
+    spans.extend(rating);
+    spans.push(Span::raw(" ".repeat(RATING_W.saturating_sub(rating_used))));
+    spans.push(Span::styled(format!("{:<fmt_w$}", truncate(fmt, fmt_w - 1)), styles[2]));
+    spans.push(Span::styled(format!("{:>time_w$}", time), styles[3]));
+    Line::from(spans)
 }
 
-fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, show_error: bool) {
+/// Five stars for a rating in Plex's units (1-10, two per star): full stars in
+/// the accent, a half star as a dimmer accent star, the rest as outlines in `empty`.
+fn star_spans(rating: u8, empty: Color) -> Vec<Span<'static>> {
+    let r = rating.min(10) as usize;
+    let (full, half) = (r / 2, r % 2);
+    let mut spans = Vec::new();
+    if full > 0 {
+        spans.push(Span::styled("★".repeat(full), Style::default().fg(ACCENT)));
+    }
+    if half > 0 {
+        spans.push(Span::styled("★", Style::default().fg(HALF_STAR)));
+    }
+    let rest = 5 - full - half;
+    if rest > 0 {
+        spans.push(Span::styled("☆".repeat(rest), Style::default().fg(empty)));
+    }
+    spans
+}
+
+/// The rating a key sets, given the track's current rating. `None` means the
+/// key doesn't change anything; `Some(None)` clears the rating.
+fn rating_for_key(code: KeyCode, current: Option<u8>) -> Option<Option<u8>> {
+    match code {
+        KeyCode::Char('0') => Some(None),
+        KeyCode::Char(c @ '1'..='5') => Some(Some((c as u8 - b'0') * 2)),
+        // Half a star down; going below half a star clears the rating.
+        KeyCode::Char('-') => current.map(|r| Some(r - 1).filter(|&r| r > 0)),
+        // Half a star up, starting from nothing on an unrated track.
+        KeyCode::Char('=') | KeyCode::Char('+') => Some(Some((current.unwrap_or(0) + 1).min(10))),
+        _ => None,
+    }
+}
+
+/// Saves rating changes to Plex one at a time, in the order you make them,
+/// so quick changes in a row can't land out of order.
+fn spawn_rater(server: Server, tx: Sender<Msg>) -> Sender<RateJob> {
+    let (job_tx, job_rx) = mpsc::channel::<RateJob>();
+    thread::spawn(move || {
+        for job in job_rx {
+            let result = server.rate(&job.key, job.wanted).map_err(|e| e.to_string());
+            let msg = Msg::Rated {
+                key: job.key,
+                wanted: job.wanted,
+                previous: job.previous,
+                result,
+            };
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    job_tx
+}
+
+/// `rating` is the playing track's latest rating (`Some(None)` when unrated).
+fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>, rating: Option<Option<u8>>) {
     let active = matches!(st.state, PlayState::Playing | PlayState::Paused | PlayState::Loading);
     let edge = if st.state == PlayState::Playing { ACCENT } else if active { DIM } else { BORDER };
     let mut block = Block::default()
@@ -854,6 +1092,9 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, show_error: bool) {
     if let Some(t) = &st.track {
         if st.state != PlayState::Stopped {
             l1.push(Span::styled(t.title.clone(), Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD)));
+            // Faint outlines when unrated, so you can see there's a rating to set.
+            l1.push(Span::raw("  "));
+            l1.extend(star_spans(rating.flatten().unwrap_or(0), BORDER));
             l1.push(Span::styled(format!("   {} — {}", t.artist, t.album), Style::default().fg(DIM)));
         }
     }
@@ -901,7 +1142,7 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, show_error: bool) {
     );
 
     // Line 3: source and output details, or the last error.
-    if let (Some(e), true) = (&st.error, show_error) {
+    if let Some(e) = error {
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ⚠ {}", e), Style::default().fg(WARN))),
             rows[2],
@@ -973,5 +1214,179 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max - 1).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plex::Plex;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn number_keys_set_whole_stars_and_zero_clears() {
+        assert_eq!(rating_for_key(KeyCode::Char('1'), None), Some(Some(2)));
+        assert_eq!(rating_for_key(KeyCode::Char('4'), Some(9)), Some(Some(8)));
+        assert_eq!(rating_for_key(KeyCode::Char('5'), Some(3)), Some(Some(10)));
+        assert_eq!(rating_for_key(KeyCode::Char('0'), Some(7)), Some(None));
+    }
+
+    #[test]
+    fn plus_and_minus_move_by_half_a_star() {
+        assert_eq!(rating_for_key(KeyCode::Char('='), Some(8)), Some(Some(9)));
+        assert_eq!(rating_for_key(KeyCode::Char('+'), Some(8)), Some(Some(9)));
+        assert_eq!(rating_for_key(KeyCode::Char('='), None), Some(Some(1)));
+        assert_eq!(rating_for_key(KeyCode::Char('='), Some(10)), Some(Some(10)));
+        assert_eq!(rating_for_key(KeyCode::Char('-'), Some(9)), Some(Some(8)));
+        // Half a star down from half a star clears it; nothing to lower when unrated.
+        assert_eq!(rating_for_key(KeyCode::Char('-'), Some(1)), Some(None));
+        assert_eq!(rating_for_key(KeyCode::Char('-'), None), None);
+        assert_eq!(rating_for_key(KeyCode::Char('x'), Some(4)), None);
+    }
+
+    fn stars_text(r: u8) -> (String, Vec<Color>) {
+        let spans = star_spans(r, FAINT);
+        let text = spans.iter().map(|s| s.content.as_ref()).collect();
+        let colors = spans
+            .iter()
+            .flat_map(|s| std::iter::repeat(s.style.fg.unwrap()).take(s.content.chars().count()))
+            .collect();
+        (text, colors)
+    }
+
+    #[test]
+    fn stars_are_always_five_wide_with_a_dim_half_star() {
+        for r in 0..=10 {
+            assert_eq!(stars_text(r).0.chars().count(), 5, "rating {}", r);
+        }
+        assert_eq!(stars_text(10).0, "★★★★★");
+        assert_eq!(stars_text(6).0, "★★★☆☆");
+        let (text, colors) = stars_text(7);
+        assert_eq!(text, "★★★★☆");
+        assert_eq!(colors, vec![ACCENT, ACCENT, ACCENT, HALF_STAR, FAINT]);
+    }
+
+    fn track(key: &str, index: u32, title: &str, rating: Option<u8>) -> Track {
+        Track {
+            key: key.into(),
+            title: title.into(),
+            album_key: Some("100".into()),
+            artist: "Cat Power".into(),
+            album: "You Are Free".into(),
+            index: Some(index),
+            disc: Some(1),
+            duration_ms: Some(185_000),
+            codec: Some("flac".into()),
+            bit_depth: Some(16),
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            bitrate_kbps: Some(641),
+            part_key: None,
+            container: None,
+            rating,
+        }
+    }
+
+    /// An app with one album open in the track list, talking to a server
+    /// address nothing listens on.
+    fn app_with_album(tracks: Vec<Track>) -> App {
+        let server = Server::new(Plex::new("plext-test"), "http://127.0.0.1:9", "token", "machine");
+        let header = HeaderInfo {
+            server_name: "Home".into(),
+            library_title: "Music".into(),
+        };
+        let mut app = App::new(server, "1".into(), header, "null".into(), false, true);
+        let album = Album {
+            key: "100".into(),
+            title: "You Are Free".into(),
+            year: Some(2003),
+            kind: ReleaseKind::Album,
+        };
+        for t in &tracks {
+            app.ratings.insert(t.key.clone(), t.rating);
+        }
+        app.tracks.insert(album.key.clone(), Loadable::Ready(tracks));
+        app.shown_album = Some(("Cat Power".into(), album));
+        app.focus = Focus::Tracks;
+        app
+    }
+
+    fn render(app: &mut App, st: &Status) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        term.draw(|f| app.draw(f, st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn track_list_and_now_playing_show_ratings() {
+        let tracks = vec![
+            track("1", 1, "I Don't Blame You", Some(8)),
+            track("2", 2, "Free", None),
+            track("3", 3, "Good Woman", Some(9)),
+        ];
+        let mut app = app_with_album(tracks.clone());
+        let st = Status {
+            state: PlayState::Playing,
+            track: Some(tracks[0].clone()),
+            dur: Some(185.0),
+            queue_len: 3,
+            ..Status::default()
+        };
+        let screen = render(&mut app, &st);
+        let row = |needle: &str| screen.iter().find(|l| l.contains(needle) && !l.contains("PLAYING")).unwrap().clone();
+        assert!(screen.iter().any(|l| l.contains("Rating") && l.contains("Format")));
+        assert!(row("Good Woman").contains("★★★★★"));
+        assert!(row("I Don't Blame You").contains("★★★★☆"));
+        assert!(!row("Free").contains('★') && !row("Free").contains('☆'));
+        let playing = screen.iter().find(|l| l.contains("PLAYING")).unwrap();
+        assert!(playing.contains("I Don't Blame You  ★★★★☆"));
+    }
+
+    #[test]
+    fn rating_keys_target_the_highlighted_track_in_the_track_list() {
+        let mut app = app_with_album(vec![track("1", 1, "One", None), track("2", 2, "Two", Some(4))]);
+        app.track_state.select(Some(1));
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        assert_eq!(app.ratings.get("2"), Some(&Some(8)));
+        assert_eq!(app.pending_ratings.get("2"), Some(&1));
+        app.on_key(KeyEvent::from(KeyCode::Char('=')));
+        assert_eq!(app.ratings.get("2"), Some(&Some(9)));
+        assert_eq!(app.ratings.get("1"), Some(&None));
+    }
+
+    #[test]
+    fn a_rating_that_fails_to_save_is_put_back() {
+        let mut app = app_with_album(vec![track("1", 1, "One", Some(6))]);
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(app.ratings.get("1"), Some(&Some(4)));
+        // Nothing listens on the test server, so the save fails.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.pending_ratings.contains_key("1") && Instant::now() < deadline {
+            if let Ok(m) = app.rx.recv_timeout(Duration::from_millis(100)) {
+                app.on_msg(m);
+            }
+        }
+        assert_eq!(app.ratings.get("1"), Some(&Some(6)));
+        assert!(app.notice.as_ref().unwrap().0.starts_with("Couldn't save rating"));
+    }
+
+    #[test]
+    fn a_refreshed_track_list_brings_in_new_ratings_but_keeps_unsaved_ones() {
+        let mut app = app_with_album(vec![track("1", 1, "One", None), track("2", 2, "Two", Some(4))]);
+        app.pending_ratings.insert("2".into(), 1);
+        app.ratings.insert("2".into(), Some(10));
+        app.refreshing.insert("100".into());
+        let fresh = vec![track("1", 1, "One", Some(7)), track("2", 2, "Two", Some(4))];
+        app.on_msg(Msg::Tracks("100".into(), Ok(fresh)));
+        assert_eq!(app.ratings.get("1"), Some(&Some(7)));
+        assert_eq!(app.ratings.get("2"), Some(&Some(10)));
+        // A refresh that fails keeps the list we already had.
+        app.refreshing.insert("100".into());
+        app.on_msg(Msg::Tracks("100".into(), Err("offline".into())));
+        assert!(matches!(app.tracks.get("100"), Some(Loadable::Ready(t)) if t.len() == 2));
     }
 }
