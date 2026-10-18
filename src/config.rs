@@ -21,6 +21,8 @@ pub struct Config {
     pub report_playback: Option<bool>,
     /// Group an artist's releases under headings (Albums, EPs, Live…). Default: on.
     pub group_releases: Option<bool>,
+    /// Show in the desktop's media controls and obey media keys (MPRIS). Default: on.
+    pub mpris: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

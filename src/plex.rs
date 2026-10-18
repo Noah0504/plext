@@ -122,6 +122,8 @@ pub struct Track {
     /// Your rating in Plex's units: 1-10, where 2 is one star (so odd numbers
     /// are half stars). `None` when the track isn't rated.
     pub rating: Option<u8>,
+    /// Server path of the album cover, e.g. "/library/metadata/123/thumb/1700000000".
+    pub thumb: Option<String>,
 }
 
 impl Track {
@@ -540,6 +542,31 @@ impl Server {
         Ok(tracks)
     }
 
+    /// Downloads an image such as an album cover, scaled down by the server to
+    /// at most `size`×`size` pixels. `path` is a server path like a track's `thumb`.
+    pub fn fetch_image(&self, path: &str, size: u32) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/photo/:/transcode?width={size}&height={size}&minSize=1&upscale=0&url={}",
+            self.base,
+            encode(path)
+        );
+        let resp = self
+            .plex
+            .req("GET", &url, Some(&self.token))
+            .set("Accept", "image/jpeg, image/png, image/*")
+            .timeout(Duration::from_secs(15))
+            .call()
+            .map_err(describe)?;
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .take(16 * 1024 * 1024)
+            .read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Err(anyhow!("empty image from Plex"));
+        }
+        Ok(bytes)
+    }
+
     /// Opens the original media file for streaming (no transcoding), starting
     /// at byte `offset` (used to resume after a dropped connection).
     /// Returns a reader positioned at `offset` and the file's total size if known.
@@ -597,6 +624,7 @@ fn merge(base: Track, full: Track) -> Track {
         part_key: full.part_key.or(base.part_key),
         container: full.container.or(base.container),
         rating: full.rating.or(base.rating),
+        thumb: full.thumb.or(base.thumb),
     }
 }
 
@@ -648,6 +676,12 @@ fn parse_track(m: &Value) -> Track {
             .or_else(|| media.and_then(|md| md["container"].as_str()))
             .map(String::from),
         rating: parse_rating(&m["userRating"]),
+        // A track's own thumb is usually its album's cover; prefer the album's.
+        thumb: m["parentThumb"]
+            .as_str()
+            .or_else(|| m["thumb"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
     }
 }
 

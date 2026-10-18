@@ -22,6 +22,9 @@ all from a single static binary for Linux.
   `media.resume`, `media.stop`, `media.scrobble`).
 - **Track ratings.** See and set your Plex star ratings (half stars included) in the track list
   and the now-playing bar. Ratings are shared with Plex and Plexamp.
+- **Desktop media controls (MPRIS).** Plext shows up in your desktop's media controls (GNOME's
+  top bar and lock screen, KDE's media applet) with the track and album cover, and the keyboard's
+  play/pause, next and previous keys control it.
 - **Plex sign-in with a link code**, automatic server discovery, LAN and remote connections.
 - **Single static binary**: no dependencies to install.
 
@@ -99,6 +102,28 @@ To turn reporting off, add this to `~/.config/plext/config.toml`:
 report_playback = false
 ```
 
+## Media keys and desktop controls
+
+While Plext runs, it registers with your desktop as a media player over MPRIS, the standard
+Linux desktops use for this. GNOME and KDE then show the playing track, artist, album and cover
+in their media controls, and route the keyboard's media keys to Plext: play/pause, next,
+previous and stop. Seeking from those controls works too. Volume isn't offered there, since
+Plext plays bit-perfect and leaves volume to your DAC or amp.
+
+On window managers without built-in media controls (sway, i3, Hyprland…), bind your keys to
+[`playerctl`](https://github.com/altdesktop/playerctl), for example in sway:
+
+```
+bindsym XF86AudioPlay exec playerctl -p plext play-pause
+bindsym XF86AudioNext exec playerctl -p plext next
+bindsym XF86AudioPrev exec playerctl -p plext previous
+```
+
+Album covers are downloaded from your server into `~/.cache/plext/covers` (the newest 400 are
+kept) and handed to the desktop as local files, so your Plex token never leaves Plext. Over SSH
+or on a console with no desktop session there's nothing to register with, and Plext simply
+carries on without it. To turn it off, set `mpris = false`.
+
 ## Ratings
 
 Plext shows your rating for each track in the track list and next to the title in the
@@ -126,6 +151,7 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 | `device` | first USB DAC | ALSA output device; set it with `plext device <name>` |
 | `report_playback` | `true` | Report playback to Plex (dashboard, history, webhooks) |
 | `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |
+| `mpris` | `true` | Show in the desktop's media controls and obey media keys |
 
 ## Bit-perfect notes
 
@@ -148,6 +174,8 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
   connections Plext recovered from.
 - **Can't reach the server.** Plext tries the server's other addresses automatically. If your
   server moved or your sign-in expired, run `plext login` again.
+- **Media keys don't do anything.** Check that Plext is registered with `playerctl -l` (it lists
+  `plext`). If another player also runs, your desktop may send the keys to that one instead.
 - **A release is in the wrong group.** Plext uses the release type Plex reads from your tags.
   `plext inspect "Artist"` shows what the server reports for each release.
 
