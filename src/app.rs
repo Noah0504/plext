@@ -935,19 +935,16 @@ impl App {
     fn draw_tracks(&mut self, f: &mut Frame, area: Rect, st: &Status) {
         let (title, right) = match &self.shown_album {
             Some((artist, al)) => {
-                let mut t = vec![
-                    Span::raw(" "),
-                    Span::styled(al.title.clone(), title_style(self.focus == Focus::Tracks)),
-                    Span::styled(format!(" · {}", artist), Style::default().fg(DIM)),
-                ];
+                let name = Span::styled(al.title.clone(), title_style(self.focus == Focus::Tracks));
+                let by = Span::styled(format!(" · {}", artist), Style::default().fg(DIM));
+                let mut extra = Vec::new();
                 if let Some(y) = al.year {
-                    t.push(Span::styled(format!(" · {}", y), Style::default().fg(DIM)));
+                    extra.push(Span::styled(format!(" · {}", y), Style::default().fg(DIM)));
                 }
                 if let Some(kind) = al.kind.label() {
-                    t.push(Span::styled(format!(" · {}", kind), Style::default().fg(DIM)));
+                    extra.push(Span::styled(format!(" · {}", kind), Style::default().fg(DIM)));
                 }
-                t.push(Span::raw(" "));
-                let right = match self.tracks.get(&al.key) {
+                let rights = match self.tracks.get(&al.key) {
                     Some(Loadable::Ready(tr)) => {
                         let total: u64 = tr.iter().filter_map(|t| t.duration_ms).sum();
                         let fmt = tr.first().map(|t| t.format_label()).unwrap_or_default();
@@ -956,11 +953,12 @@ impl App {
                             .and_then(|t| t.codec.clone())
                             .map(|c| c.to_uppercase())
                             .unwrap_or_default();
-                        format!(" {} {} · {} tracks · {} ", codec, fmt, tr.len(), mmss(total as f64 / 1000.0))
+                        let summary = format!("{} tracks · {}", tr.len(), mmss(total as f64 / 1000.0));
+                        vec![format!(" {} {} · {} ", codec, fmt, summary), format!(" {} ", summary)]
                     }
-                    _ => String::new(),
+                    _ => Vec::new(),
                 };
-                (Line::from(t), right)
+                fit_pane_titles(area.width, name, by, extra, rights)
             }
             None => (
                 Line::from(Span::styled(" Tracks ", title_style(self.focus == Focus::Tracks))),
@@ -1341,33 +1339,6 @@ fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>
     if st.state == PlayState::Stopped {
         return;
     }
-    let width = area.width as usize;
-    let len = |spans: &[Span]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-
-    // Left: the source, from most to least detailed.
-    let sources: Vec<String> = match &st.source {
-        Some(s) => {
-            let ch = match s.channels {
-                1 => "mono".to_string(),
-                2 => "stereo".to_string(),
-                n => format!("{} ch", n),
-            };
-            let base = if s.lossless {
-                format!("{} · {}-bit / {} kHz", s.codec, s.bits, khz(s.rate))
-            } else {
-                format!("{} · {} kHz · lossy", s.codec, khz(s.rate))
-            };
-            let mut v = Vec::new();
-            if let Some(br) = st.track.as_ref().and_then(|t| t.bitrate_kbps) {
-                v.push(format!("{} · {} · {} kbps", base, ch, br));
-            }
-            v.push(format!("{} · {}", base, ch));
-            v.push(base);
-            v
-        }
-        None => vec![String::new()],
-    };
-
     // Right: verdict → device · mode, with or without the mode.
     let rights: Vec<Vec<Span>> = match &st.output {
         Some(o) => {
@@ -1386,40 +1357,7 @@ fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>
         }
         None => vec![Vec::new()],
     };
-
-    // The fullest pair that fits with a two-column gap; else the shortest of each.
-    let mut pick = (sources.len() - 1, rights.len() - 1);
-    'search: for (ri, r) in rights.iter().enumerate() {
-        for (si, src) in sources.iter().enumerate() {
-            if src.chars().count() + 2 + len(r) <= width {
-                pick = (si, ri);
-                break 'search;
-            }
-        }
-    }
-    let src = &sources[pick.0];
-    let mut right = rights[pick.1].clone();
-    let right_w = len(&right).min(width);
-    if right_w < len(&right) {
-        // Even the short form is too wide: shorten the device name.
-        let over = len(&right) - right_w;
-        if let Some(dev) = right.get_mut(2) {
-            let keep = dev.content.chars().count().saturating_sub(over).max(4);
-            *dev = Span::styled(truncate(&dev.content, keep), dev.style);
-        }
-    }
-    let right_w = len(&right).min(width) as u16;
-    let parts = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
-        .split(area);
-    let room = (parts[0].width as usize).saturating_sub(2);
-    if room >= 4 && !src.is_empty() {
-        f.render_widget(Paragraph::new(Span::styled(truncate(src, room), Style::default().fg(DIM))), parts[0]);
-    }
-    if !right.is_empty() {
-        f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), parts[1]);
-    }
+    draw_split_line(f, area, &source_variants(st), rights, 2);
 }
 
 /// "▶ PLAYING  Title  ★★★★☆" (the title and stars only while something plays).
@@ -1493,6 +1431,55 @@ fn draw_progress(f: &mut Frame, area: Rect, st: &Status, indent: bool) {
 }
 
 /// Source and output details, or the latest error in their place.
+/// Fits the track list's border headings into a pane `width` wide: the
+/// album heading on the left (name, artist, then extras like year and
+/// type) and the summary on the right (fullest form first). Pieces go
+/// whole, least important first: the format, then the whole summary, then
+/// the extras; only then are the artist and finally the name shortened.
+fn fit_pane_titles(
+    width: u16,
+    name: Span<'static>,
+    by: Span<'static>,
+    extra: Vec<Span<'static>>,
+    rights: Vec<String>,
+) -> (Line<'static>, String) {
+    // Two corners, the spaces around the heading, and a gap of at least one.
+    let avail = (width as usize).saturating_sub(5);
+    let n = |s: &Span| s.content.chars().count();
+    let line = |spans: Vec<Span<'static>>| {
+        let mut v = vec![Span::raw(" ")];
+        v.extend(spans);
+        v.push(Span::raw(" "));
+        Line::from(v)
+    };
+    let full_left = n(&name) + n(&by) + extra.iter().map(n).sum::<usize>();
+    for r in &rights {
+        if full_left + r.chars().count() <= avail {
+            let mut spans = vec![name, by];
+            spans.extend(extra);
+            return (line(spans), r.clone());
+        }
+    }
+    if full_left <= avail {
+        let mut spans = vec![name, by];
+        spans.extend(extra);
+        return (line(spans), String::new());
+    }
+    if n(&name) + n(&by) <= avail {
+        return (line(vec![name, by]), String::new());
+    }
+    // Shorten the artist, keeping at least " · X…"; then the name.
+    let by_room = avail.saturating_sub(n(&name));
+    if by_room >= 5 {
+        let short = truncate(&by.content, by_room);
+        return (line(vec![name, Span::styled(short, by.style)]), String::new());
+    }
+    let short = truncate(&name.content, avail.max(1));
+    (line(vec![Span::styled(short, name.style)]), String::new())
+}
+
+/// The compact bar's details line: source on the left, output on the
+/// right. Like the tall layout's, it drops pieces whole when narrow.
 fn draw_details(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>) {
     if let Some(e) = error {
         f.render_widget(
@@ -1501,50 +1488,91 @@ fn draw_details(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>) {
         );
         return;
     }
-    let playing = st.state != PlayState::Stopped;
-    // Split the line: source details on the left, output details on the right.
-    let out_text = match (&st.output, playing) {
-        (Some(o), true) => {
-            let mode = if o.direct { "exclusive · no resample · vol: DAC" } else { "via ALSA plugins" };
-            Some((o.label.clone(), format!(" · {} · {} ", o.fmt.name(), mode)))
-        }
-        _ => None,
-    };
-    let out_w = out_text
-        .as_ref()
-        .map(|(d, rest)| (5 + d.chars().count() + rest.chars().count()) as u16)
-        .unwrap_or(0)
-        .min(area.width * 55 / 100);
-    let line3 = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(out_w)])
-        .split(area);
-    if let (Some(s), true) = (&st.source, playing) {
-        let ch = match s.channels {
-            1 => "mono".to_string(),
-            2 => "stereo".to_string(),
-            n => format!("{} ch", n),
-        };
-        let mut src = format!(" {} · ", s.codec);
-        if s.lossless {
-            src.push_str(&format!("{}-bit / {} kHz · {}", s.bits, khz(s.rate), ch));
-        } else {
-            src.push_str(&format!("{} kHz · {} · lossy", khz(s.rate), ch));
-        }
-        if let Some(br) = st.track.as_ref().and_then(|t| t.bitrate_kbps) {
-            src.push_str(&format!(" · {} kbps", br));
-        }
-        f.render_widget(Paragraph::new(Span::styled(src, Style::default().fg(DIM))), line3[0]);
+    if st.state == PlayState::Stopped {
+        return;
     }
-    if let Some((device, rest)) = out_text {
-        let room = (out_w as usize).saturating_sub(5 + rest.chars().count());
-        let out = Line::from(vec![
-            Span::styled("out: ", Style::default().fg(DIM)),
-            Span::styled(truncate(&device, room.max(6)), Style::default().fg(BRIGHT)),
-            Span::styled(rest, Style::default().fg(DIM)),
-        ])
-        .alignment(Alignment::Right);
-        f.render_widget(Paragraph::new(out), line3[1]);
+    let sources: Vec<String> = source_variants(st).into_iter().map(|s| format!(" {}", s)).collect();
+    let rights: Vec<Vec<Span>> = match &st.output {
+        Some(o) => {
+            let out = Span::styled("out: ", Style::default().fg(DIM));
+            let device = Span::styled(o.label.clone(), Style::default().fg(BRIGHT));
+            let dim = |t: String| Span::styled(t, Style::default().fg(DIM));
+            let modes: Vec<String> = if o.direct {
+                vec![
+                    format!(" · {} · exclusive · no resample · vol: DAC ", o.fmt.name()),
+                    format!(" · {} · exclusive ", o.fmt.name()),
+                    " ".into(),
+                ]
+            } else {
+                vec![format!(" · {} · via ALSA plugins ", o.fmt.name()), " · via ALSA plugins ".into(), " ".into()]
+            };
+            modes.into_iter().map(|m| vec![out.clone(), device.clone(), dim(m)]).collect()
+        }
+        None => vec![Vec::new()],
+    };
+    draw_split_line(f, area, &sources, rights, 1);
+}
+
+/// The source description, from most to least detailed.
+fn source_variants(st: &Status) -> Vec<String> {
+    let Some(s) = &st.source else { return vec![String::new()] };
+    let ch = match s.channels {
+        1 => "mono".to_string(),
+        2 => "stereo".to_string(),
+        n => format!("{} ch", n),
+    };
+    let base = if s.lossless {
+        format!("{} · {}-bit / {} kHz", s.codec, s.bits, khz(s.rate))
+    } else {
+        format!("{} · {} kHz · lossy", s.codec, khz(s.rate))
+    };
+    let mut v = Vec::new();
+    if let Some(br) = st.track.as_ref().and_then(|t| t.bitrate_kbps) {
+        v.push(format!("{} · {} · {} kbps", base, ch, br));
+    }
+    v.push(format!("{} · {}", base, ch));
+    v.push(base);
+    v
+}
+
+/// Draws `sources[i]` on the left and `rights[j]` right-aligned, choosing
+/// the fullest pair that fits with a two-column gap (the right side's
+/// detail is kept longest). If even the shortest pair doesn't fit, the
+/// span at `shrink` in the right side (the device name) is shortened.
+fn draw_split_line(f: &mut Frame, area: Rect, sources: &[String], rights: Vec<Vec<Span<'static>>>, shrink: usize) {
+    let width = area.width as usize;
+    let len = |spans: &[Span]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let mut pick = (sources.len() - 1, rights.len() - 1);
+    'search: for (ri, r) in rights.iter().enumerate() {
+        for (si, src) in sources.iter().enumerate() {
+            if src.chars().count() + 2 + len(r) <= width {
+                pick = (si, ri);
+                break 'search;
+            }
+        }
+    }
+    let src = &sources[pick.0];
+    let mut right = rights.into_iter().nth(pick.1).unwrap_or_default();
+    let min_src = src.chars().count().min(12);
+    let max_right = width.saturating_sub(min_src + 2);
+    if len(&right) > max_right {
+        let over = len(&right) - max_right;
+        if let Some(dev) = right.get_mut(shrink) {
+            let keep = dev.content.chars().count().saturating_sub(over).max(4);
+            *dev = Span::styled(truncate(&dev.content, keep), dev.style);
+        }
+    }
+    let right_w = len(&right).min(width) as u16;
+    let parts = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
+        .split(area);
+    let room = (parts[0].width as usize).saturating_sub(2);
+    if room >= 4 && !src.trim().is_empty() {
+        f.render_widget(Paragraph::new(Span::styled(truncate(src, room), Style::default().fg(DIM))), parts[0]);
+    }
+    if !right.is_empty() {
+        f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), parts[1]);
     }
 }
 
@@ -1896,6 +1924,43 @@ mod tests {
             assert!(title.contains("Cat Power — You Are Free"), "{} {}x{}", album_art, w, h);
             assert!(!screen.iter().any(|l| l.contains('▀') || l.contains('♪')));
         }
+    }
+
+    #[test]
+    fn at_80x24_headings_and_details_fit_without_overlapping() {
+        use crate::decode::SourceInfo;
+        use crate::output::{OutputInfo, SampleFmt};
+        let tracks: Vec<Track> = (1..=5).map(|i| track(&i.to_string(), i, &format!("Song {}", i), None)).collect();
+        let mut app = app_with_album(tracks.clone());
+        if let Some((_, a)) = app.shown_album.as_mut() {
+            a.kind = ReleaseKind::Ep;
+        }
+        let mut st = playing_status(&tracks[2]);
+        st.source = Some(SourceInfo {
+            codec: "FLAC".into(),
+            lossless: true,
+            rate: 44_100,
+            channels: 2,
+            bits: 16,
+            duration_secs: Some(185.0),
+        });
+        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, direct: true });
+        let buf = render_sized(&mut app, &st, 80, 24);
+        let screen: Vec<String> = (0..24).map(|y| row_text(&buf, y)).collect();
+
+        // The track list heading keeps the album, artist, year and type whole;
+        // the summary on the right is either whole or left out.
+        let heading = screen.iter().find(|l| l.contains("You Are Free")).unwrap();
+        assert!(heading.contains("You Are Free · Cat Power · 2003 · EP"), "{}", heading);
+        if heading.contains("tracks") {
+            assert!(heading.contains("5 tracks · 15:25"), "{}", heading);
+        }
+
+        // The compact details line: a real gap before "out:", nothing cut off.
+        let details = screen.iter().find(|l| l.contains("FLAC ·")).unwrap();
+        assert!(details.contains("  out: Schiit Modi+"), "{}", details);
+        assert!(!details.contains('…'), "{}", details);
+        assert!(inside(details).ends_with("exclusive") || inside(details).ends_with("vol: DAC") || inside(details).ends_with("Modi+"), "{}", details);
     }
 
     #[test]
