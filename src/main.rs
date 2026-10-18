@@ -6,6 +6,7 @@ mod download;
 mod log;
 mod mpris;
 mod output;
+mod pixelart;
 mod player;
 mod plex;
 mod report;
@@ -128,6 +129,7 @@ fn run(cfg: &mut Config, device_override: Option<String>) -> Result<()> {
         cfg.report_playback.unwrap_or(true),
         cfg.group_releases.unwrap_or(true),
         cfg.mpris.unwrap_or(true),
+        cfg.album_art.unwrap_or(true),
     ).run(&mut terminal);
     ratatui::restore();
     result

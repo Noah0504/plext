@@ -2,6 +2,7 @@
 
 use crate::covers::Covers;
 use crate::mpris::Mpris;
+use crate::pixelart::{self, PixelArt};
 use crate::player::{Cmd, PlayState, Player, Status};
 use crate::plex::{khz, Album, Artist, ReleaseKind, Server, Track};
 use crate::report::Reporter;
@@ -35,6 +36,8 @@ const HALF_STAR: Color = Color::Rgb(0x8a, 0x6a, 0x2a);
 const RATING_W: usize = 7;
 
 enum Msg {
+    /// A cover finished turning into pixel art (keyed by its Plex thumb path).
+    Art(String, Result<PixelArt, String>),
     Artists(Result<Vec<Artist>, String>),
     Albums(String, Result<Vec<Album>, String>),
     Tracks(String, Result<Vec<Track>, String>),
@@ -52,6 +55,20 @@ struct RateJob {
     key: String,
     wanted: Option<u8>,
     previous: Option<u8>,
+}
+
+/// The playing album's cover, on its way to the screen.
+struct ArtSlot {
+    thumb: String,
+    state: ArtState,
+}
+
+enum ArtState {
+    /// Waiting for the download.
+    Waiting,
+    Decoding,
+    Ready(PixelArt),
+    Failed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,6 +98,11 @@ pub struct App {
     player: Player,
     _reporter: Option<Reporter>,
     _mpris: Option<Mpris>,
+    covers: Option<Covers>,
+    /// Show the cover as pixel art in a taller now-playing area.
+    album_art: bool,
+    truecolor: bool,
+    art: Option<ArtSlot>,
     /// Show release-type headings under an expanded artist.
     group_releases: bool,
     tx: Sender<Msg>,
@@ -134,6 +156,7 @@ impl App {
         report_playback: bool,
         group_releases: bool,
         mpris: bool,
+        album_art: bool,
     ) -> App {
         let (tx, rx) = mpsc::channel();
         let player = Player::spawn(server.clone(), device);
@@ -144,13 +167,16 @@ impl App {
                 crate::config::new_client_id().replacen("plext-", "plext-session-", 1),
             )
         });
-        let mpris = mpris.then(|| {
-            Mpris::spawn(player.status_handle(), player.commander(), Covers::open(server.clone()))
-        });
+        let covers = (mpris || album_art).then(|| Covers::open(server.clone())).flatten();
+        let mpris = mpris.then(|| Mpris::spawn(player.status_handle(), player.commander(), covers.clone()));
         let rate_tx = spawn_rater(server.clone(), tx.clone());
         let mut app = App {
             _reporter: reporter,
             _mpris: mpris,
+            covers,
+            album_art,
+            truecolor: pixelart::truecolor(),
+            art: None,
             group_releases,
             server,
             library_key,
@@ -189,6 +215,7 @@ impl App {
                 self.on_msg(m);
             }
             let status = self.player.status();
+            self.update_art(&status);
             if status.error_seq != self.seen_error_seq {
                 self.seen_error_seq = status.error_seq;
                 self.error_since = Some(Instant::now());
@@ -207,6 +234,42 @@ impl App {
     }
 
     // ---------- loading ----------
+
+    /// Keeps the cover for the playing track on its way: asks for the
+    /// download, then turns the file into pixel art on a background thread.
+    fn update_art(&mut self, st: &Status) {
+        if !self.album_art {
+            return;
+        }
+        let Some(covers) = self.covers.as_ref() else { return };
+        let thumb = st
+            .track
+            .as_ref()
+            .filter(|_| st.state != PlayState::Stopped)
+            .and_then(|t| t.thumb.clone());
+        let Some(thumb) = thumb else {
+            self.art = None;
+            return;
+        };
+        if self.art.as_ref().map(|a| a.thumb != thumb).unwrap_or(true) {
+            covers.request(&thumb);
+            self.art = Some(ArtSlot {
+                thumb: thumb.clone(),
+                state: ArtState::Waiting,
+            });
+        }
+        let slot = self.art.as_mut().unwrap();
+        if matches!(slot.state, ArtState::Waiting) {
+            if let Some(path) = covers.cached(&thumb) {
+                slot.state = ArtState::Decoding;
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let r = pixelart::from_file(&path).map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::Art(thumb, r));
+                });
+            }
+        }
+    }
 
     fn load_artists(&mut self) {
         let (s, key, tx) = (self.server.clone(), self.library_key.clone(), self.tx.clone());
@@ -261,6 +324,17 @@ impl App {
 
     fn on_msg(&mut self, m: Msg) {
         match m {
+            Msg::Art(thumb, r) => {
+                if let Some(slot) = self.art.as_mut().filter(|a| a.thumb == thumb) {
+                    slot.state = match r {
+                        Ok(art) => ArtState::Ready(art),
+                        Err(e) => {
+                            crate::log::write(&format!("cover: couldn't read {}: {}", thumb, e));
+                            ArtState::Failed
+                        }
+                    };
+                }
+            }
             Msg::Artists(r) => {
                 self.artists = match r {
                     Ok(a) => Loadable::Ready(a),
@@ -645,6 +719,7 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame, st: &Status) {
         let area = f.area();
+        let tall = self.album_art && area.width >= TALL_MIN_W && area.height >= TALL_MIN_H;
         f.render_widget(Block::default().style(Style::default().fg(FG)), area);
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -652,7 +727,7 @@ impl App {
                 Constraint::Length(1), // header
                 Constraint::Length(1), // breathing room under the header
                 Constraint::Min(5),
-                Constraint::Length(5),
+                Constraint::Length(if tall { NOW_PLAYING_TALL_H } else { NOW_PLAYING_H }),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -682,7 +757,14 @@ impl App {
             (p, n) => p.or(n).map(|(m, _)| m),
         };
         let rating = st.track.as_ref().map(|t| self.rating_of(t));
-        draw_now_playing(f, outer[3], st, error, rating);
+        let art = tall.then(|| ArtView {
+            art: match self.art.as_ref().map(|a| &a.state) {
+                Some(ArtState::Ready(p)) => Some(p),
+                _ => None,
+            },
+            truecolor: self.truecolor,
+        });
+        draw_now_playing(f, outer[3], st, error, rating, art);
         self.draw_keys(f, outer[4]);
     }
 
@@ -1051,8 +1133,30 @@ fn spawn_rater(server: Server, tx: Sender<Msg>) -> Sender<RateJob> {
     job_tx
 }
 
+/// Height of the now-playing box: compact, or tall with the cover beside it.
+const NOW_PLAYING_H: u16 = 5;
+const NOW_PLAYING_TALL_H: u16 = 2 + (pixelart::SIZE / 2) as u16;
+/// The tall layout only when the terminal has room for it.
+const TALL_MIN_W: u16 = 90;
+const TALL_MIN_H: u16 = 30;
+
+/// What the cover area shows in the tall layout.
+pub struct ArtView<'a> {
+    pub art: Option<&'a PixelArt>,
+    pub truecolor: bool,
+}
+
 /// `rating` is the playing track's latest rating (`Some(None)` when unrated).
-fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>, rating: Option<Option<u8>>) {
+/// With `art`, draws the tall layout: the cover on the left, then the title,
+/// artist and album on their own lines.
+fn draw_now_playing(
+    f: &mut Frame,
+    area: Rect,
+    st: &Status,
+    error: Option<&str>,
+    rating: Option<Option<u8>>,
+    art: Option<ArtView>,
+) {
     let active = matches!(st.state, PlayState::Playing | PlayState::Paused | PlayState::Loading);
     let edge = if st.state == PlayState::Playing { ACCENT } else if active { DIM } else { BORDER };
     let mut block = Block::default()
@@ -1080,49 +1184,92 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>,
         width: inner.width.saturating_sub(2),
         ..inner
     };
+    let playing = st.state != PlayState::Stopped;
+    let track = st.track.as_ref().filter(|_| playing);
+
+    let Some(art) = art else {
+        // Compact: title line, progress, details.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+            .split(inner);
+        let mut l1 = state_and_title(st, rating);
+        if let Some(t) = track {
+            l1.push(Span::styled(format!("   {} — {}", t.artist, t.album), Style::default().fg(DIM)));
+        }
+        f.render_widget(Paragraph::new(Line::from(l1)), rows[0]);
+        draw_badge(f, rows[0], st);
+        draw_progress(f, rows[1], st);
+        draw_details(f, rows[2], st, error);
+        return;
+    };
+
+    // Tall: cover | gap | eight text rows.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(pixelart::SIZE as u16),
+            Constraint::Length(2),
+            Constraint::Min(10),
+        ])
+        .split(inner);
+    draw_cover(f, cols[0], &art);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
+        .constraints([Constraint::Length(1); 8])
+        .split(cols[2]);
+    f.render_widget(Paragraph::new(Line::from(state_and_title(st, rating))), rows[0]);
+    draw_badge(f, rows[0], st);
+    if let Some(t) = track {
+        // A leading space lines these up with the title line's label.
+        f.render_widget(Paragraph::new(Span::styled(format!(" {}", t.artist), Style::default().fg(BRIGHT))), rows[1]);
+        f.render_widget(Paragraph::new(Span::styled(format!(" {}", t.album), Style::default().fg(DIM))), rows[2]);
+    }
+    draw_progress(f, rows[4], st);
+    draw_details(f, rows[7], st, error);
+}
 
+/// "▶ PLAYING  Title  ★★★★☆" (the title and stars only while something plays).
+fn state_and_title(st: &Status, rating: Option<Option<u8>>) -> Vec<Span<'static>> {
     let (label, label_color) = match st.state {
         PlayState::Playing => ("▶ PLAYING", ACCENT),
         PlayState::Paused => ("❚❚ PAUSED", DIM),
         PlayState::Loading => ("… LOADING", DIM),
         PlayState::Stopped => ("■ STOPPED", FAINT),
     };
-
-    // Line 1: state, title, artist — album, bit-perfect badge.
     let mut l1 = vec![Span::styled(
         format!(" {}  ", label),
         Style::default().fg(label_color).add_modifier(Modifier::BOLD),
     )];
-    if let Some(t) = &st.track {
-        if st.state != PlayState::Stopped {
-            l1.push(Span::styled(t.title.clone(), Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD)));
-            // Faint outlines when unrated, so you can see there's a rating to set.
-            l1.push(Span::raw("  "));
-            l1.extend(star_spans(rating.flatten().unwrap_or(0), BORDER));
-            l1.push(Span::styled(format!("   {} — {}", t.artist, t.album), Style::default().fg(DIM)));
-        }
+    if let Some(t) = st.track.as_ref().filter(|_| st.state != PlayState::Stopped) {
+        l1.push(Span::styled(t.title.clone(), Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD)));
+        // Faint outlines when unrated, so you can see there's a rating to set.
+        l1.push(Span::raw("  "));
+        l1.extend(star_spans(rating.flatten().unwrap_or(0), BORDER));
     }
-    f.render_widget(Paragraph::new(Line::from(l1)), rows[0]);
+    l1
+}
+
+/// The bit-perfect badge at the right end of `area`.
+fn draw_badge(f: &mut Frame, area: Rect, st: &Status) {
     if st.output.is_some() {
         let badge = if st.bit_perfect() {
             Span::styled("◆ BIT-PERFECT ", Style::default().fg(GOOD).add_modifier(Modifier::BOLD))
         } else {
             Span::styled("◇ NOT BIT-PERFECT ", Style::default().fg(WARN).add_modifier(Modifier::BOLD))
         };
-        f.render_widget(Paragraph::new(Line::from(badge)).alignment(Alignment::Right), rows[0]);
+        f.render_widget(Paragraph::new(Line::from(badge)).alignment(Alignment::Right), area);
     }
+}
 
-    // Line 2: progress.
+/// Elapsed time, progress bar, duration.
+fn draw_progress(f: &mut Frame, area: Rect, st: &Status) {
     let dur = st.dur.unwrap_or(0.0);
     let ratio = if dur > 0.0 { (st.pos / dur).clamp(0.0, 1.0) } else { 0.0 };
     let bar = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(9), Constraint::Min(4), Constraint::Length(9)])
-        .split(rows[1]);
+        .split(area);
     let playing = st.state != PlayState::Stopped;
     f.render_widget(
         Paragraph::new(Span::styled(
@@ -1148,15 +1295,18 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>,
         .alignment(Alignment::Right),
         bar[2],
     );
+}
 
-    // Line 3: source and output details, or the last error.
+/// Source and output details, or the latest error in their place.
+fn draw_details(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>) {
     if let Some(e) = error {
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ⚠ {}", e), Style::default().fg(WARN))),
-            rows[2],
+            area,
         );
         return;
     }
+    let playing = st.state != PlayState::Stopped;
     // Split the line: source details on the left, output details on the right.
     let out_text = match (&st.output, playing) {
         (Some(o), true) => {
@@ -1169,11 +1319,11 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>,
         .as_ref()
         .map(|(d, rest)| (5 + d.chars().count() + rest.chars().count()) as u16)
         .unwrap_or(0)
-        .min(rows[2].width * 55 / 100);
+        .min(area.width * 55 / 100);
     let line3 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(out_w)])
-        .split(rows[2]);
+        .split(area);
     if let (Some(s), true) = (&st.source, playing) {
         let ch = match s.channels {
             1 => "mono".to_string(),
@@ -1200,6 +1350,42 @@ fn draw_now_playing(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>,
         ])
         .alignment(Alignment::Right);
         f.render_widget(Paragraph::new(out), line3[1]);
+    }
+}
+
+fn art_color(rgb: [u8; 3], truecolor: bool) -> Color {
+    if truecolor {
+        Color::Rgb(rgb[0], rgb[1], rgb[2])
+    } else {
+        Color::Indexed(pixelart::to_256(rgb))
+    }
+}
+
+/// The cover as pixel art: each cell is "▀", its foreground the upper pixel
+/// and its background the lower one. Without a cover, a quiet placeholder.
+fn draw_cover(f: &mut Frame, area: Rect, view: &ArtView) {
+    let buf = f.buffer_mut();
+    let w = (pixelart::SIZE as u16).min(area.width);
+    let h = ((pixelart::SIZE / 2) as u16).min(area.height);
+    for cy in 0..h {
+        for cx in 0..w {
+            let cell = &mut buf[(area.x + cx, area.y + cy)];
+            match view.art {
+                Some(art) => {
+                    let (x, y) = (cx as usize, cy as usize * 2);
+                    cell.set_symbol("▀")
+                        .set_fg(art_color(art.at(x, y), view.truecolor))
+                        .set_bg(art_color(art.at(x, y + 1), view.truecolor));
+                }
+                None => {
+                    cell.set_symbol(" ").set_bg(SEL_BG);
+                }
+            }
+        }
+    }
+    if view.art.is_none() && w >= 2 && h >= 1 {
+        let cell = &mut buf[(area.x + w / 2 - 1, area.y + h / 2)];
+        cell.set_symbol("♪").set_fg(FAINT);
     }
 }
 
@@ -1305,7 +1491,7 @@ mod tests {
             server_name: "Home".into(),
             library_title: "Music".into(),
         };
-        let mut app = App::new(server, "1".into(), header, "null".into(), false, true, false);
+        let mut app = App::new(server, "1".into(), header, "null".into(), false, true, false, false);
         let album = Album {
             key: "100".into(),
             title: "You Are Free".into(),
@@ -1353,6 +1539,102 @@ mod tests {
         assert!(!row("Free").contains('★') && !row("Free").contains('☆'));
         let playing = screen.iter().find(|l| l.contains("PLAYING")).unwrap();
         assert!(playing.contains("I Don't Blame You  ★★★★☆"));
+    }
+
+    fn playing_status(t: &Track) -> Status {
+        Status {
+            state: PlayState::Playing,
+            track: Some(t.clone()),
+            pos: 25.0,
+            dur: Some(185.0),
+            queue_len: 1,
+            ..Status::default()
+        }
+    }
+
+    fn render_sized(app: &mut App, st: &Status, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f, st)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
+    }
+
+    /// Top-left cell of the cover: inside the border and the breathing column.
+    fn cover_origin(buf: &ratatui::buffer::Buffer) -> (u16, u16) {
+        let h = buf.area.height;
+        (2, h - 1 - NOW_PLAYING_TALL_H + 1)
+    }
+
+    #[test]
+    fn tall_layout_draws_the_cover_two_pixels_per_cell() {
+        let t = track("1", 1, "Northbound", Some(8));
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = true;
+        app.truecolor = true;
+        // Top half of each pixel pair red, bottom half blue: rows alternate.
+        let pixels = (0..pixelart::SIZE * pixelart::SIZE)
+            .map(|i| if (i / pixelart::SIZE) % 2 == 0 { [200, 0, 0] } else { [0, 0, 200] })
+            .collect();
+        app.art = Some(ArtSlot { thumb: "/thumb".into(), state: ArtState::Ready(PixelArt { pixels }) });
+        let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
+        let (x0, y0) = cover_origin(&buf);
+        for cy in 0..(pixelart::SIZE / 2) as u16 {
+            for cx in 0..pixelart::SIZE as u16 {
+                let c = &buf[(x0 + cx, y0 + cy)];
+                assert_eq!(c.symbol(), "▀", "cell {},{}", cx, cy);
+                assert_eq!(c.fg, Color::Rgb(200, 0, 0));
+                assert_eq!(c.bg, Color::Rgb(0, 0, 200));
+            }
+        }
+        // Title, artist and album each get a line beside the cover.
+        let text_rows: Vec<String> = (y0..y0 + 8).map(|y| row_text(&buf, y)).collect();
+        assert!(text_rows[0].contains("PLAYING") && text_rows[0].contains("Northbound  ★★★★☆"));
+        assert!(text_rows[1].contains("Cat Power"));
+        assert!(text_rows[2].contains("You Are Free"));
+        assert!(text_rows[4].contains("0:25") && text_rows[4].contains("3:05"));
+    }
+
+    #[test]
+    fn without_truecolor_the_cover_uses_the_256_color_palette() {
+        let t = track("1", 1, "Northbound", None);
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = true;
+        app.truecolor = false;
+        let pixels = vec![[255, 0, 0]; pixelart::SIZE * pixelart::SIZE];
+        app.art = Some(ArtSlot { thumb: "/thumb".into(), state: ArtState::Ready(PixelArt { pixels }) });
+        let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
+        let (x0, y0) = cover_origin(&buf);
+        assert_eq!(buf[(x0, y0)].fg, Color::Indexed(196));
+    }
+
+    #[test]
+    fn a_cover_still_on_its_way_shows_a_placeholder() {
+        let t = track("1", 1, "Northbound", None);
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = true;
+        let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
+        let (x0, y0) = cover_origin(&buf);
+        assert_eq!(buf[(x0, y0)].bg, SEL_BG);
+        let rows: String = (y0..y0 + 8).map(|y| row_text(&buf, y)).collect();
+        assert!(rows.contains('♪'));
+    }
+
+    #[test]
+    fn compact_layout_when_art_is_off_or_the_terminal_is_small() {
+        let t = track("1", 1, "Northbound", None);
+        for (album_art, w, h) in [(false, 140, 40), (true, 80, 40), (true, 140, 24)] {
+            let mut app = app_with_album(vec![t.clone()]);
+            app.album_art = album_art;
+            let buf = render_sized(&mut app, &playing_status(&t), w, h);
+            // Compact: the title line carries "artist — album", and no cover cells.
+            let screen: Vec<String> = (0..h).map(|y| row_text(&buf, y)).collect();
+            let title = screen.iter().find(|l| l.contains("PLAYING")).unwrap();
+            assert!(title.contains("Cat Power — You Are Free"), "{} {}x{}", album_art, w, h);
+            assert!(!screen.iter().any(|l| l.contains('▀') || l.contains('♪')));
+        }
     }
 
     #[test]

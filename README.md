@@ -22,6 +22,8 @@ all from a single static binary for Linux.
   `media.resume`, `media.stop`, `media.scrobble`).
 - **Track ratings.** See and set your Plex star ratings (half stars included) in the track list
   and the now-playing bar. Ratings are shared with Plex and Plexamp.
+- **Album art as pixel art.** The playing album's cover, shrunk to 16×16 and drawn right in the
+  terminal beside what's playing.
 - **Desktop media controls (MPRIS).** Plext shows up in your desktop's media controls (GNOME's
   top bar and lock screen, KDE's media applet) with the track and album cover, and the keyboard's
   play/pause, next and previous keys control it.
@@ -102,6 +104,18 @@ To turn reporting off, add this to `~/.config/plext/config.toml`:
 report_playback = false
 ```
 
+## Album art
+
+The now-playing area shows the album's cover as 16×16 pixel art, drawn with half-block
+characters (two pixels per character cell). Plext asks your server for the cover, averages it
+down and cuts it to a 16-color palette for a crisp, hand-made look. Covers are cached in
+`~/.cache/plext/covers`, the same cache the desktop's media controls use.
+
+It looks best in a terminal with 24-bit color (GNOME Terminal, Konsole, kitty, WezTerm,
+Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors. In a terminal
+smaller than 90×30, or with `album_art = false`, Plext uses the compact three-line
+now-playing bar instead.
+
 ## Media keys and desktop controls
 
 While Plext runs, it registers with your desktop as a media player over MPRIS, the standard
@@ -151,6 +165,7 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 | `device` | first USB DAC | ALSA output device; set it with `plext device <name>` |
 | `report_playback` | `true` | Report playback to Plex (dashboard, history, webhooks) |
 | `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |
+| `album_art` | `true` | Show the album cover as pixel art in a taller now-playing area |
 | `mpris` | `true` | Show in the desktop's media controls and obey media keys |
 
 ## Bit-perfect notes
