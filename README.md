@@ -111,10 +111,21 @@ characters (two pixels per character cell). Plext asks your server for the cover
 down and cuts it to a 16-color palette for a crisp, hand-made look. Covers are cached in
 `~/.cache/plext/covers`, the same cache the desktop's media controls use.
 
+Beside the cover are the title and your rating, the artist, and the album with its year and
+release type; then the progress bar and a line with the source format and where it's playing
+(◆ BIT-PERFECT → your DAC). With room to spare, an "up next" column lists the next two tracks.
+
+The layout follows the size of your terminal:
+
+| Terminal size | Now-playing area |
+| --- | --- |
+| under 90×30 (e.g. the usual 80×24 default) | compact three-line bar |
+| 90×30 and larger | cover, track details, progress, format and output |
+| about 100 columns and wider | the above, plus "up next" |
+
 It looks best in a terminal with 24-bit color (GNOME Terminal, Konsole, kitty, WezTerm,
-Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors. In a terminal
-smaller than 90×30, or with `album_art = false`, Plext uses the compact three-line
-now-playing bar instead.
+Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors. With
+`album_art = false`, Plext always uses the compact bar.
 
 ## Media keys and desktop controls
 

@@ -235,6 +235,32 @@ impl App {
 
     // ---------- loading ----------
 
+    /// "Album · 2019 · EP" for a track, from the album lists already loaded.
+    fn album_line(&self, t: &Track) -> String {
+        let album = t.album_key.as_deref().and_then(|key| {
+            self.shown_album
+                .as_ref()
+                .map(|(_, a)| a)
+                .filter(|a| a.key == key)
+                .or_else(|| {
+                    self.albums.values().find_map(|l| match l {
+                        Loadable::Ready(v) => v.iter().find(|a| a.key == key),
+                        _ => None,
+                    })
+                })
+        });
+        let mut parts = vec![t.album.clone()];
+        if let Some(a) = album {
+            if let Some(y) = a.year {
+                parts.push(y.to_string());
+            }
+            if let Some(l) = a.kind.label() {
+                parts.push(l.to_string());
+            }
+        }
+        parts.join(" · ")
+    }
+
     /// Keeps the cover for the playing track on its way: asks for the
     /// download, then turns the file into pixel art on a background thread.
     fn update_art(&mut self, st: &Status) {
@@ -763,6 +789,7 @@ impl App {
                 _ => None,
             },
             truecolor: self.truecolor,
+            album_line: st.track.as_ref().map(|t| self.album_line(t)),
         });
         draw_now_playing(f, outer[3], st, error, rating, art);
         self.draw_keys(f, outer[4]);
@@ -1144,7 +1171,15 @@ const TALL_MIN_H: u16 = 30;
 pub struct ArtView<'a> {
     pub art: Option<&'a PixelArt>,
     pub truecolor: bool,
+    /// "Album · 2019 · EP", when the album's details are known.
+    pub album_line: Option<String>,
 }
+
+/// The "up next" column, and the text width it needs before it appears
+/// (about a 100-column terminal).
+const UP_NEXT_W: u16 = 34;
+const UP_NEXT_GAP: u16 = 4;
+const UP_NEXT_MIN_W: u16 = UP_NEXT_W + UP_NEXT_GAP + 40;
 
 /// `rating` is the playing track's latest rating (`Some(None)` when unrated).
 /// With `art`, draws the tall layout: the cover on the left, then the title,
@@ -1199,12 +1234,13 @@ fn draw_now_playing(
         }
         f.render_widget(Paragraph::new(Line::from(l1)), rows[0]);
         draw_badge(f, rows[0], st);
-        draw_progress(f, rows[1], st);
+        draw_progress(f, rows[1], st, true);
         draw_details(f, rows[2], st, error);
         return;
     };
 
-    // Tall: cover | gap | eight text rows.
+    // Tall: cover | gap | text. The text has a title block (with "up next"
+    // beside it when there's room), the progress bar, and a details line.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1214,19 +1250,176 @@ fn draw_now_playing(
         ])
         .split(inner);
     draw_cover(f, cols[0], &art);
+    let text = cols[2];
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1); 8])
-        .split(cols[2]);
-    f.render_widget(Paragraph::new(Line::from(state_and_title(st, rating))), rows[0]);
-    draw_badge(f, rows[0], st);
-    if let Some(t) = track {
-        // A leading space lines these up with the title line's label.
-        f.render_widget(Paragraph::new(Span::styled(format!(" {}", t.artist), Style::default().fg(BRIGHT))), rows[1]);
-        f.render_widget(Paragraph::new(Span::styled(format!(" {}", t.album), Style::default().fg(DIM))), rows[2]);
+        .split(text);
+    let show_next = text.width >= UP_NEXT_MIN_W;
+    let left_w = if show_next { text.width - UP_NEXT_W - UP_NEXT_GAP } else { text.width };
+    let left = |i: usize| Rect { width: left_w, ..rows[i] };
+    let right = |i: usize| Rect {
+        x: text.x + text.width - UP_NEXT_W,
+        width: UP_NEXT_W,
+        ..rows[i]
+    };
+    let lw = left_w as usize;
+
+    // Title block: state icon and title, then artist and album lined up under the title.
+    let (icon, icon_color) = match st.state {
+        PlayState::Playing => ("▶ ", ACCENT),
+        PlayState::Paused => ("‖ ", DIM),
+        PlayState::Loading => ("… ", DIM),
+        PlayState::Stopped => ("■ ", FAINT),
+    };
+    let mut l0 = vec![Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD))];
+    match track {
+        Some(t) => {
+            l0.push(Span::styled(
+                truncate(&t.title, lw.saturating_sub(2 + 7).max(4)),
+                Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+            ));
+            l0.push(Span::raw("  "));
+            l0.extend(star_spans(rating.flatten().unwrap_or(0), BORDER));
+        }
+        None => l0.push(Span::styled("Stopped", Style::default().fg(FAINT))),
     }
-    draw_progress(f, rows[4], st);
-    draw_details(f, rows[7], st, error);
+    f.render_widget(Paragraph::new(Line::from(l0)), left(0));
+    if let Some(t) = track {
+        let room = lw.saturating_sub(2).max(4);
+        f.render_widget(
+            Paragraph::new(Span::styled(format!("  {}", truncate(&t.artist, room)), Style::default().fg(BRIGHT))),
+            left(1),
+        );
+        let album = art.album_line.clone().unwrap_or_else(|| t.album.clone());
+        f.render_widget(
+            Paragraph::new(Span::styled(format!("  {}", truncate(&album, room)), Style::default().fg(DIM))),
+            left(2),
+        );
+    }
+
+    // Up next: the following two tracks, or the end of the album.
+    if show_next && track.is_some() {
+        f.render_widget(Paragraph::new(Span::styled("up next", Style::default().fg(FAINT))), right(0));
+        if st.next.is_empty() {
+            f.render_widget(Paragraph::new(Span::styled("end of album", Style::default().fg(FAINT))), right(1));
+        }
+        for (i, n) in st.next.iter().take(2).enumerate() {
+            let num = n.index.map(|x| x.to_string()).unwrap_or_else(|| (st.queue_pos + 2 + i).to_string());
+            let len = n.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
+            let title_room = (UP_NEXT_W as usize).saturating_sub(num.chars().count() + 2 + len.chars().count() + 2);
+            let title_color = if i == 0 { FG } else { DIM };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!("{}  ", num), Style::default().fg(FAINT)),
+                    Span::styled(truncate(&n.title, title_room.max(4)), Style::default().fg(title_color)),
+                ])),
+                right(1 + i),
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(len, Style::default().fg(FAINT))).alignment(Alignment::Right),
+                right(1 + i),
+            );
+        }
+    }
+
+    // Row 3 and 6 stay blank around the progress bar (rows 4–5, which the
+    // waveform will fill; the bar sits on the lower one).
+    draw_progress(f, rows[5], st, false);
+    draw_details_tall(f, rows[7], st, error);
+}
+
+/// The tall layout's details line: the source on the left, and on the
+/// right the bit-perfect verdict, where the sound goes and how. When the
+/// line is too narrow, the least important parts go first (bitrate,
+/// channels, the output mode) before anything is cut short.
+fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>) {
+    if let Some(e) = error {
+        f.render_widget(Paragraph::new(Span::styled(format!("⚠ {}", e), Style::default().fg(WARN))), area);
+        return;
+    }
+    if st.state == PlayState::Stopped {
+        return;
+    }
+    let width = area.width as usize;
+    let len = |spans: &[Span]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+
+    // Left: the source, from most to least detailed.
+    let sources: Vec<String> = match &st.source {
+        Some(s) => {
+            let ch = match s.channels {
+                1 => "mono".to_string(),
+                2 => "stereo".to_string(),
+                n => format!("{} ch", n),
+            };
+            let base = if s.lossless {
+                format!("{} · {}-bit / {} kHz", s.codec, s.bits, khz(s.rate))
+            } else {
+                format!("{} · {} kHz · lossy", s.codec, khz(s.rate))
+            };
+            let mut v = Vec::new();
+            if let Some(br) = st.track.as_ref().and_then(|t| t.bitrate_kbps) {
+                v.push(format!("{} · {} · {} kbps", base, ch, br));
+            }
+            v.push(format!("{} · {}", base, ch));
+            v.push(base);
+            v
+        }
+        None => vec![String::new()],
+    };
+
+    // Right: verdict → device · mode, with or without the mode.
+    let rights: Vec<Vec<Span>> = match &st.output {
+        Some(o) => {
+            let verdict = if st.bit_perfect() {
+                Span::styled("◆ BIT-PERFECT", Style::default().fg(GOOD).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("◇ NOT BIT-PERFECT", Style::default().fg(WARN).add_modifier(Modifier::BOLD))
+            };
+            let mode = if o.direct { " · exclusive" } else { " · via ALSA plugins" };
+            let arrow = Span::styled("  →  ", Style::default().fg(DIM));
+            let device = Span::styled(o.label.clone(), Style::default().fg(BRIGHT));
+            vec![
+                vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(mode, Style::default().fg(DIM))],
+                vec![verdict, arrow, device],
+            ]
+        }
+        None => vec![Vec::new()],
+    };
+
+    // The fullest pair that fits with a two-column gap; else the shortest of each.
+    let mut pick = (sources.len() - 1, rights.len() - 1);
+    'search: for (ri, r) in rights.iter().enumerate() {
+        for (si, src) in sources.iter().enumerate() {
+            if src.chars().count() + 2 + len(r) <= width {
+                pick = (si, ri);
+                break 'search;
+            }
+        }
+    }
+    let src = &sources[pick.0];
+    let mut right = rights[pick.1].clone();
+    let right_w = len(&right).min(width);
+    if right_w < len(&right) {
+        // Even the short form is too wide: shorten the device name.
+        let over = len(&right) - right_w;
+        if let Some(dev) = right.get_mut(2) {
+            let keep = dev.content.chars().count().saturating_sub(over).max(4);
+            *dev = Span::styled(truncate(&dev.content, keep), dev.style);
+        }
+    }
+    let right_w = len(&right).min(width) as u16;
+    let parts = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
+        .split(area);
+    let room = (parts[0].width as usize).saturating_sub(2);
+    if room >= 4 && !src.is_empty() {
+        f.render_widget(Paragraph::new(Span::styled(truncate(src, room), Style::default().fg(DIM))), parts[0]);
+    }
+    if !right.is_empty() {
+        f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), parts[1]);
+    }
 }
 
 /// "▶ PLAYING  Title  ★★★★☆" (the title and stars only while something plays).
@@ -1263,7 +1456,9 @@ fn draw_badge(f: &mut Frame, area: Rect, st: &Status) {
 }
 
 /// Elapsed time, progress bar, duration.
-fn draw_progress(f: &mut Frame, area: Rect, st: &Status) {
+/// With `indent`, a space before the elapsed time and after the duration
+/// (the compact bar's spacing).
+fn draw_progress(f: &mut Frame, area: Rect, st: &Status, indent: bool) {
     let dur = st.dur.unwrap_or(0.0);
     let ratio = if dur > 0.0 { (st.pos / dur).clamp(0.0, 1.0) } else { 0.0 };
     let bar = Layout::default()
@@ -1273,7 +1468,7 @@ fn draw_progress(f: &mut Frame, area: Rect, st: &Status) {
     let playing = st.state != PlayState::Stopped;
     f.render_widget(
         Paragraph::new(Span::styled(
-            if playing { format!(" {}", mmss(st.pos)) } else { String::new() },
+            if playing { format!("{}{}", if indent { " " } else { "" }, mmss(st.pos)) } else { String::new() },
             Style::default().fg(BRIGHT),
         )),
         bar[0],
@@ -1289,7 +1484,7 @@ fn draw_progress(f: &mut Frame, area: Rect, st: &Status) {
     );
     f.render_widget(
         Paragraph::new(Span::styled(
-            if playing && dur > 0.0 { format!("{} ", mmss(dur)) } else { String::new() },
+            if playing && dur > 0.0 { format!("{}{}", mmss(dur), if indent { " " } else { "" }) } else { String::new() },
             Style::default().fg(DIM),
         ))
         .alignment(Alignment::Right),
@@ -1589,12 +1784,78 @@ mod tests {
                 assert_eq!(c.bg, Color::Rgb(0, 0, 200));
             }
         }
-        // Title, artist and album each get a line beside the cover.
+        // Title, artist and album each get a line beside the cover, the
+        // album with its year; the progress bar sits on row 5.
         let text_rows: Vec<String> = (y0..y0 + 8).map(|y| row_text(&buf, y)).collect();
-        assert!(text_rows[0].contains("PLAYING") && text_rows[0].contains("Northbound  ★★★★☆"));
-        assert!(text_rows[1].contains("Cat Power"));
-        assert!(text_rows[2].contains("You Are Free"));
-        assert!(text_rows[4].contains("0:25") && text_rows[4].contains("3:05"));
+        assert!(text_rows[0].contains("▶ Northbound  ★★★★☆"), "{}", text_rows[0]);
+        assert!(text_rows[1].contains("  Cat Power"));
+        assert!(text_rows[2].contains("  You Are Free · 2003"));
+        assert!(text_rows[5].contains("0:25") && text_rows[5].contains("3:05"));
+    }
+
+    /// A row's text without the box's right edge.
+    fn inside(row: &str) -> &str {
+        row.trim_end().trim_end_matches('│').trim_end()
+    }
+
+    fn tall_rows(app: &mut App, st: &Status, w: u16) -> Vec<String> {
+        let buf = render_sized(app, st, w, 40);
+        let (_, y0) = cover_origin(&buf);
+        (y0..y0 + 8).map(|y| row_text(&buf, y)).collect()
+    }
+
+    #[test]
+    fn up_next_lists_the_next_two_tracks_when_there_is_room() {
+        let tracks = vec![
+            track("1", 1, "One", None),
+            track("2", 2, "Two", None),
+            track("3", 3, "Three", None),
+            track("4", 4, "Four", None),
+        ];
+        let mut app = app_with_album(tracks.clone());
+        app.album_art = true;
+        let mut st = playing_status(&tracks[0]);
+        st.queue_len = 4;
+        st.next = vec![tracks[1].clone(), tracks[2].clone()];
+        let rows = tall_rows(&mut app, &st, 140);
+        assert!(rows[0].contains("up next"));
+        assert!(rows[1].contains("2  Two") && inside(&rows[1]).ends_with("3:05"));
+        assert!(rows[2].contains("3  Three"));
+        assert!(!rows.iter().any(|r| r.contains("Four")));
+
+        // On the last track it says so; in a narrower terminal the column goes.
+        st.next.clear();
+        let rows = tall_rows(&mut app, &st, 140);
+        assert!(rows[1].contains("end of album"));
+        let rows = tall_rows(&mut app, &st, 96);
+        assert!(!rows.iter().any(|r| r.contains("up next") || r.contains("end of album")));
+        assert!(rows[0].contains("▶ One"));
+    }
+
+    #[test]
+    fn tall_details_line_shows_source_and_where_it_plays() {
+        use crate::decode::SourceInfo;
+        use crate::output::{OutputInfo, SampleFmt};
+        let t = track("1", 1, "One", None);
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = true;
+        let mut st = playing_status(&t);
+        st.source = Some(SourceInfo {
+            codec: "FLAC".into(),
+            lossless: true,
+            rate: 44_100,
+            channels: 2,
+            bits: 16,
+            duration_secs: Some(185.0),
+        });
+        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, direct: true });
+        let rows = tall_rows(&mut app, &st, 140);
+        assert!(rows[7].contains("FLAC · 16-bit / 44.1 kHz · stereo · 641 kbps"), "{}", rows[7]);
+        assert!(inside(&rows[7]).ends_with("◆ BIT-PERFECT  →  Schiit Modi+ · exclusive"), "{}", rows[7]);
+        // Narrower: details drop out whole, nothing is cut mid-word.
+        let rows = tall_rows(&mut app, &st, 96);
+        assert!(!rows[7].contains('…'), "{}", rows[7]);
+        assert!(rows[7].contains("FLAC · 16-bit / 44.1 kHz") && rows[7].contains("◆ BIT-PERFECT  →  Schiit Modi+"), "{}", rows[7]);
     }
 
     #[test]
