@@ -54,9 +54,9 @@ Source code for every crate below is available on <https://crates.io>.
 Crates under the Mozilla Public License 2.0 (the Symphonia audio decoders)
 are used unmodified; their source is at <https://github.com/pdeljanov/Symphonia>.
 
-- **MIT License** (174 crates)
+- **MIT License** (186 crates)
+- **ISC License** (23 crates)
 - **Unicode License v3** (19 crates)
-- **ISC License** (18 crates)
 - **Mozilla Public License 2.0** (17 crates)
 - **Apache License 2.0** (5 crates)
 - **BSD 3-Clause "New" or "Revised" License** (3 crates)
@@ -1223,6 +1223,43 @@ impl N0 {
 Used by: ring 0.17.14
 
 ```
+// Copyright 2015-2024 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+#[cfg(target_pointer_width = "64")]
+type CompilerWord = u64;
+
+#[cfg(target_pointer_width = "32")]
+type CompilerWord = u32;
+
+/// A native word that isn't secret.
+///
+/// `LeakyWord` supports `as` conversions to/from native types.
+///
+/// XXX: This isn't the native word size on targets where a pointer isn't the
+/// same size as a native word. TODO: Fix this.
+pub(crate) type LeakyWord = CompilerWord;
+
+```
+
+---
+
+### ISC License
+
+Used by: ring 0.17.14
+
+```
 // Copyright 2015-2025 Brian Smith.
 //
 // Permission to use, copy, modify, and/or distribute this software for any
@@ -1344,6 +1381,48 @@ Used by: ring 0.17.14
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+#[cfg(target_arch = "x86")]
+pub fn shift_full_blocks<const BLOCK_LEN: usize>(
+    in_out: super::overlapping::Overlapping<'_, u8>,
+    mut transform: impl FnMut(&[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN],
+) {
+    let (in_out, src) = in_out.into_slice_src_mut();
+    let in_out_len = in_out[src.clone()].len();
+
+    for i in (0..in_out_len).step_by(BLOCK_LEN) {
+        let block = {
+            let input =
+                <&[u8; BLOCK_LEN]>::try_from(&in_out[(src.start + i)..][..BLOCK_LEN]).unwrap();
+            transform(input)
+        };
+        let output = <&mut [u8; BLOCK_LEN]>::try_from(&mut in_out[i..][..BLOCK_LEN]).unwrap();
+        *output = block;
+    }
+}
+
+```
+
+---
+
+### ISC License
+
+Used by: ring 0.17.14
+
+```
+// Copyright 2018 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 //! Serialization and deserialization.
 
 #[doc(hidden)]
@@ -1405,6 +1484,45 @@ mod ffi;
 pub(super) mod fallback;
 mod sha2_32;
 mod sha2_64;
+
+```
+
+---
+
+### ISC License
+
+Used by: ring 0.17.14
+
+```
+// Copyright 2022 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+/// Polyfill for `Option::unwrap()` as a const fn; feature `const_option`.
+/// https://github.com/rust-lang/rust/issues/67441.
+/// TODO(MSRV): Replace this with `x.unwrap()`.
+///
+/// `T: Copy` avoids "constant functions cannot evaluate destructors."
+pub const fn unwrap_const<T>(x: Option<T>) -> T
+where
+    T: Copy,
+{
+    if let Some(x) = x {
+        x
+    } else {
+        panic!("unwrap_const on `None`");
+    }
+}
 
 ```
 
@@ -1493,6 +1611,39 @@ Used by: ring 0.17.14
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+//! Utilities to make dealing with slices less tediuous.
+
+/// Replaces the first N elements of `a` with the first N elements of `b`, where
+/// N is `core::cmp::min(a.len(), b.len())`, leaving the rest unchanged.
+pub fn overwrite_at_start<T: Copy>(a: &mut [T], b: &[T]) {
+    a.iter_mut().zip(b).for_each(|(a, b)| {
+        *a = *b;
+    });
+}
+
+```
+
+---
+
+### ISC License
+
+Used by: ring 0.17.14
+
+```
+// Copyright 2024 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 pub use self::{
     array::Array,
     base::{IndexError, Overlapping},
@@ -1502,6 +1653,46 @@ pub use self::{
 mod array;
 mod base;
 mod partial_block;
+
+```
+
+---
+
+### ISC License
+
+Used by: ring 0.17.14
+
+```
+// Copyright 2024 Brian Smith.
+//
+// Permission to use, copy, modify, and/or distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+// OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use crate::testutil;
+use core::{marker::PhantomData, mem::size_of};
+
+/// A ZST that can be added to any type to make the type `!Send`.
+#[derive(Clone, Copy)]
+pub struct NotSend(PhantomData<*mut ()>);
+
+impl NotSend {
+    pub const VALUE: Self = Self(PhantomData);
+}
+
+#[allow(deprecated)]
+const _: () = testutil::compile_time_assert_clone::<NotSend>();
+#[allow(deprecated)]
+const _: () = testutil::compile_time_assert_copy::<NotSend>();
+const _: () = assert!(size_of::<NotSend>() == 0);
 
 ```
 
@@ -2165,7 +2356,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### MIT License
 
-Used by: futures-core 0.3.34, futures-io 0.3.34
+Used by: futures-channel 0.3.34, futures-core 0.3.34, futures-executor 0.3.34, futures-io 0.3.34, futures-macro 0.3.34, futures-sink 0.3.34, futures-task 0.3.34, futures-util 0.3.34, futures 0.3.34
 
 ```
 Copyright (c) 2016 Alex Crichton
@@ -2439,6 +2630,36 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+```
+
+---
+
+### MIT License
+
+Used by: enum-primitive-derive 0.3.0
+
+```
+Copyright (c) 2017 Doug Goldstein <cardoe@cardoe.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+“Software”), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -3145,6 +3366,23 @@ SOFTWARE.
 
 ### MIT License
 
+Used by: pulseaudio 0.3.2
+
+```
+Copyright 2023 Colin Marc <hi@colinmarc.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+---
+
+### MIT License
+
 Used by: encoding_rs 0.8.42, multiversion_no_op 1.0.0, utf8_iter 1.0.4
 
 ```
@@ -3508,7 +3746,7 @@ SOFTWARE.
 
 ### MIT License
 
-Used by: plext 0.4.0
+Used by: plext 0.5.0
 
 ```
 MIT License
@@ -3793,7 +4031,7 @@ SOFTWARE.
 
 ### MIT License
 
-Used by: adler2 2.0.1, anyhow 1.0.104, async-channel 2.5.0, async-executor 1.14.0, async-io 2.6.0, async-lock 3.4.2, async-process 2.5.0, async-signal 0.2.14, async-task 4.7.1, async-trait 0.1.92, atomic-waker 1.1.2, blocking 1.7.0, concurrent-queue 2.5.0, displaydoc 0.2.7, endi 1.1.1, event-listener-strategy 0.5.4, event-listener 5.4.2, fastrand 2.5.0, futures-lite 2.6.1, indoc 2.0.8, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, once_cell 1.21.4, ordered-stream 0.2.0, parking 2.2.1, paste 1.0.15, pin-project-lite 0.2.17, piper 0.2.5, polling 3.11.0, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rustix 0.38.44, rustix 1.1.5, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, serde_repr 0.1.21, syn 2.0.119, syn 3.0.9, unicode-ident 1.0.27, zmij 1.0.23, zvariant_utils 4.2.0
+Used by: adler2 2.0.1, anyhow 1.0.104, async-channel 2.5.0, async-executor 1.14.0, async-io 2.6.0, async-lock 3.4.2, async-process 2.5.0, async-signal 0.2.14, async-task 4.7.1, async-trait 0.1.92, atomic-waker 1.1.2, blocking 1.7.0, concurrent-queue 2.5.0, displaydoc 0.2.7, endi 1.1.1, event-listener-strategy 0.5.4, event-listener 5.4.2, fastrand 2.5.0, futures-lite 2.6.1, indoc 2.0.8, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, once_cell 1.21.4, ordered-stream 0.2.0, parking 2.2.1, paste 1.0.15, pin-project-lite 0.2.17, piper 0.2.5, polling 3.11.0, proc-macro-crate 3.5.0, proc-macro2 1.0.107, quote 1.0.47, rustix 0.38.44, rustix 1.1.5, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, serde_repr 0.1.21, syn 2.0.119, syn 3.0.9, thiserror-impl 1.0.69, thiserror 1.0.69, unicode-ident 1.0.27, zmij 1.0.23, zvariant_utils 4.2.0
 
 ```
 Permission is hereby granted, free of charge, to any
@@ -3981,7 +4219,7 @@ THE SOFTWARE.
 
 ### MIT License
 
-Used by: byteorder-lite 0.1.0, memchr 2.8.3
+Used by: byteorder-lite 0.1.0, byteorder 1.5.0, memchr 2.8.3
 
 ```
 The MIT License (MIT)

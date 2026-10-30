@@ -1,4 +1,5 @@
-//! ALSA output that talks straight to the DAC.
+//! Audio output: ALSA straight to the DAC (bit-perfect), or the desktop's
+//! sound server (see `pulse.rs`).
 //!
 //! For bit-perfect playback the device must be a `hw:` device (no ALSA plugins,
 //! no PipeWire/PulseAudio), the hardware is switched to the track's exact sample
@@ -105,17 +106,129 @@ pub struct StreamSpec {
     pub bits: u32,
 }
 
+/// How the audio reaches the speakers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Straight to the hardware through an ALSA `hw:` device.
+    Direct,
+    /// Through an ALSA device with plugins in the way (`plughw:`, `default`…).
+    AlsaPlugins,
+    /// Through the desktop's sound server: "PipeWire" or "PulseAudio".
+    SoundServer(&'static str),
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
     /// Human-friendly name, e.g. the DAC's card name.
     pub label: String,
     pub rate: u32,
     pub fmt: SampleFmt,
-    /// Direct hardware access (no ALSA plugin layer).
-    pub direct: bool,
+    pub route: Route,
 }
 
-pub struct Output {
+impl OutputInfo {
+    /// Direct hardware access (no ALSA plugin layer, no sound server).
+    pub fn direct(&self) -> bool {
+        self.route == Route::Direct
+    }
+}
+
+/// Where to play.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// An ALSA device, e.g. "hw:CARD=DAC,DEV=0".
+    Alsa(String),
+    /// The desktop's sound server; `sink` None follows the desktop's default output.
+    SoundServer { sink: Option<String> },
+}
+
+impl Target {
+    /// How the target is shown in `plext status` and the log.
+    pub fn describe(&self) -> String {
+        match self {
+            Target::Alsa(d) => d.clone(),
+            Target::SoundServer { sink: Some(s) } => s.clone(),
+            Target::SoundServer { sink: None } => "the desktop's default output".into(),
+        }
+    }
+}
+
+/// An open output of either kind.
+pub enum Output {
+    Alsa(AlsaOutput),
+    Pulse(crate::pulse::PulseOutput),
+}
+
+impl Output {
+    pub fn open(target: &Target, spec: StreamSpec) -> Result<Output> {
+        match target {
+            Target::Alsa(d) => AlsaOutput::open(d, spec).map(Output::Alsa),
+            Target::SoundServer { sink } => {
+                crate::pulse::PulseOutput::open(sink.as_deref(), spec).map(Output::Pulse)
+            }
+        }
+    }
+
+    pub fn spec(&self) -> StreamSpec {
+        match self {
+            Output::Alsa(o) => o.spec,
+            Output::Pulse(o) => o.spec,
+        }
+    }
+
+    pub fn info(&self) -> &OutputInfo {
+        match self {
+            Output::Alsa(o) => &o.info,
+            Output::Pulse(o) => &o.info,
+        }
+    }
+
+    /// Writes interleaved, left-justified 32-bit samples. Blocks while the
+    /// output's buffer is full.
+    pub fn write(&mut self, samples: &[i32]) -> Result<()> {
+        match self {
+            Output::Alsa(o) => o.write(samples),
+            Output::Pulse(o) => o.write(samples),
+        }
+    }
+
+    /// Pauses or resumes. Returns false if the output can't pause and the
+    /// queued audio was discarded instead (the caller should then resume by
+    /// seeking back to the position that was actually heard).
+    pub fn set_paused(&mut self, paused: bool) -> bool {
+        match self {
+            Output::Alsa(o) => o.set_paused(paused),
+            Output::Pulse(o) => o.set_paused(paused),
+        }
+    }
+
+    /// Discards whatever is still queued (skip/seek/stop).
+    pub fn flush(&mut self) {
+        match self {
+            Output::Alsa(o) => o.flush(),
+            Output::Pulse(o) => o.flush(),
+        }
+    }
+
+    /// Lets queued audio finish playing.
+    pub fn drain(&mut self) {
+        match self {
+            Output::Alsa(o) => o.drain(),
+            Output::Pulse(o) => o.drain(),
+        }
+    }
+
+    /// Frames written but not yet heard.
+    pub fn delay(&self) -> i64 {
+        match self {
+            Output::Alsa(o) => o.delay(),
+            Output::Pulse(o) => o.delay(),
+        }
+    }
+}
+
+/// ALSA output.
+pub struct AlsaOutput {
     pcm: PCM,
     pub spec: StreamSpec,
     pub info: OutputInfo,
@@ -123,16 +236,22 @@ pub struct Output {
     buf: Vec<u8>,
 }
 
-impl Output {
-    pub fn open(device: &str, spec: StreamSpec) -> Result<Output> {
+impl AlsaOutput {
+    pub fn open(device: &str, spec: StreamSpec) -> Result<AlsaOutput> {
         let pcm = PCM::new(device, Direction::Playback, false).map_err(|e| {
             if e.errno() == libc_ebusy() {
                 anyhow!(
-                    "{} is busy. Another program (often PipeWire or PulseAudio) is using it.",
+                    "{} is busy. Another program (often PipeWire or PulseAudio) is using it. \
+                     To play through your desktop's sound instead, run `plext output system`.",
                     device
                 )
             } else {
-                anyhow!("could not open {}: {}", device, e)
+                anyhow!(
+                    "could not open {}: {}. Run `plext device` to see your devices, or \
+                     `plext output system` to play through your desktop's sound.",
+                    device,
+                    e
+                )
             }
         })?;
 
@@ -164,12 +283,12 @@ impl Output {
             .unwrap_or(false);
         pcm.prepare()?;
 
-        Ok(Output {
+        Ok(AlsaOutput {
             info: OutputInfo {
                 label: friendly_name(device),
                 rate: spec.rate,
                 fmt,
-                direct: is_direct(device),
+                route: if is_direct(device) { Route::Direct } else { Route::AlsaPlugins },
             },
             pcm,
             spec,

@@ -9,6 +9,7 @@ mod output;
 mod pixelart;
 mod player;
 mod plex;
+mod pulse;
 mod report;
 
 #[cfg(test)]
@@ -16,7 +17,8 @@ mod bitperfect_tests;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use config::{Config, LibraryConfig, ServerConfig};
+use config::{Config, LibraryConfig, OutputMode, ServerConfig};
+use output::Target;
 use plex::{Plex, Server};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -24,9 +26,14 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(name = "plext", version, about = "A terminal music player for Plex with bit-perfect playback")]
 struct Cli {
-    /// ALSA device to play through for this session (e.g. hw:CARD=DAC,DEV=0)
+    /// Device to play through for this session: an ALSA device in bit-perfect
+    /// mode (e.g. hw:CARD=DAC,DEV=0), a PipeWire/PulseAudio output in system mode
     #[arg(short, long, global = true)]
     device: Option<String>,
+
+    /// How to play for this session: bitperfect or system
+    #[arg(short, long, global = true, value_enum)]
+    output: Option<OutputMode>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -38,6 +45,11 @@ enum Command {
     Login,
     /// Forget the saved Plex sign-in
     Logout,
+    /// Choose how to play: `bitperfect` or `system` (PipeWire/PulseAudio); asks if not given
+    Output {
+        #[arg(value_enum)]
+        mode: Option<OutputMode>,
+    },
     /// List output devices, or set the default one: `plext device hw:CARD=DAC,DEV=0`
     Device { name: Option<String> },
     /// Show the current configuration
@@ -71,7 +83,15 @@ fn real_main() -> Result<()> {
             println!("Signed out.");
             Ok(())
         }
-        Some(Command::Device { name }) => device_cmd(&mut cfg, name),
+        Some(Command::Output { mode: None }) => setup_output(&mut cfg),
+        Some(Command::Output { mode: Some(m) }) => {
+            cfg.output = Some(m);
+            cfg.save()?;
+            println!("Output set to {}.", mode_label(m));
+            println!("Now playing through {}. Change it with `plext device`.", target_for(&cfg, m, None).describe());
+            Ok(())
+        }
+        Some(Command::Device { name }) => device_cmd(&mut cfg, cli.output, name),
         Some(Command::Status) => {
             println!("Config file: {}", config::path()?.display());
             match &cfg.server {
@@ -85,21 +105,77 @@ fn real_main() -> Result<()> {
             if let Some(p) = log::path() {
                 println!("Log file:    {}", p.display());
             }
-            match &cfg.device {
-                Some(d) => println!("Device:      {}", d),
-                None => println!(
-                    "Device:      not set (auto: {})",
-                    output::guess_device().unwrap_or_else(|| "default".into())
-                ),
+            let mode = cli.output.unwrap_or(cfg.output_mode());
+            match mode {
+                OutputMode::Bitperfect => {
+                    println!("Output:      bit-perfect (ALSA)");
+                    match &cfg.device {
+                        Some(d) => println!("Device:      {}", d),
+                        None => println!(
+                            "Device:      not set (auto: {})",
+                            output::guess_device().unwrap_or_else(|| "default".into())
+                        ),
+                    }
+                }
+                OutputMode::System => {
+                    let server = pulse::query();
+                    match &server {
+                        Ok(s) => println!("Output:      system sound ({})", s.kind),
+                        Err(e) => println!("Output:      system sound — {}", e),
+                    }
+                    match (&cfg.sink, &server) {
+                        (Some(sk), _) => println!("Device:      {}", sk),
+                        (None, Ok(s)) => println!(
+                            "Device:      desktop default (now: {})",
+                            s.default_sink.as_deref().map(|d| sink_desc(s, d)).unwrap_or_else(|| "none".into())
+                        ),
+                        (None, Err(_)) => println!("Device:      desktop default"),
+                    }
+                }
             }
             Ok(())
         }
         Some(Command::Inspect { artist }) => inspect(&mut cfg, &artist),
-        None => run(&mut cfg, cli.device),
+        None => run(&mut cfg, cli.output, cli.device),
     }
 }
 
-fn run(cfg: &mut Config, device_override: Option<String>) -> Result<()> {
+/// Where to play in `mode`, honoring a one-off `--device`.
+fn target_for(cfg: &Config, mode: OutputMode, device_override: Option<String>) -> Target {
+    match mode {
+        OutputMode::Bitperfect => Target::Alsa(
+            device_override
+                .or_else(|| cfg.device.clone())
+                .or_else(output::guess_device)
+                .unwrap_or_else(|| "default".to_string()),
+        ),
+        OutputMode::System => Target::SoundServer {
+            sink: match device_override {
+                Some(d) if d == "default" => None,
+                Some(d) => Some(d),
+                None => cfg.sink.clone(),
+            },
+        },
+    }
+}
+
+fn mode_label(m: OutputMode) -> &'static str {
+    match m {
+        OutputMode::Bitperfect => "bit-perfect (straight to your DAC through ALSA)",
+        OutputMode::System => "system sound (PipeWire/PulseAudio)",
+    }
+}
+
+/// A sink's description, or its name when it has none.
+fn sink_desc(s: &pulse::ServerSummary, name: &str) -> String {
+    s.sinks
+        .iter()
+        .find(|k| k.name == name && !k.desc.is_empty())
+        .map(|k| k.desc.clone())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Option<String>) -> Result<()> {
     if cfg.account_token.is_none() || cfg.server.is_none() || cfg.library.is_none() {
         println!("Welcome to Plext! Let's connect to your Plex server first.\n");
         login(cfg)?;
@@ -109,10 +185,9 @@ fn run(cfg: &mut Config, device_override: Option<String>) -> Result<()> {
     let server_cfg = connect(&plex_client, cfg)?;
     let library = cfg.library.clone().context("no library chosen; run `plext login`")?;
 
-    let device = device_override
-        .or_else(|| cfg.device.clone())
-        .or_else(output::guess_device)
-        .unwrap_or_else(|| "default".to_string());
+    let mode = mode_override.unwrap_or(cfg.output_mode());
+    let target = target_for(cfg, mode, device_override);
+    log::write(&format!("output: {} → {}", mode.name(), target.describe()));
 
     let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token, &server_cfg.machine_id);
     let header = app::HeaderInfo {
@@ -125,7 +200,7 @@ fn run(cfg: &mut Config, device_override: Option<String>) -> Result<()> {
         server,
         library.key,
         header,
-        device,
+        target,
         cfg.report_playback.unwrap_or(true),
         cfg.group_releases.unwrap_or(true),
         cfg.mpris.unwrap_or(true),
@@ -261,14 +336,91 @@ fn login(cfg: &mut Config) -> Result<()> {
     });
     cfg.save()?;
 
-    if cfg.device.is_none() {
+    if cfg.output.is_none() {
         println!();
-        device_cmd(cfg, None)?;
+        setup_output(cfg)?;
     }
     Ok(())
 }
 
-fn device_cmd(cfg: &mut Config, name: Option<String>) -> Result<()> {
+/// Asks how to play, then which device to play through, and saves both.
+fn setup_output(cfg: &mut Config) -> Result<()> {
+    let server = pulse::query().ok();
+    let usb = output::guess_device();
+    let kind = server.as_ref().map(|s| s.kind).unwrap_or("PipeWire/PulseAudio");
+    let options = vec![
+        "Bit-perfect: straight to your DAC, untouched. Exclusive while playing; volume on the DAC."
+            .to_string(),
+        format!(
+            "Desktop sound: through {}, to any speakers or headphones, alongside other apps.{}",
+            kind,
+            if server.is_none() { " (Not running right now.)" } else { "" }
+        ),
+    ];
+    // A USB DAC is the reason to want bit-perfect; without one, desktop sound
+    // is what most people expect.
+    let recommended = if usb.is_none() && server.is_some() { 1 } else { 0 };
+    let current = cfg.output.map(|m| if m == OutputMode::Bitperfect { 0 } else { 1 });
+    let pick = choose_default("How should Plext play your music?", &options, current.unwrap_or(recommended))?;
+    let mode = if pick == 0 { OutputMode::Bitperfect } else { OutputMode::System };
+    cfg.output = Some(mode);
+
+    match mode {
+        OutputMode::Bitperfect => {
+            let devices = output::list_devices();
+            if devices.is_empty() {
+                println!(
+                    "\nNo ALSA hardware playback devices found, so Plext will use ALSA's default device \
+                     (not bit-perfect). Connect your DAC and run `plext device` to choose it."
+                );
+            } else {
+                let names: Vec<String> = devices.iter().map(|d| format!("{:<26} {}", d.name, d.desc)).collect();
+                let default = cfg
+                    .device
+                    .as_deref()
+                    .or(usb.as_deref())
+                    .and_then(|want| devices.iter().position(|d| d.name == want))
+                    .unwrap_or(0);
+                println!();
+                let i = choose_default("Which device?", &names, default)?;
+                cfg.device = Some(devices[i].name.clone());
+            }
+        }
+        OutputMode::System => {
+            if let Some(s) = server.as_ref().filter(|s| !s.sinks.is_empty()) {
+                let now = s.default_sink.as_deref().map(|d| sink_desc(s, d));
+                let mut names = vec![match now {
+                    Some(n) => format!("Follow the desktop's default output (now: {})", n),
+                    None => "Follow the desktop's default output".to_string(),
+                }];
+                names.extend(s.sinks.iter().map(|k| if k.desc.is_empty() { k.name.clone() } else { k.desc.clone() }));
+                let default = cfg
+                    .sink
+                    .as_deref()
+                    .and_then(|want| s.sinks.iter().position(|k| k.name == want).map(|i| i + 1))
+                    .unwrap_or(0);
+                println!();
+                let i = choose_default("Which output?", &names, default)?;
+                cfg.sink = if i == 0 { None } else { Some(s.sinks[i - 1].name.clone()) };
+            } else {
+                cfg.sink = None;
+                println!("\nPlext will play through the desktop's default output once a sound server is running.");
+            }
+        }
+    }
+    cfg.save()?;
+    println!(
+        "\nOutput: {} → {}. Change it any time with `plext output`.",
+        mode_label(mode),
+        target_for(cfg, mode, None).describe()
+    );
+    Ok(())
+}
+
+fn device_cmd(cfg: &mut Config, mode_override: Option<OutputMode>, name: Option<String>) -> Result<()> {
+    if mode_override.unwrap_or(cfg.output_mode()) == OutputMode::System {
+        return sink_cmd(cfg, name);
+    }
     if let Some(n) = name {
         cfg.device = Some(n.clone());
         cfg.save()?;
@@ -293,24 +445,77 @@ fn device_cmd(cfg: &mut Config, name: Option<String>) -> Result<()> {
         ),
     }
     println!("Choose one with:  plext device <name>");
+    println!("To play through your desktop's sound instead:  plext output system");
+    Ok(())
+}
+
+/// `plext device` in system mode: the sound server's outputs.
+fn sink_cmd(cfg: &mut Config, name: Option<String>) -> Result<()> {
+    let server = pulse::query();
+    if let Some(n) = name {
+        if n == "default" {
+            cfg.sink = None;
+            cfg.save()?;
+            println!("Playing through the desktop's default output.");
+            return Ok(());
+        }
+        if let Ok(s) = &server {
+            if !s.sinks.iter().any(|k| k.name == n) {
+                bail!("{} has no output named \"{}\"; run `plext device` to list them", s.kind, n);
+            }
+        }
+        cfg.sink = Some(n.clone());
+        cfg.save()?;
+        println!("Output device set to {}", n);
+        return Ok(());
+    }
+    let s = server?;
+    println!("{} outputs:\n", s.kind);
+    for k in &s.sinks {
+        let mark = if cfg.sink.as_deref() == Some(k.name.as_str()) { "*" } else { " " };
+        let default = if s.default_sink.as_deref() == Some(k.name.as_str()) { "  (desktop default)" } else { "" };
+        println!(" {} {}{}\n     {}", mark, k.desc, default, k.name);
+    }
+    match &cfg.sink {
+        Some(k) => println!("\nCurrent: {}", k),
+        None => println!("\nCurrent: the desktop's default output"),
+    }
+    println!("Choose one with:  plext device <name>   (or `plext device default` to follow the desktop)");
+    println!("For bit-perfect playback straight to a DAC:  plext output bitperfect");
     Ok(())
 }
 
 fn choose(prompt: &str, options: &[String]) -> Result<usize> {
+    choose_inner(prompt, options, None)
+}
+
+/// Like `choose`, but pressing Enter picks `default` (marked with *).
+fn choose_default(prompt: &str, options: &[String], default: usize) -> Result<usize> {
+    choose_inner(prompt, options, Some(default.min(options.len().saturating_sub(1))))
+}
+
+fn choose_inner(prompt: &str, options: &[String], default: Option<usize>) -> Result<usize> {
     if options.len() == 1 {
         println!("{} {}", prompt, options[0]);
         return Ok(0);
     }
     println!("{}", prompt);
     for (i, o) in options.iter().enumerate() {
-        println!("  {}) {}", i + 1, o);
+        let mark = if default == Some(i) { "*" } else { " " };
+        println!(" {}{}) {}", mark, i + 1, o);
     }
     loop {
-        print!("Enter 1-{}: ", options.len());
+        match default {
+            Some(d) => print!("Enter 1-{} [{}]: ", options.len(), d + 1),
+            None => print!("Enter 1-{}: ", options.len()),
+        }
         io::stdout().flush().ok();
         let mut line = String::new();
         if io::stdin().read_line(&mut line)? == 0 {
             bail!("cancelled");
+        }
+        if let (Some(d), "") = (default, line.trim()) {
+            return Ok(d);
         }
         if let Ok(n) = line.trim().parse::<usize>() {
             if (1..=options.len()).contains(&n) {
