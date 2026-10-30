@@ -11,6 +11,7 @@
 
 use crate::covers::Covers;
 use crate::player::{Cmd, PlayState, Status};
+use crate::queue::Repeat;
 use crate::plex::Track;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +75,8 @@ struct View {
     can_play: bool,
     can_pause: bool,
     can_seek: bool,
+    shuffle: bool,
+    loop_status: &'static str,
 }
 
 fn is_active(st: &Status) -> bool {
@@ -114,12 +117,23 @@ fn view(st: &Status, covers: Option<&Covers>) -> View {
         track_key: st.track.as_ref().filter(|_| active).map(|t| t.key.clone()),
         length_ms: length_us(st).map(|u| (u / 1000) as u64),
         has_art,
-        can_next: active && st.queue_pos + 1 < st.queue_len,
+        can_next: active && st.has_next(),
         // Previous always works while playing: it restarts the track or goes back.
         can_prev: active,
         can_play: active,
         can_pause: active,
         can_seek: active && st.state != PlayState::Loading && st.dur.is_some(),
+        shuffle: st.shuffle,
+        loop_status: loop_status(st.repeat),
+    }
+}
+
+/// MPRIS names for the repeat modes.
+fn loop_status(r: Repeat) -> &'static str {
+    match r {
+        Repeat::Off => "None",
+        Repeat::All => "Playlist",
+        Repeat::One => "Track",
     }
 }
 
@@ -388,6 +402,34 @@ impl Player {
     fn can_control(&self) -> bool {
         true
     }
+
+    #[zbus(property)]
+    fn shuffle(&self) -> bool {
+        self.snapshot().shuffle
+    }
+
+    #[zbus(property)]
+    fn set_shuffle(&self, on: bool) {
+        self.send(Cmd::SetShuffle(on));
+    }
+
+    /// "None", "Track" or "Playlist" (the whole queue).
+    #[zbus(property)]
+    fn loop_status(&self) -> String {
+        loop_status(self.snapshot().repeat).to_string()
+    }
+
+    #[zbus(property)]
+    fn set_loop_status(&self, value: String) -> zbus::fdo::Result<()> {
+        let r = match value.as_str() {
+            "None" => Repeat::Off,
+            "Track" => Repeat::One,
+            "Playlist" => Repeat::All,
+            other => return Err(zbus::fdo::Error::InvalidArgs(format!("unknown loop status {}", other))),
+        };
+        self.send(Cmd::SetRepeat(r));
+        Ok(())
+    }
 }
 
 // ---------- the service thread ----------
@@ -457,6 +499,12 @@ fn run(
             }
             if now.can_seek != last.can_seek {
                 announce(p.can_seek_changed(&emitter));
+            }
+            if now.shuffle != last.shuffle {
+                announce(p.shuffle_changed(&emitter));
+            }
+            if now.loop_status != last.loop_status {
+                announce(p.loop_status_changed(&emitter));
             }
             last = now;
         }
@@ -628,6 +676,9 @@ mod live {
                 Cmd::SeekBy(d) => format!("SeekBy({:.1})", d),
                 Cmd::Play { .. } => "Play".into(),
                 Cmd::Quit => "Quit".into(),
+                Cmd::SetShuffle(on) => format!("SetShuffle({})", on),
+                Cmd::SetRepeat(r) => format!("SetRepeat({:?})", r),
+                _ => "queue edit".into(),
             };
             println!("engine got: {}", name);
             match cmd {
@@ -654,6 +705,8 @@ mod live {
                     s.pos = t;
                     s.seek_seq += 1;
                 }
+                Cmd::SetShuffle(on) => s.shuffle = on,
+                Cmd::SetRepeat(r) => s.repeat = r,
                 _ => {}
             }
         }

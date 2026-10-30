@@ -4,7 +4,8 @@ use crate::covers::Covers;
 use crate::mpris::Mpris;
 use crate::output::Route;
 use crate::pixelart::{self, PixelArt};
-use crate::player::{Cmd, PlayState, Player, Status};
+use crate::player::{Cmd, PlayState, Player, QueueView, Status};
+use crate::queue::Repeat;
 use crate::plex::{khz, Album, Artist, ReleaseKind, Server, Track};
 use crate::report::Reporter;
 use anyhow::Result;
@@ -78,7 +79,42 @@ enum ArtState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Tree,
+    /// The right pane, whichever view it shows.
     Tracks,
+}
+
+/// What the right pane shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RightView {
+    /// The album under the cursor in the artist list.
+    Album,
+    /// The play queue.
+    Queue,
+}
+
+/// What to do with an album once its tracks have loaded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Action {
+    /// Replace the queue and play from this track.
+    Play(usize),
+    /// Add to the end of the queue.
+    Append,
+    /// Add after the current track.
+    PlayNext,
+}
+
+/// A line of feedback in the now-playing bar.
+struct Notice {
+    text: String,
+    at: Instant,
+    error: bool,
+}
+
+/// What the now-playing bar's details line shows instead of the details.
+#[derive(Clone, Copy)]
+pub struct Banner<'a> {
+    pub text: &'a str,
+    pub error: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,8 +165,9 @@ pub struct App {
     pending_ratings: HashMap<String, u32>,
     /// Rating changes go to one worker so they reach Plex in the order made.
     rate_tx: Sender<RateJob>,
-    /// An error from the UI side (e.g. a rating that didn't save) and when it appeared.
-    notice: Option<(String, Instant)>,
+    /// Feedback from the UI side: a rating that didn't save (an error), or
+    /// what a key just did ("Added … to the queue").
+    notice: Option<Notice>,
 
     tree_state: ListState,
     /// Rows visible in the artist pane at the last draw, for PageUp/PageDown.
@@ -141,8 +178,14 @@ pub struct App {
     filtering: bool,
     /// Album shown in the right pane: (artist name, album).
     shown_album: Option<(String, Album)>,
-    /// Album to start playing as soon as its tracks arrive.
-    play_when_loaded: Option<(String, usize)>,
+    /// Albums to play or queue as soon as their tracks arrive, in the order asked.
+    when_loaded: Vec<(String, Action)>,
+    right: RightView,
+    /// The queue as last fetched from the player, and the cursor in it.
+    queue: QueueView,
+    queue_state: ListState,
+    /// Save the queue on quit (off in tests).
+    keep_queue: bool,
     quit: bool,
     /// The last error we've seen from the player, and when it appeared.
     seen_error_seq: u64,
@@ -208,7 +251,11 @@ impl App {
             filter: String::new(),
             filtering: false,
             shown_album: None,
-            play_when_loaded: None,
+            when_loaded: Vec::new(),
+            right: RightView::Album,
+            queue: QueueView::default(),
+            queue_state: ListState::default().with_selected(Some(0)),
+            keep_queue: false,
             quit: false,
             seen_error_seq: 0,
             error_since: None,
@@ -223,6 +270,7 @@ impl App {
                 self.on_msg(m);
             }
             let status = self.player.status();
+            self.refresh_queue(&status);
             // Cheap to ask, and the font size can change while we run.
             self.art_cols = art_columns();
             self.update_art(&status);
@@ -239,8 +287,48 @@ impl App {
                 }
             }
         }
+        if self.keep_queue {
+            match self.player.saved(&self.server.machine_id) {
+                Some(s) => crate::queue::save(&s),
+                None => crate::queue::forget(),
+            }
+        }
         self.player.send(Cmd::Stop);
         Ok(())
+    }
+
+    /// Brings back the queue from last time (paused where it was left), and
+    /// saves it again on quit.
+    pub fn restore_queue(&mut self) {
+        self.keep_queue = true;
+        if let Some(saved) = crate::queue::load(&self.server.machine_id) {
+            crate::log::write(&format!("restoring the queue ({} tracks)", saved.items.len()));
+            self.player.send(Cmd::Restore(saved));
+        }
+    }
+
+    /// Fetches the queue again when it has changed.
+    fn refresh_queue(&mut self, st: &Status) {
+        if st.queue_version == self.queue.version && !self.queue.items.is_empty() == (st.queue_len > 0) {
+            return;
+        }
+        let selected_id = self
+            .queue_state
+            .selected()
+            .and_then(|i| self.queue.items.get(i))
+            .map(|e| e.id);
+        self.queue = self.player.queue();
+        // Keep the cursor on the same entry if it's still there.
+        let n = self.queue.items.len();
+        let idx = selected_id
+            .and_then(|id| self.queue.items.iter().position(|e| e.id == id))
+            .or(self.queue_state.selected())
+            .unwrap_or(0);
+        self.queue_state.select(Some(idx.min(n.saturating_sub(1))));
+    }
+
+    fn say(&mut self, text: String) {
+        self.notice = Some(Notice { text, at: Instant::now(), error: false });
     }
 
     // ---------- loading ----------
@@ -421,12 +509,16 @@ impl App {
                         Err(e) => Loadable::Failed(e),
                     },
                 );
+                if !ready {
+                    // Nothing to play or add after all; the error shows in the pane.
+                    self.when_loaded.retain(|(pk, _)| *pk != k);
+                }
                 if ready {
-                    if let Some((pk, idx)) = self.play_when_loaded.clone() {
-                        if pk == k {
-                            self.play_when_loaded = None;
-                            self.play_album(&k, idx);
-                        }
+                    let (now, later): (Vec<_>, Vec<_>) =
+                        std::mem::take(&mut self.when_loaded).into_iter().partition(|(pk, _)| *pk == k);
+                    self.when_loaded = later;
+                    for (_, action) in now {
+                        self.album_action(&k, action);
                     }
                 }
             }
@@ -443,7 +535,11 @@ impl App {
                     if self.ratings.get(&key).copied().flatten() == wanted {
                         self.ratings.insert(key, previous);
                     }
-                    self.notice = Some((format!("Couldn't save rating: {}", e), Instant::now()));
+                    self.notice = Some(Notice {
+                        text: format!("Couldn't save rating: {}", e),
+                        at: Instant::now(),
+                        error: true,
+                    });
                 }
             }
         }
@@ -629,6 +725,83 @@ impl App {
         }
     }
 
+    /// Plays or queues an album whose tracks have loaded.
+    fn album_action(&mut self, album_key: &str, action: Action) {
+        match action {
+            Action::Play(i) => self.play_album(album_key, i),
+            Action::Append | Action::PlayNext => {
+                let Some(Loadable::Ready(t)) = self.tracks.get(album_key) else { return };
+                let tracks = t.clone();
+                let title = self
+                    .albums
+                    .values()
+                    .find_map(|l| match l {
+                        Loadable::Ready(v) => v.iter().find(|a| a.key == album_key),
+                        _ => None,
+                    })
+                    .map(|a| a.title.clone())
+                    .or_else(|| tracks.first().map(|t| t.album.clone()))
+                    .unwrap_or_default();
+                self.queue_tracks(tracks, action, &title);
+            }
+        }
+    }
+
+    /// Plays or queues the album on a row of the artist list, loading its
+    /// tracks first if need be.
+    fn act_on_album(&mut self, i: usize, j: usize, action: Action) {
+        let Some(al) = self.album(i, j).cloned() else { return };
+        self.sync_shown_album();
+        if matches!(self.tracks.get(&al.key), Some(Loadable::Ready(_))) {
+            self.album_action(&al.key, action);
+        } else {
+            self.load_tracks(&al.key);
+            // Playing replaces the queue, so it cancels anything still waiting to be added.
+            if matches!(action, Action::Play(_)) {
+                self.when_loaded.clear();
+            }
+            self.when_loaded.push((al.key, action));
+        }
+    }
+
+    /// Adds tracks to the queue and says so. `what` names them ("You Are Free").
+    fn queue_tracks(&mut self, tracks: Vec<Track>, action: Action, what: &str) {
+        if tracks.is_empty() {
+            return;
+        }
+        let n = tracks.len();
+        let empty = self.player.status().queue_len == 0;
+        let count = if n == 1 { String::new() } else { format!(" ({} tracks)", n) };
+        let msg = match action {
+            Action::PlayNext => format!("Playing next: {}{}", what, count),
+            _ => format!("Added {}{} to the queue", what, count),
+        };
+        let stopped = self.player.status().state == PlayState::Stopped;
+        self.player.send(match action {
+            Action::PlayNext => Cmd::PlayNext(tracks),
+            _ => Cmd::Append(tracks),
+        });
+        let hint = if empty && stopped { " · space plays" } else { "" };
+        self.say(format!("{}{}", msg, hint));
+    }
+
+    /// Opens or closes the queue in the right pane.
+    fn toggle_queue_view(&mut self) {
+        if self.right == RightView::Queue {
+            self.right = RightView::Album;
+            if self.shown_album.is_none() {
+                self.focus = Focus::Tree;
+            }
+        } else {
+            self.right = RightView::Queue;
+            self.focus = Focus::Tracks;
+            // Start at the playing track.
+            let pos = self.player.status().queue_pos;
+            self.queue = self.player.queue();
+            self.queue_state.select(Some(pos.min(self.queue.items.len().saturating_sub(1))));
+        }
+    }
+
     // ---------- input ----------
 
     fn on_key(&mut self, k: KeyEvent) {
@@ -666,9 +839,27 @@ impl App {
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Focus::Tree if self.shown_album.is_some() => Focus::Tracks,
+                    Focus::Tree if self.shown_album.is_some() || self.right == RightView::Queue => Focus::Tracks,
                     _ => Focus::Tree,
                 }
+            }
+            KeyCode::Char('u') => self.toggle_queue_view(),
+            KeyCode::Char('z') => {
+                let on = !self.player.status().shuffle;
+                self.player.send(Cmd::ToggleShuffle);
+                self.say(if on { "Shuffle on".into() } else { "Shuffle off: back to the original order".into() });
+            }
+            KeyCode::Char('r') => {
+                let next = self.player.status().repeat.cycled();
+                self.player.send(Cmd::CycleRepeat);
+                self.say(
+                    match next {
+                        Repeat::Off => "Repeat off",
+                        Repeat::All => "Repeat: the whole queue",
+                        Repeat::One => "Repeat: this track",
+                    }
+                    .into(),
+                );
             }
             KeyCode::Char(' ') => self.player.send(Cmd::TogglePause),
             KeyCode::Char('n') => self.player.send(Cmd::Next),
@@ -679,9 +870,10 @@ impl App {
             KeyCode::Char('0'..='5') | KeyCode::Char('-') | KeyCode::Char('=') | KeyCode::Char('+') => {
                 self.rate(k.code)
             }
-            _ => match self.focus {
-                Focus::Tree => self.tree_key(k.code),
-                Focus::Tracks => self.tracks_key(k.code),
+            _ => match (self.focus, self.right) {
+                (Focus::Tree, _) => self.tree_key(k.code),
+                (Focus::Tracks, RightView::Album) => self.tracks_key(k.code),
+                (Focus::Tracks, RightView::Queue) => self.queue_key(k.code),
             },
         }
     }
@@ -698,6 +890,7 @@ impl App {
                 Some(Row::Artist(i)) => self.set_expanded(i, true),
                 Some(Row::Album(..)) => {
                     self.sync_shown_album();
+                    self.right = RightView::Album;
                     self.focus = Focus::Tracks;
                 }
                 None | Some(Row::Heading(..)) => {}
@@ -720,19 +913,66 @@ impl App {
                         .unwrap_or(false);
                     self.set_expanded(i, !open);
                 }
-                Some(Row::Album(i, j)) => {
-                    if let Some(al) = self.album(i, j).cloned() {
-                        self.sync_shown_album();
-                        if matches!(self.tracks.get(&al.key), Some(Loadable::Ready(_))) {
-                            self.play_album(&al.key, 0);
-                        } else {
-                            self.load_tracks(&al.key);
-                            self.play_when_loaded = Some((al.key, 0));
-                        }
-                    }
-                }
+                Some(Row::Album(i, j)) => self.act_on_album(i, j, Action::Play(0)),
                 None | Some(Row::Heading(..)) => {}
             },
+            KeyCode::Char(c @ ('a' | 'A')) => {
+                let action = if c == 'a' { Action::Append } else { Action::PlayNext };
+                match self.current_row() {
+                    Some(Row::Album(i, j)) => self.act_on_album(i, j, action),
+                    Some(Row::Artist(_)) => self.say("Pick an album (→ to expand the artist), then press a to add it".into()),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn queue_key(&mut self, code: KeyCode) {
+        let n = self.queue.items.len();
+        let cur = self.queue_state.selected().unwrap_or(0).min(n.saturating_sub(1));
+        let id = self.queue.items.get(cur).map(|e| e.id);
+        let page = 10;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.queue_state.select(Some(cur.saturating_sub(1))),
+            KeyCode::Down | KeyCode::Char('j') => self.queue_state.select(Some((cur + 1).min(n.saturating_sub(1)))),
+            KeyCode::PageUp => self.queue_state.select(Some(cur.saturating_sub(page))),
+            KeyCode::PageDown => self.queue_state.select(Some((cur + page).min(n.saturating_sub(1)))),
+            KeyCode::Home | KeyCode::Char('g') => self.queue_state.select(Some(0)),
+            KeyCode::End | KeyCode::Char('G') => self.queue_state.select(Some(n.saturating_sub(1))),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.right = RightView::Album;
+                self.focus = Focus::Tree;
+            }
+            KeyCode::Enter => {
+                if let Some(id) = id {
+                    self.player.send(Cmd::Jump(id));
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                if let Some(e) = self.queue.items.get(cur) {
+                    let title = e.track.title.clone();
+                    self.player.send(Cmd::Remove(e.id));
+                    self.say(format!("Removed {} from the queue", title));
+                }
+            }
+            KeyCode::Char('K') | KeyCode::Char('J') => {
+                let by: i64 = if code == KeyCode::Char('K') { -1 } else { 1 };
+                // Only tracks still to come can move, and not above the playing one.
+                let first_movable = self.queue.pos + 1;
+                if let Some(id) = id.filter(|_| cur >= first_movable) {
+                    let to = (cur as i64 + by).clamp(first_movable as i64, n.saturating_sub(1) as i64) as usize;
+                    self.player.send(Cmd::Move { id, by });
+                    self.queue_state.select(Some(to));
+                }
+            }
+            KeyCode::Char('c') => {
+                let upcoming = n.saturating_sub(self.queue.pos + 1);
+                if upcoming > 0 {
+                    self.player.send(Cmd::ClearUpcoming);
+                    self.say(format!("Cleared {} upcoming track{}", upcoming, if upcoming == 1 { "" } else { "s" }));
+                }
+            }
             _ => {}
         }
     }
@@ -751,6 +991,13 @@ impl App {
             KeyCode::Enter => {
                 if let Some((_, al)) = self.shown_album.clone() {
                     self.play_album(&al.key, cur);
+                }
+            }
+            KeyCode::Char(c @ ('a' | 'A')) => {
+                if let Some(t) = self.shown_tracks().and_then(|t| t.get(cur)).cloned() {
+                    let action = if c == 'a' { Action::Append } else { Action::PlayNext };
+                    let title = t.title.clone();
+                    self.queue_tracks(vec![t], action, &title);
                 }
             }
             _ => {}
@@ -780,7 +1027,10 @@ impl App {
             .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
             .split(outer[2]);
         self.draw_tree(f, main[0]);
-        self.draw_tracks(f, main[1], st);
+        match self.right {
+            RightView::Album => self.draw_tracks(f, main[1], st),
+            RightView::Queue => self.draw_queue(f, main[1], st),
+        }
         // Errors stay up long enough to read, even if the next track has started.
         let recent = |t: Instant| t.elapsed() < Duration::from_secs(15);
         let player_error = st
@@ -788,12 +1038,14 @@ impl App {
             .as_deref()
             .zip(self.error_since)
             .filter(|(_, t)| recent(*t));
+        // Feedback on a key fades sooner than an error.
         let notice = self
             .notice
             .as_ref()
-            .map(|(m, t)| (m.as_str(), *t))
-            .filter(|(_, t)| recent(*t));
-        // Show whichever error is newer.
+            .filter(|n| if n.error { recent(n.at) } else { n.at.elapsed() < Duration::from_secs(4) })
+            .map(|n| (Banner { text: n.text.as_str(), error: n.error }, n.at));
+        let player_error = player_error.map(|(m, t)| (Banner { text: m, error: true }, t));
+        // Show whichever is newer.
         let error = match (player_error, notice) {
             (Some(p), Some(n)) => Some(if n.1 > p.1 { n.0 } else { p.0 }),
             (p, n) => p.or(n).map(|(m, _)| m),
@@ -1065,26 +1317,161 @@ impl App {
         f.render_stateful_widget(list, parts[2], &mut self.track_state);
     }
 
-    fn draw_keys(&self, f: &mut Frame, area: Rect) {
-        let keys = [
-            ("↑↓", "move"),
-            ("→/←", "expand"),
-            ("enter", "play"),
-            ("space", "pause"),
-            ("n/p", "next/prev"),
-            (",/.", "seek"),
-            ("0-5", "rate"),
-            ("tab", "switch pane"),
-            ("/", "search"),
-            ("q", "quit"),
+    fn draw_queue(&mut self, f: &mut Frame, area: Rect, st: &Status) {
+        let focused = self.focus == Focus::Tracks;
+        let items = &self.queue.items;
+        let mut title = vec![Span::styled(" Queue ", title_style(focused))];
+        if !items.is_empty() {
+            let total: u64 = items.iter().filter_map(|e| e.track.duration_ms).sum();
+            title.push(Span::styled(
+                format!("· {} track{} · {} ", items.len(), if items.len() == 1 { "" } else { "s" }, mmss(total as f64 / 1000.0)),
+                Style::default().fg(DIM),
+            ));
+        }
+        // On the right: the modes and how to get back, dropping what doesn't fit.
+        let modes = modes_label(st);
+        let left_w: usize = title.iter().map(|s| s.content.chars().count()).sum::<usize>() + 2;
+        let candidates = [
+            if modes.is_empty() { " u back ".to_string() } else { format!(" {} · u back ", modes) },
+            if modes.is_empty() { String::new() } else { format!(" {} ", modes) },
+            String::new(),
         ];
+        let right = candidates
+            .into_iter()
+            .find(|r| left_w + r.chars().count() + 2 <= area.width as usize)
+            .unwrap_or_default();
+        let block = self.pane(Line::from(title), right, focused);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let inner_w = inner.width as usize;
+
+        if items.is_empty() {
+            let lines = vec![
+                Line::from(Span::styled(" The queue is empty.", Style::default().fg(DIM))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Press a on an album or track to add it, A to play it next, or Enter to play it now.",
+                    Style::default().fg(FAINT),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+            return;
+        }
+
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        let head = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
+        f.render_widget(Paragraph::new(queue_line("#", "Title", "Artist", "Album", "Time", inner_w, [head; 5])), parts[0]);
+        f.render_widget(
+            Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(BORDER))),
+            parts[1],
+        );
+
+        let active = st.state != PlayState::Stopped;
+        let selected = self.queue_state.selected();
+        let rows: Vec<ListItem> = items
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let t = &e.track;
+                let current = i == self.queue.pos;
+                let num = if current && active { "▶".to_string() } else { (i + 1).to_string() };
+                let styles = if current {
+                    [Style::default().fg(ACCENT).add_modifier(Modifier::BOLD); 5]
+                } else if i < self.queue.pos {
+                    // Already played.
+                    [Style::default().fg(FAINT); 5]
+                } else if selected == Some(i) {
+                    [Style::default().fg(BRIGHT); 5]
+                } else {
+                    [
+                        Style::default().fg(FAINT),
+                        Style::default().fg(FG),
+                        Style::default().fg(DIM),
+                        Style::default().fg(DIM),
+                        Style::default().fg(DIM),
+                    ]
+                };
+                let time = t.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
+                ListItem::new(queue_line(&num, &t.title, &t.artist, &t.album, &time, inner_w, styles))
+            })
+            .collect();
+        let list = List::new(rows)
+            .scroll_padding(2)
+            .highlight_style(Style::default().bg(if focused { SEL_BG } else { Color::Reset }));
+        f.render_stateful_widget(list, parts[2], &mut self.queue_state);
+    }
+
+    fn draw_keys(&self, f: &mut Frame, area: Rect) {
+        // The keys for where you are: the queue has its own.
+        let keys: &[(&str, &str)] = if self.focus == Focus::Tracks && self.right == RightView::Queue {
+            &[
+                ("enter", "play"),
+                ("d", "remove"),
+                ("J/K", "reorder"),
+                ("c", "clear upcoming"),
+                ("u", "back"),
+                ("z/r", "shuffle/repeat"),
+                ("space", "pause"),
+                ("q", "quit"),
+            ]
+        } else {
+            &[
+                ("↑↓", "move"),
+                ("→/←", "expand"),
+                ("enter", "play"),
+                ("a/A", "add/play next"),
+                ("u", "queue"),
+                ("space", "pause"),
+                ("n/p", "next/prev"),
+                ("z/r", "shuffle/repeat"),
+                ("0-5", "rate"),
+                ("/", "search"),
+                ("q", "quit"),
+            ]
+        };
         let mut spans = vec![Span::raw(" ")];
         for (k, d) in keys {
-            spans.push(Span::styled(k, Style::default().fg(FG)));
+            spans.push(Span::styled(*k, Style::default().fg(FG)));
             spans.push(Span::styled(format!(" {}   ", d), Style::default().fg(FAINT)));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
+}
+
+/// One row of the queue: number, title, artist, album, time. The title gets
+/// the most room; artist and album share the rest.
+fn queue_line(num: &str, title: &str, artist: &str, album: &str, time: &str, width: usize, styles: [Style; 5]) -> Line<'static> {
+    let num_w = 5;
+    let time_w = 7;
+    let rest = width.saturating_sub(num_w + time_w + 2).max(12);
+    let title_w = rest * 45 / 100;
+    let artist_w = rest * 25 / 100;
+    let album_w = rest - title_w - artist_w;
+    let col = |text: &str, w: usize| format!("{:<w$}", truncate(text, w.saturating_sub(2)));
+    Line::from(vec![
+        Span::styled(format!(" {:<num_w$}", truncate(num, num_w - 1)), styles[0]),
+        Span::styled(col(title, title_w), styles[1]),
+        Span::styled(col(artist, artist_w), styles[2]),
+        Span::styled(col(album, album_w), styles[3]),
+        Span::styled(format!("{:>time_w$}", time), styles[4]),
+    ])
+}
+
+/// "shuffle · repeat" — the queue's modes, or "" when both are off.
+fn modes_label(st: &Status) -> String {
+    let mut m = Vec::new();
+    if st.shuffle {
+        m.push("shuffle");
+    }
+    match st.repeat {
+        Repeat::Off => {}
+        Repeat::All => m.push("repeat"),
+        Repeat::One => m.push("repeat one"),
+    }
+    m.join(" · ")
 }
 
 /// Pane titles light up in the accent colour only on the focused pane.
@@ -1205,7 +1592,7 @@ fn draw_now_playing(
     f: &mut Frame,
     area: Rect,
     st: &Status,
-    error: Option<&str>,
+    error: Option<Banner>,
     rating: Option<Option<u8>>,
     art: Option<ArtView>,
 ) {
@@ -1219,14 +1606,18 @@ fn draw_now_playing(
             " Now Playing ",
             Style::default().fg(if active { ACCENT } else { DIM }).add_modifier(Modifier::BOLD),
         )));
-    if active && st.queue_len > 0 {
-        block = block.title(
-            Line::from(Span::styled(
-                format!(" track {} of {} ", st.queue_pos + 1, st.queue_len),
-                Style::default().fg(DIM),
-            ))
-            .alignment(Alignment::Right),
-        );
+    let modes = modes_label(st);
+    if (active && st.queue_len > 0) || !modes.is_empty() {
+        let mut spans = Vec::new();
+        if active && st.queue_len > 0 {
+            spans.push(Span::styled(format!(" track {} of {}", st.queue_pos + 1, st.queue_len), Style::default().fg(DIM)));
+        }
+        if !modes.is_empty() {
+            let sep = if spans.is_empty() { " " } else { " · " };
+            spans.push(Span::styled(format!("{}{}", sep, modes), Style::default().fg(ACCENT)));
+        }
+        spans.push(Span::raw(" "));
+        block = block.title(Line::from(spans).alignment(Alignment::Right));
     }
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1318,10 +1709,12 @@ fn draw_now_playing(
     // Up next: the following two tracks, or the end of the album.
     if show_next && track.is_some() {
         f.render_widget(Paragraph::new(Span::styled("up next", Style::default().fg(FAINT))), right(0));
-        if st.next.is_empty() {
-            f.render_widget(Paragraph::new(Span::styled("end of album", Style::default().fg(FAINT))), right(1));
+        if st.repeat == Repeat::One {
+            f.render_widget(Paragraph::new(Span::styled("repeating this track", Style::default().fg(FAINT))), right(1));
+        } else if st.next.is_empty() {
+            f.render_widget(Paragraph::new(Span::styled("end of queue", Style::default().fg(FAINT))), right(1));
         }
-        for (i, n) in st.next.iter().take(2).enumerate() {
+        for (i, n) in st.next.iter().take(if st.repeat == Repeat::One { 0 } else { 2 }).enumerate() {
             let num = n.index.map(|x| x.to_string()).unwrap_or_else(|| (st.queue_pos + 2 + i).to_string());
             let len = n.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
             let title_room = (UP_NEXT_W as usize).saturating_sub(num.chars().count() + 2 + len.chars().count() + 2);
@@ -1350,9 +1743,9 @@ fn draw_now_playing(
 /// right the bit-perfect verdict, where the sound goes and how. When the
 /// line is too narrow, the least important parts go first (bitrate,
 /// channels, the output mode) before anything is cut short.
-fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>) {
-    if let Some(e) = error {
-        f.render_widget(Paragraph::new(Span::styled(format!("⚠ {}", e), Style::default().fg(WARN))), area);
+fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, banner: Option<Banner>) {
+    if let Some(b) = banner {
+        f.render_widget(Paragraph::new(banner_span(b, "")), area);
         return;
     }
     if st.state == PlayState::Stopped {
@@ -1505,14 +1898,20 @@ fn fit_pane_titles(
     (line(vec![Span::styled(short, name.style)]), String::new())
 }
 
+/// An error (⚠, orange) or what a key just did (✓).
+fn banner_span(b: Banner, indent: &str) -> Span<'static> {
+    if b.error {
+        Span::styled(format!("{}⚠ {}", indent, b.text), Style::default().fg(WARN))
+    } else {
+        Span::styled(format!("{}✓ {}", indent, b.text), Style::default().fg(GOOD))
+    }
+}
+
 /// The compact bar's details line: source on the left, output on the
 /// right. Like the tall layout's, it drops pieces whole when narrow.
-fn draw_details(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>) {
-    if let Some(e) = error {
-        f.render_widget(
-            Paragraph::new(Span::styled(format!(" ⚠ {}", e), Style::default().fg(WARN))),
-            area,
-        );
+fn draw_details(f: &mut Frame, area: Rect, st: &Status, banner: Option<Banner>) {
+    if let Some(b) = banner {
+        f.render_widget(Paragraph::new(banner_span(b, " ")), area);
         return;
     }
     if st.state == PlayState::Stopped {
@@ -1898,9 +2297,9 @@ mod tests {
         // On the last track it says so; in a narrower terminal the column goes.
         st.next.clear();
         let rows = tall_rows(&mut app, &st, 140);
-        assert!(rows[1].contains("end of album"));
+        assert!(rows[1].contains("end of queue"));
         let rows = tall_rows(&mut app, &st, 96);
-        assert!(!rows.iter().any(|r| r.contains("up next") || r.contains("end of album")));
+        assert!(!rows.iter().any(|r| r.contains("up next") || r.contains("end of queue")));
         assert!(rows[0].contains("▶ One"));
     }
 
@@ -2111,7 +2510,7 @@ mod tests {
             }
         }
         assert_eq!(app.ratings.get("1"), Some(&Some(6)));
-        assert!(app.notice.as_ref().unwrap().0.starts_with("Couldn't save rating"));
+        assert!(app.notice.as_ref().unwrap().text.starts_with("Couldn't save rating"));
     }
 
     #[test]
@@ -2128,5 +2527,99 @@ mod tests {
         app.refreshing.insert("100".into());
         app.on_msg(Msg::Tracks("100".into(), Err("offline".into())));
         assert!(matches!(app.tracks.get("100"), Some(Loadable::Ready(t)) if t.len() == 2));
+    }
+
+    /// Waits for the player thread to catch up with what the keys asked for.
+    fn wait_for(app: &mut App, what: impl Fn(&Status, &QueueView) -> bool) -> Status {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let st = app.player.status();
+            app.refresh_queue(&st);
+            if what(&st, &app.queue) || Instant::now() > deadline {
+                return st;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_and_shift_a_queue_tracks_and_u_shows_the_queue() {
+        let tracks = vec![track("1", 1, "One", None), track("2", 2, "Two", None), track("3", 3, "Three", None)];
+        let mut app = app_with_album(tracks);
+        // An empty queue explains itself.
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        assert_eq!(app.right, RightView::Queue);
+        let rows = render(&mut app, &Status::default());
+        assert!(rows.iter().any(|r| r.contains("The queue is empty")), "{:#?}", rows);
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        assert_eq!(app.right, RightView::Album);
+
+        // a adds the highlighted track; A puts one right after the current track.
+        app.on_key(KeyEvent::from(KeyCode::Char('a')));
+        assert!(app.notice.as_ref().unwrap().text.starts_with("Added One to the queue"));
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Char('a')));
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        app.on_key(KeyEvent::from(KeyCode::Char('A')));
+        assert!(app.notice.as_ref().unwrap().text.starts_with("Playing next: Two"));
+        wait_for(&mut app, |_, q| q.items.len() == 3);
+        let order: Vec<&str> = app.queue.items.iter().map(|e| e.track.title.as_str()).collect();
+        assert_eq!(order, ["One", "Two", "Three"]);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        let st = Status { queue_len: 3, ..Status::default() };
+        let rows = render(&mut app, &st);
+        let screen = rows.join("\n");
+        assert!(screen.contains("Queue · 3 tracks"), "{}", screen);
+        assert!(rows.iter().any(|r| r.contains("Title") && r.contains("Artist") && r.contains("Album")));
+        assert!(rows.iter().any(|r| r.contains("Two") && r.contains("Cat Power")));
+        // The key hints switch to the queue's own.
+        assert!(rows.last().unwrap().contains("remove") && rows.last().unwrap().contains("clear upcoming"));
+    }
+
+    #[test]
+    fn queue_view_edits_go_to_the_player() {
+        let tracks = vec![track("1", 1, "One", None), track("2", 2, "Two", None), track("3", 3, "Three", None)];
+        let mut app = app_with_album(tracks.clone());
+        app.player.send(Cmd::Append(tracks));
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        wait_for(&mut app, |_, q| q.items.len() == 3);
+        // Move "Three" up above "Two", then remove "One".
+        app.queue_state.select(Some(2));
+        app.on_key(KeyEvent::from(KeyCode::Char('K')));
+        assert_eq!(app.queue_state.selected(), Some(1), "the cursor follows the track");
+        wait_for(&mut app, |_, q| q.items.get(1).map(|e| e.track.title == "Three").unwrap_or(false));
+        app.queue_state.select(Some(0));
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        wait_for(&mut app, |_, q| q.items.len() == 2);
+        let order: Vec<&str> = app.queue.items.iter().map(|e| e.track.title.as_str()).collect();
+        assert_eq!(order, ["Three", "Two"]);
+        // c clears what's after the current track.
+        app.on_key(KeyEvent::from(KeyCode::Char('c')));
+        wait_for(&mut app, |_, q| q.items.len() == 1);
+        assert_eq!(app.queue.items[0].track.title, "Three");
+        // ← leaves the queue view.
+        app.on_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!((app.right, app.focus == Focus::Tree), (RightView::Album, true));
+    }
+
+    #[test]
+    fn shuffle_and_repeat_show_in_the_now_playing_bar() {
+        let t = track("1", 1, "One", None);
+        let mut app = app_with_album(vec![t.clone()]);
+        app.on_key(KeyEvent::from(KeyCode::Char('z')));
+        assert_eq!(app.notice.as_ref().unwrap().text, "Shuffle on");
+        app.on_key(KeyEvent::from(KeyCode::Char('r')));
+        assert_eq!(app.notice.as_ref().unwrap().text, "Repeat: the whole queue");
+        let st = wait_for(&mut app, |st, _| st.shuffle && st.repeat == Repeat::All);
+        assert!(st.shuffle && st.repeat == Repeat::All);
+        let mut shown = playing_status(&t);
+        shown.shuffle = true;
+        shown.repeat = Repeat::One;
+        let rows = render(&mut app, &shown);
+        assert!(rows.iter().any(|r| r.contains("track 1 of 1 · shuffle · repeat one")), "{:#?}", rows);
+        // Feedback from a key shows with a tick, not a warning.
+        assert!(rows.iter().any(|r| r.contains("✓ Repeat: the whole queue")), "{:#?}", rows);
     }
 }

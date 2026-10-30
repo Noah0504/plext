@@ -109,7 +109,7 @@ impl ReleaseKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub key: String,
     pub title: String,
