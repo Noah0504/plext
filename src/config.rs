@@ -15,8 +15,14 @@ pub struct Config {
     pub server: Option<ServerConfig>,
     /// The chosen music library (section key) on that server.
     pub library: Option<LibraryConfig>,
-    /// ALSA output device, e.g. "hw:CARD=DAC,DEV=0" or "hw:1,0".
+    /// How to play: bit-perfect through ALSA, or through the desktop's sound
+    /// server. Unset means bit-perfect (what Plext did before this was asked).
+    pub output: Option<OutputMode>,
+    /// ALSA output device for bit-perfect mode, e.g. "hw:CARD=DAC,DEV=0" or "hw:1,0".
     pub device: Option<String>,
+    /// PipeWire/PulseAudio output (sink name) for system mode. Unset follows
+    /// the desktop's default output.
+    pub sink: Option<String>,
     /// Report playback to Plex (now playing, play counts, webhooks). Default: on.
     pub report_playback: Option<bool>,
     /// Group an artist's releases under headings (Albums, EPs, Live…). Default: on.
@@ -25,6 +31,31 @@ pub struct Config {
     pub mpris: Option<bool>,
     /// Show the album cover as pixel art beside what's playing. Default: on.
     pub album_art: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lowercase")]
+pub enum OutputMode {
+    /// Straight to the DAC through an ALSA `hw:` device, exclusively.
+    Bitperfect,
+    /// Through PipeWire or PulseAudio, alongside other apps.
+    System,
+}
+
+impl OutputMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            OutputMode::Bitperfect => "bitperfect",
+            OutputMode::System => "system",
+        }
+    }
+}
+
+impl Config {
+    pub fn output_mode(&self) -> OutputMode {
+        self.output.unwrap_or(OutputMode::Bitperfect)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,4 +128,20 @@ pub fn new_client_id() -> String {
         }
     }
     format!("plext-{:032x}", seed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_mode_is_written_in_lowercase_and_defaults_to_bitperfect() {
+        let old: Config = toml::from_str("client_id = \"x\"\ndevice = \"hw:1,0\"\n").unwrap();
+        assert_eq!(old.output_mode(), OutputMode::Bitperfect);
+        let cfg = Config { output: Some(OutputMode::System), ..Config::default() };
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("output = \"system\""), "{}", text);
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.output_mode(), OutputMode::System);
+    }
 }

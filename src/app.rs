@@ -2,6 +2,7 @@
 
 use crate::covers::Covers;
 use crate::mpris::Mpris;
+use crate::output::Route;
 use crate::pixelart::{self, PixelArt};
 use crate::player::{Cmd, PlayState, Player, Status};
 use crate::plex::{khz, Album, Artist, ReleaseKind, Server, Track};
@@ -158,14 +159,14 @@ impl App {
         server: Server,
         library_key: String,
         header: HeaderInfo,
-        device: String,
+        target: crate::output::Target,
         report_playback: bool,
         group_releases: bool,
         mpris: bool,
         album_art: bool,
     ) -> App {
         let (tx, rx) = mpsc::channel();
-        let player = Player::spawn(server.clone(), device);
+        let player = Player::spawn(server.clone(), target);
         let reporter = report_playback.then(|| {
             Reporter::spawn(
                 server.clone(),
@@ -1360,12 +1361,19 @@ fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>
     // Right: verdict → device · mode, with or without the mode.
     let rights: Vec<Vec<Span>> = match &st.output {
         Some(o) => {
-            let verdict = if st.bit_perfect() {
+            // Through the desktop's sound by choice: no verdict to give.
+            let verdict = if let Route::SoundServer(_) = o.route {
+                Span::raw("")
+            } else if st.bit_perfect() {
                 Span::styled("◆ BIT-PERFECT", Style::default().fg(GOOD).add_modifier(Modifier::BOLD))
             } else {
                 Span::styled("◇ NOT BIT-PERFECT", Style::default().fg(WARN).add_modifier(Modifier::BOLD))
             };
-            let mode = if o.direct { " · exclusive" } else { " · via ALSA plugins" };
+            let mode = match o.route {
+                Route::Direct => " · exclusive".to_string(),
+                Route::AlsaPlugins => " · via ALSA plugins".to_string(),
+                Route::SoundServer(kind) => format!(" · via {}", kind),
+            };
             let arrow = Span::styled("  →  ", Style::default().fg(DIM));
             let device = Span::styled(o.label.clone(), Style::default().fg(BRIGHT));
             vec![
@@ -1401,7 +1409,8 @@ fn state_and_title(st: &Status, rating: Option<Option<u8>>) -> Vec<Span<'static>
 
 /// The bit-perfect badge at the right end of `area`.
 fn draw_badge(f: &mut Frame, area: Rect, st: &Status) {
-    if st.output.is_some() {
+    let chosen_shared = matches!(st.output.as_ref().map(|o| o.route), Some(Route::SoundServer(_)));
+    if st.output.is_some() && !chosen_shared {
         let badge = if st.bit_perfect() {
             Span::styled("◆ BIT-PERFECT ", Style::default().fg(GOOD).add_modifier(Modifier::BOLD))
         } else {
@@ -1515,14 +1524,18 @@ fn draw_details(f: &mut Frame, area: Rect, st: &Status, error: Option<&str>) {
             let out = Span::styled("out: ", Style::default().fg(DIM));
             let device = Span::styled(o.label.clone(), Style::default().fg(BRIGHT));
             let dim = |t: String| Span::styled(t, Style::default().fg(DIM));
-            let modes: Vec<String> = if o.direct {
-                vec![
+            let modes: Vec<String> = match o.route {
+                Route::Direct => vec![
                     format!(" · {} · exclusive · no resample · vol: DAC ", o.fmt.name()),
                     format!(" · {} · exclusive ", o.fmt.name()),
                     " ".into(),
-                ]
-            } else {
-                vec![format!(" · {} · via ALSA plugins ", o.fmt.name()), " · via ALSA plugins ".into(), " ".into()]
+                ],
+                Route::AlsaPlugins => {
+                    vec![format!(" · {} · via ALSA plugins ", o.fmt.name()), " · via ALSA plugins ".into(), " ".into()]
+                }
+                Route::SoundServer(kind) => {
+                    vec![format!(" · via {} · vol: system ", kind), format!(" · via {} ", kind), " ".into()]
+                }
             };
             modes.into_iter().map(|m| vec![out.clone(), device.clone(), dim(m)]).collect()
         }
@@ -1744,7 +1757,7 @@ mod tests {
             server_name: "Home".into(),
             library_title: "Music".into(),
         };
-        let mut app = App::new(server, "1".into(), header, "null".into(), false, true, false, false);
+        let mut app = App::new(server, "1".into(), header, crate::output::Target::Alsa("null".into()), false, true, false, false);
         let album = Album {
             key: "100".into(),
             title: "You Are Free".into(),
@@ -1894,7 +1907,7 @@ mod tests {
     #[test]
     fn tall_details_line_shows_source_and_where_it_plays() {
         use crate::decode::SourceInfo;
-        use crate::output::{OutputInfo, SampleFmt};
+        use crate::output::{OutputInfo, Route, SampleFmt};
         let t = track("1", 1, "One", None);
         let mut app = app_with_album(vec![t.clone()]);
         app.album_art = true;
@@ -1907,7 +1920,7 @@ mod tests {
             bits: 16,
             duration_secs: Some(185.0),
         });
-        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, direct: true });
+        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, route: Route::Direct });
         let rows = tall_rows(&mut app, &st, 140);
         assert!(rows[7].contains("FLAC · 16-bit / 44.1 kHz · stereo · 641 kbps"), "{}", rows[7]);
         assert!(inside(&rows[7]).ends_with("◆ BIT-PERFECT  →  Schiit Modi+ · exclusive"), "{}", rows[7]);
@@ -1915,6 +1928,41 @@ mod tests {
         let rows = tall_rows(&mut app, &st, 96);
         assert!(!rows[7].contains('…'), "{}", rows[7]);
         assert!(rows[7].contains("FLAC · 16-bit / 44.1 kHz") && rows[7].contains("◆ BIT-PERFECT  →  Schiit Modi+"), "{}", rows[7]);
+    }
+
+    #[test]
+    fn desktop_sound_shows_where_it_plays_without_a_verdict() {
+        use crate::decode::SourceInfo;
+        use crate::output::{OutputInfo, Route, SampleFmt};
+        let t = track("1", 1, "One", None);
+        let mut st = playing_status(&t);
+        st.source = Some(SourceInfo {
+            codec: "FLAC".into(),
+            lossless: true,
+            rate: 44_100,
+            channels: 2,
+            bits: 16,
+            duration_secs: Some(185.0),
+        });
+        st.output = Some(OutputInfo {
+            label: "Built-in Audio".into(),
+            rate: 44_100,
+            fmt: SampleFmt::S16,
+            route: Route::SoundServer("PipeWire"),
+        });
+        // Tall layout.
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = true;
+        let rows = tall_rows(&mut app, &st, 140);
+        assert!(inside(&rows[7]).ends_with("→  Built-in Audio · via PipeWire"), "{}", rows[7]);
+        assert!(!rows.iter().any(|r| r.contains("BIT-PERFECT")));
+        // Compact layout.
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = false;
+        let buf = render_sized(&mut app, &st, 140, 40);
+        let screen: Vec<String> = (0..40).map(|y| row_text(&buf, y)).collect();
+        assert!(screen.iter().any(|l| l.contains("out: Built-in Audio · via PipeWire · vol: system")), "{:#?}", screen);
+        assert!(!screen.iter().any(|l| l.contains("BIT-PERFECT")));
     }
 
     #[test]
@@ -1978,7 +2026,7 @@ mod tests {
     #[test]
     fn at_80x24_headings_and_details_fit_without_overlapping() {
         use crate::decode::SourceInfo;
-        use crate::output::{OutputInfo, SampleFmt};
+        use crate::output::{OutputInfo, Route, SampleFmt};
         let tracks: Vec<Track> = (1..=5).map(|i| track(&i.to_string(), i, &format!("Song {}", i), None)).collect();
         let mut app = app_with_album(tracks.clone());
         if let Some((_, a)) = app.shown_album.as_mut() {
@@ -1993,7 +2041,7 @@ mod tests {
             bits: 16,
             duration_secs: Some(185.0),
         });
-        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, direct: true });
+        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, route: Route::Direct });
         let buf = render_sized(&mut app, &st, 80, 24);
         let screen: Vec<String> = (0..24).map(|y| row_text(&buf, y)).collect();
 

@@ -3,7 +3,7 @@
 
 use crate::decode::{Decoder, SourceInfo};
 use crate::download::Download;
-use crate::output::{Output, OutputInfo, StreamSpec};
+use crate::output::{Output, OutputInfo, StreamSpec, Target};
 use crate::plex::{Server, Track};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -60,7 +60,7 @@ impl Status {
     pub fn bit_perfect(&self) -> bool {
         match (&self.source, &self.output) {
             (Some(s), Some(o)) => {
-                s.lossless && o.direct && o.rate == s.rate && o.fmt.bits() >= s.bits
+                s.lossless && o.direct() && o.rate == s.rate && o.fmt.bits() >= s.bits
             }
             _ => false,
         }
@@ -74,7 +74,7 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn spawn(server: Server, device: String) -> Player {
+    pub fn spawn(server: Server, target: Target) -> Player {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new(Status::default()));
         let st = status.clone();
@@ -85,7 +85,7 @@ impl Player {
                     rx,
                     status: st,
                     server,
-                    device,
+                    target,
                     out: None,
                 }
                 .run()
@@ -143,7 +143,7 @@ struct Engine {
     rx: Receiver<Cmd>,
     status: Arc<Mutex<Status>>,
     server: Server,
-    device: String,
+    target: Target,
     out: Option<Output>,
 }
 
@@ -294,11 +294,11 @@ impl Engine {
 
         // Reconfigure the DAC only when the format changes; otherwise keep
         // writing into the same stream for gapless playback.
-        if self.out.as_ref().map(|o| o.spec) != Some(spec) {
+        if self.out.as_ref().map(|o| o.spec()) != Some(spec) {
             if let Some(mut o) = self.out.take() {
                 o.drain();
             }
-            match Output::open(&self.device, spec) {
+            match Output::open(&self.target, spec) {
                 Ok(o) => self.out = Some(o),
                 Err(e) => return End::Fatal(e.to_string()),
             }
@@ -312,7 +312,7 @@ impl Engine {
         {
             let mut s = self.status.lock().unwrap();
             s.source = Some(dec.info.clone());
-            s.output = Some(out.info.clone());
+            s.output = Some(out.info().clone());
             s.dur = dur;
             s.state = PlayState::Playing;
         }

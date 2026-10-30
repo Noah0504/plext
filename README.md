@@ -12,6 +12,9 @@ all from a single static binary for Linux.
   and writes the samples unchanged to the DAC through ALSA's `hw:` device. The DAC is switched to
   each track's native sample rate and resampling is disabled. The now-playing bar shows
   **◆ BIT-PERFECT** only when every bit reaches the DAC unaltered.
+- **Or play through your desktop's sound.** If you'd rather listen on any speakers or headphones
+  alongside other apps, Plext can play through PipeWire or PulseAudio instead. Setup asks which
+  you want, and `plext output` switches any time.
 - **Gapless playback** between tracks of the same format; the next track is pre-fetched.
 - **Formats:** FLAC, ALAC, WAV, AIFF (lossless), plus MP3, AAC, Vorbis.
 - **All release types**: albums, EPs, singles, live albums, compilations and more, grouped under
@@ -34,7 +37,9 @@ all from a single static binary for Linux.
 
 - Linux on x86_64 (any distribution; the binary has no dependencies)
 - A Plex Media Server with a music library, and a Plex account
-- For bit-perfect playback, a USB DAC or other sound card that Plext can access directly
+- For bit-perfect playback, a USB DAC or other sound card that Plext can access directly.
+  For desktop sound, PipeWire (with pipewire-pulse, the default on current distributions) or
+  PulseAudio
 - Plex Pass only if you want Plex webhooks; everything else works without it
 
 ## Install
@@ -51,13 +56,33 @@ To upgrade, download the new release and run the same two commands; your setting
 ## Getting started
 
 ```sh
-plext login          # sign in at plex.tv/link, pick your server and music library
-plext device         # list your output devices
-plext device hw:CARD=DAC,DEV=0   # choose your DAC
+plext login          # sign in at plex.tv/link, pick your server, library and how to play
 plext                # start playing
 ```
 
-If no device is set, Plext picks the first USB audio device it finds.
+The first time, Plext asks how to play your music:
+
+- **Bit-perfect**: straight to your DAC through ALSA, untouched. Plext has the DAC to itself
+  while it plays, and you set the volume on the DAC or amp. Best with a USB DAC.
+- **Desktop sound**: through PipeWire or PulseAudio, to whatever speakers or headphones your
+  desktop uses, alongside other apps and with your usual volume controls. Never bit-perfect,
+  since the sound server mixes and converts the audio.
+
+Then it asks which device or output to use. Change either later:
+
+```sh
+plext output                       # ask again
+plext output system                # switch to desktop sound
+plext output bitperfect            # switch to bit-perfect
+plext device                       # list the devices for the current mode
+plext device hw:CARD=DAC,DEV=0     # bit-perfect: choose your DAC
+plext device default               # desktop sound: follow the desktop's default output
+```
+
+In bit-perfect mode, if no device is set, Plext picks the first USB audio device it finds. In
+desktop-sound mode it follows your desktop's default output unless you pick one, so it moves to
+your headphones when the desktop does. You can also move Plext to another output from your
+sound settings while it plays.
 
 ## Commands
 
@@ -66,10 +91,12 @@ If no device is set, Plext picks the first USB audio device it finds.
 | `plext` | Start the player (runs `login` first if you haven't signed in) |
 | `plext login` | Sign in at plex.tv/link and choose a server and music library |
 | `plext logout` | Forget the saved Plex sign-in |
-| `plext device` | List output devices; `plext device <name>` sets the default |
-| `plext status` | Show the server, library, device, and config and log file locations |
+| `plext output` | Choose bit-perfect or desktop sound; `plext output bitperfect` / `plext output system` sets it directly |
+| `plext device` | List output devices for the current mode; `plext device <name>` sets the default |
+| `plext status` | Show the server, library, output mode, device, and config and log file locations |
 | `plext inspect "Artist"` | Show what your server reports about an artist's releases |
 | `plext --device <name>` | Play through a different device for this session only |
+| `plext --output <mode>` | Use the other mode (`bitperfect` or `system`) for this session only |
 
 ## Keys
 
@@ -134,8 +161,9 @@ Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors
 While Plext runs, it registers with your desktop as a media player over MPRIS, the standard
 Linux desktops use for this. GNOME and KDE then show the playing track, artist, album and cover
 in their media controls, and route the keyboard's media keys to Plext: play/pause, next,
-previous and stop. Seeking from those controls works too. Volume isn't offered there, since
-Plext plays bit-perfect and leaves volume to your DAC or amp.
+previous and stop. Seeking from those controls works too. Volume isn't offered there: in
+bit-perfect mode it's up to your DAC or amp, and in desktop-sound mode your desktop's own volume
+controls work as usual.
 
 On window managers without built-in media controls (sway, i3, Hyprland…), bind your keys to
 [`playerctl`](https://github.com/altdesktop/playerctl), for example in sway:
@@ -175,13 +203,18 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `device` | first USB DAC | ALSA output device; set it with `plext device <name>` |
+| `output` | `bitperfect` | `bitperfect` (ALSA, straight to the DAC) or `system` (PipeWire/PulseAudio); set it with `plext output` |
+| `device` | first USB DAC | ALSA device for bit-perfect mode; set it with `plext device <name>` |
+| `sink` | desktop default | PipeWire/PulseAudio output for desktop-sound mode; set it with `plext device <name>` |
 | `report_playback` | `true` | Report playback to Plex (dashboard, history, webhooks) |
 | `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |
 | `album_art` | `true` | Show the album cover as pixel art in a taller now-playing area |
 | `mpris` | `true` | Show in the desktop's media controls and obey media keys |
 
 ## Bit-perfect notes
+
+These apply in bit-perfect mode. In desktop-sound mode, Plext sends each track to the sound
+server in its own sample rate and bit depth, and the server takes it from there.
 
 - **Exclusive access.** While Plext is playing, the DAC is reserved for it. Other sounds won't play
   through it, and Plext releases the device when playback stops.
@@ -196,7 +229,11 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 
 - **"Device is busy."** Your desktop sound server (PipeWire or PulseAudio) is holding the DAC.
   Stop other audio, or set the DAC's profile to *Off* in your sound settings
-  (e.g. `pavucontrol` → Configuration) while you listen.
+  (e.g. `pavucontrol` → Configuration) while you listen. If you don't need bit-perfect playback,
+  `plext output system` plays through the sound server instead.
+- **"No PipeWire or PulseAudio server found."** Desktop-sound mode needs a running sound server
+  with its PulseAudio socket; on PipeWire systems that's the `pipewire-pulse` service
+  (`systemctl --user status pipewire-pulse`).
 - **A track was skipped, or something flashed by.** Errors stay on screen for 15 seconds and are
   written to `~/.local/state/plext/plext.log`, along with each track played and any dropped
   connections Plext recovered from.
@@ -219,7 +256,11 @@ cargo test --release   # bit-perfect and interface tests; needs ffmpeg
 
 The tests encode random audio with ffmpeg, stream it through Plext's download, decode and
 output path (including the real ALSA output code, captured with ALSA's `file` device), and check
-every byte matches the source.
+every byte matches the source. If a PipeWire or PulseAudio server is running, the desktop-sound
+output is also tested against it (playing a second and a half of silence).
+
+Desktop sound talks to the sound server over its PulseAudio socket in pure Rust, with no extra
+system libraries, so the release binary stays static.
 
 ## License
 

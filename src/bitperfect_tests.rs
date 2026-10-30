@@ -192,7 +192,7 @@ fn aiff_16_48_to_s16() {
 /// exactly the bytes the hardware would receive, and compares them with the source.
 #[test]
 fn alsa_output_writes_source_bits_unchanged() {
-    use crate::output::{Output, StreamSpec};
+    use crate::output::{AlsaOutput, StreamSpec};
     if !have_ffmpeg() {
         eprintln!("skipping: ffmpeg not installed");
         return;
@@ -210,7 +210,7 @@ fn alsa_output_writes_source_bits_unchanged() {
     let mut dec = Decoder::open(Box::new(dl.reader().unwrap()), Some("flac")).unwrap();
     let spec = StreamSpec { rate: dec.info.rate, channels: dec.info.channels, bits: dec.info.bits };
     let device = format!("file:FILE={},FORMAT=raw", captured.display());
-    let mut out = match Output::open(&device, spec) {
+    let mut out = match AlsaOutput::open(&device, spec) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("skipping: ALSA file device unavailable: {}", e);
