@@ -1,4 +1,8 @@
-//! Terminal user interface: artist/album tree, track list and now-playing bar.
+//! Terminal user interface: artist/album tree (or playlists), track list,
+//! queue and now-playing bar.
+
+mod help;
+mod playlists;
 
 use crate::covers::Covers;
 use crate::mpris::Mpris;
@@ -6,7 +10,8 @@ use crate::output::Route;
 use crate::pixelart::{self, PixelArt};
 use crate::player::{Cmd, PlayState, Player, QueueView, Status};
 use crate::queue::Repeat;
-use crate::plex::{khz, Album, Artist, ReleaseKind, Server, Track};
+use crate::plex::{khz, Album, Artist, Playlist, PlaylistTracks, ReleaseKind, Server, Track};
+use playlists::{InputFor, Modal, PlaylistJob};
 use crate::report::Reporter;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -44,6 +49,9 @@ enum Msg {
     Artists(Result<Vec<Artist>, String>),
     Albums(String, Result<Vec<Album>, String>),
     Tracks(String, Result<Vec<Track>, String>),
+    Playlists(Result<Vec<Playlist>, String>),
+    PlaylistTracks(String, Result<PlaylistTracks, String>),
+    PlaylistDone(playlists::PlaylistDone),
     /// A rating change finished saving to Plex (or failed to).
     Rated {
         key: String,
@@ -76,11 +84,18 @@ enum ArtState {
     Failed,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Tree,
     /// The right pane, whichever view it shows.
     Tracks,
+}
+
+/// What the left pane lists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LeftView {
+    Artists,
+    Playlists,
 }
 
 /// What the right pane shows.
@@ -101,6 +116,8 @@ enum Action {
     Append,
     /// Add after the current track.
     PlayNext,
+    /// Open "Add to playlist" with its tracks.
+    Pick,
 }
 
 /// A line of feedback in the now-playing bar.
@@ -186,6 +203,20 @@ pub struct App {
     queue_state: ListState,
     /// Save the queue on quit (off in tests).
     keep_queue: bool,
+    view: LeftView,
+    /// None until first asked for.
+    playlists: Option<Loadable<Vec<Playlist>>>,
+    playlist_state: ListState,
+    playlist_tracks: HashMap<String, Loadable<PlaylistTracks>>,
+    /// The playlist shown on the right in the Playlists view.
+    shown_playlist: Option<String>,
+    /// Playlists to play or queue once their tracks arrive.
+    playlist_when_loaded: Vec<(String, Action)>,
+    /// Playlist edits still being saved, per playlist ("" for new ones).
+    playlist_pending: HashMap<String, u32>,
+    playlist_tx: Sender<PlaylistJob>,
+    /// A window over the screen (picker, name, confirm, help).
+    modal: Option<Modal>,
     quit: bool,
     /// The last error we've seen from the player, and when it appeared.
     seen_error_seq: u64,
@@ -220,6 +251,7 @@ impl App {
         let covers = (mpris || album_art).then(|| Covers::open(server.clone())).flatten();
         let mpris = mpris.then(|| Mpris::spawn(player.status_handle(), player.commander(), covers.clone()));
         let rate_tx = spawn_rater(server.clone(), tx.clone());
+        let playlist_tx = playlists::spawn_playlist_worker(server.clone(), tx.clone());
         let mut app = App {
             _reporter: reporter,
             _mpris: mpris,
@@ -256,6 +288,15 @@ impl App {
             queue: QueueView::default(),
             queue_state: ListState::default().with_selected(Some(0)),
             keep_queue: false,
+            view: LeftView::Artists,
+            playlists: None,
+            playlist_state: ListState::default().with_selected(Some(0)),
+            playlist_tracks: HashMap::new(),
+            shown_playlist: None,
+            playlist_when_loaded: Vec::new(),
+            playlist_pending: HashMap::new(),
+            playlist_tx,
+            modal: None,
             quit: false,
             seen_error_seq: 0,
             error_since: None,
@@ -522,6 +563,9 @@ impl App {
                     }
                 }
             }
+            Msg::Playlists(r) => self.on_playlists(r),
+            Msg::PlaylistTracks(k, r) => self.on_playlist_tracks(k, r),
+            Msg::PlaylistDone(d) => self.on_playlist_done(d),
             Msg::Rated { key, wanted, previous, result } => {
                 if let Some(n) = self.pending_ratings.get_mut(&key) {
                     *n = n.saturating_sub(1);
@@ -706,7 +750,11 @@ impl App {
         self.sync_shown_album();
     }
 
+    /// The tracks in the right pane: the album's, or the playlist's.
     fn shown_tracks(&self) -> Option<&Vec<Track>> {
+        if self.view == LeftView::Playlists {
+            return self.shown_playlist_tracks().map(|pt| &pt.tracks);
+        }
         let (_, al) = self.shown_album.as_ref()?;
         match self.tracks.get(&al.key) {
             Some(Loadable::Ready(t)) => Some(t),
@@ -729,7 +777,7 @@ impl App {
     fn album_action(&mut self, album_key: &str, action: Action) {
         match action {
             Action::Play(i) => self.play_album(album_key, i),
-            Action::Append | Action::PlayNext => {
+            Action::Append | Action::PlayNext | Action::Pick => {
                 let Some(Loadable::Ready(t)) = self.tracks.get(album_key) else { return };
                 let tracks = t.clone();
                 let title = self
@@ -742,7 +790,11 @@ impl App {
                     .map(|a| a.title.clone())
                     .or_else(|| tracks.first().map(|t| t.album.clone()))
                     .unwrap_or_default();
-                self.queue_tracks(tracks, action, &title);
+                if action == Action::Pick {
+                    self.open_picker(tracks, title);
+                } else {
+                    self.queue_tracks(tracks, action, &title);
+                }
             }
         }
     }
@@ -789,7 +841,7 @@ impl App {
     fn toggle_queue_view(&mut self) {
         if self.right == RightView::Queue {
             self.right = RightView::Album;
-            if self.shown_album.is_none() {
+            if !self.has_shown() {
                 self.focus = Focus::Tree;
             }
         } else {
@@ -802,11 +854,37 @@ impl App {
         }
     }
 
+    /// Whether the right pane has an album or playlist to show.
+    fn has_shown(&self) -> bool {
+        match self.view {
+            LeftView::Artists => self.shown_album.is_some(),
+            LeftView::Playlists => self.shown_playlist.is_some(),
+        }
+    }
+
+    /// Back to the top of the filtered list.
+    fn filter_changed(&mut self) {
+        match self.view {
+            LeftView::Artists => {
+                self.tree_state.select(Some(0));
+                self.sync_shown_album();
+            }
+            LeftView::Playlists => {
+                self.playlist_state.select(Some(0));
+                self.sync_shown_playlist();
+            }
+        }
+    }
+
     // ---------- input ----------
 
     fn on_key(&mut self, k: KeyEvent) {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+        if self.modal.is_some() {
+            self.modal_key(k);
             return;
         }
         if self.filtering {
@@ -822,8 +900,7 @@ impl App {
                 KeyCode::Char(c) => self.filter.push(c),
                 _ => {}
             }
-            self.tree_state.select(Some(0));
-            self.sync_shown_album();
+            self.filter_changed();
             return;
         }
 
@@ -835,14 +912,16 @@ impl App {
             }
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
-                self.tree_state.select(Some(0));
+                self.filter_changed();
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Focus::Tree if self.shown_album.is_some() || self.right == RightView::Queue => Focus::Tracks,
+                    Focus::Tree if self.has_shown() || self.right == RightView::Queue => Focus::Tracks,
                     _ => Focus::Tree,
                 }
             }
+            KeyCode::Char('?') | KeyCode::F(1) => self.open_help(),
+            KeyCode::Char('v') => self.toggle_view(),
             KeyCode::Char('u') => self.toggle_queue_view(),
             KeyCode::Char('z') => {
                 let on = !self.player.status().shuffle;
@@ -871,6 +950,7 @@ impl App {
                 self.rate(k.code)
             }
             _ => match (self.focus, self.right) {
+                (Focus::Tree, _) if self.view == LeftView::Playlists => self.playlist_list_key(k.code),
                 (Focus::Tree, _) => self.tree_key(k.code),
                 (Focus::Tracks, RightView::Album) => self.tracks_key(k.code),
                 (Focus::Tracks, RightView::Queue) => self.queue_key(k.code),
@@ -916,11 +996,17 @@ impl App {
                 Some(Row::Album(i, j)) => self.act_on_album(i, j, Action::Play(0)),
                 None | Some(Row::Heading(..)) => {}
             },
-            KeyCode::Char(c @ ('a' | 'A')) => {
-                let action = if c == 'a' { Action::Append } else { Action::PlayNext };
+            KeyCode::Char(c @ ('a' | 'A' | 'P')) => {
+                let action = match c {
+                    'a' => Action::Append,
+                    'A' => Action::PlayNext,
+                    _ => Action::Pick,
+                };
                 match self.current_row() {
                     Some(Row::Album(i, j)) => self.act_on_album(i, j, action),
-                    Some(Row::Artist(_)) => self.say("Pick an album (→ to expand the artist), then press a to add it".into()),
+                    Some(Row::Artist(_)) => {
+                        self.say(format!("Pick an album (→ to expand the artist), then press {} again", c))
+                    }
                     _ => {}
                 }
             }
@@ -966,6 +1052,23 @@ impl App {
                     self.queue_state.select(Some(to));
                 }
             }
+            KeyCode::Char('P') => {
+                if let Some(e) = self.queue.items.get(cur) {
+                    let (t, title) = (e.track.clone(), e.track.title.clone());
+                    self.open_picker(vec![t], title);
+                }
+            }
+            KeyCode::Char('S') => {
+                let tracks: Vec<Track> = self.queue.items.iter().map(|e| e.track.clone()).collect();
+                if tracks.is_empty() {
+                    self.say("The queue is empty: nothing to save".into());
+                } else {
+                    self.modal = Some(Modal::Input {
+                        purpose: InputFor::NewPlaylist { tracks, what: "the queue".into() },
+                        text: String::new(),
+                    });
+                }
+            }
             KeyCode::Char('c') => {
                 let upcoming = n.saturating_sub(self.queue.pos + 1);
                 if upcoming > 0 {
@@ -978,9 +1081,20 @@ impl App {
     }
 
     fn tracks_key(&mut self, code: KeyCode) {
+        if self.view == LeftView::Playlists && self.playlist_tracks_key(code) {
+            return;
+        }
         let n = self.shown_tracks().map(|t| t.len()).unwrap_or(0);
         let cur = self.track_state.selected().unwrap_or(0);
         match code {
+            KeyCode::PageUp => self.track_state.select(Some(cur.saturating_sub(10))),
+            KeyCode::PageDown => self.track_state.select(Some((cur + 10).min(n.saturating_sub(1)))),
+            KeyCode::Char('P') => {
+                if let Some(t) = self.shown_tracks().and_then(|t| t.get(cur)).cloned() {
+                    let title = t.title.clone();
+                    self.open_picker(vec![t], title);
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => self.track_state.select(Some(cur.saturating_sub(1))),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.track_state.select(Some((cur + 1).min(n.saturating_sub(1))))
@@ -988,7 +1102,7 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.track_state.select(Some(0)),
             KeyCode::End | KeyCode::Char('G') => self.track_state.select(Some(n.saturating_sub(1))),
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
-            KeyCode::Enter => {
+            KeyCode::Enter if self.view == LeftView::Artists => {
                 if let Some((_, al)) = self.shown_album.clone() {
                     self.play_album(&al.key, cur);
                 }
@@ -1026,10 +1140,14 @@ impl App {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
             .split(outer[2]);
-        self.draw_tree(f, main[0]);
-        match self.right {
-            RightView::Album => self.draw_tracks(f, main[1], st),
-            RightView::Queue => self.draw_queue(f, main[1], st),
+        match self.view {
+            LeftView::Artists => self.draw_tree(f, main[0]),
+            LeftView::Playlists => self.draw_playlist_list(f, main[0]),
+        }
+        match (self.right, self.view) {
+            (RightView::Album, LeftView::Artists) => self.draw_tracks(f, main[1], st),
+            (RightView::Album, LeftView::Playlists) => self.draw_playlist_tracks(f, main[1], st),
+            (RightView::Queue, _) => self.draw_queue(f, main[1], st),
         }
         // Errors stay up long enough to read, even if the next track has started.
         let recent = |t: Instant| t.elapsed() < Duration::from_secs(15);
@@ -1062,6 +1180,7 @@ impl App {
         });
         draw_now_playing(f, outer[3], st, error, rating, art);
         self.draw_keys(f, outer[4]);
+        self.draw_modal(f);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -1073,10 +1192,12 @@ impl App {
             Span::styled(&self.header.library_title, Style::default().fg(BRIGHT)),
         ]);
         f.render_widget(Paragraph::new(left), area);
-        let count = match &self.artists {
-            Loadable::Ready(a) => format!("{} artists ", a.len()),
-            Loadable::Loading => "loading… ".into(),
-            Loadable::Failed(_) => "".into(),
+        let count = match (self.view, &self.artists, &self.playlists) {
+            (LeftView::Playlists, _, Some(Loadable::Ready(p))) => format!("{} playlists ", p.len()),
+            (LeftView::Playlists, _, _) => "".into(),
+            (_, Loadable::Ready(a), _) => format!("{} artists ", a.len()),
+            (_, Loadable::Loading, _) => "loading… ".into(),
+            (_, Loadable::Failed(_), _) => "".into(),
         };
         let right = Line::from(vec![
             Span::styled(count, Style::default().fg(DIM)),
@@ -1095,19 +1216,54 @@ impl App {
             .title(Line::from(Span::styled(right, Style::default().fg(DIM))).alignment(Alignment::Right))
     }
 
-    fn draw_tree(&mut self, f: &mut Frame, area: Rect) {
-        let filter_label = if self.filtering {
+    /// "/ filter", or what you're filtering by, for the left pane `width`
+    /// wide. The hint goes when there's no room for it beside the title.
+    fn filter_label(&self, width: u16) -> String {
+        let fits = |label: &str| 21 + label.chars().count() + 4 <= width as usize;
+        let label = self.filter_label_text();
+        if fits(&label) || self.filtering || !self.filter.is_empty() {
+            label
+        } else {
+            String::new()
+        }
+    }
+
+    fn filter_label_text(&self) -> String {
+        if self.filtering {
             format!(" /{}▏", self.filter)
         } else if !self.filter.is_empty() {
             format!(" /{} (esc clears) ", self.filter)
         } else {
             " / filter ".into()
+        }
+    }
+
+    /// The left pane's title: "Artists · Playlists", the current one lit.
+    fn view_switcher(&self, focused: bool) -> Line<'static> {
+        let on = title_style(focused);
+        let off = Style::default().fg(FAINT);
+        let (a, p) = match self.view {
+            LeftView::Artists => (on, off),
+            LeftView::Playlists => (off, on),
         };
-        let mut block = self.pane(
-            Line::from(Span::styled(" Album Artists ", title_style(self.focus == Focus::Tree))),
-            filter_label,
-            self.focus == Focus::Tree,
-        );
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("Artists", a),
+            Span::styled(" · ", Style::default().fg(FAINT)),
+            Span::styled("Playlists", p),
+            Span::raw(" "),
+        ])
+    }
+
+    fn draw_tree(&mut self, f: &mut Frame, area: Rect) {
+        let filter_label = self.filter_label(area.width);
+        // While filtering, the filter takes the title's place if both don't fit.
+        let title = if self.filter_label(area.width).chars().count() + 25 > area.width as usize && !filter_label.is_empty() {
+            Line::from("")
+        } else {
+            self.view_switcher(self.focus == Focus::Tree)
+        };
+        let mut block = self.pane(title, filter_label, self.focus == Focus::Tree);
         // Where you are in the (possibly filtered) artist list.
         let visible = self.visible_artists();
         if !visible.is_empty() {
@@ -1404,41 +1560,6 @@ impl App {
         f.render_stateful_widget(list, parts[2], &mut self.queue_state);
     }
 
-    fn draw_keys(&self, f: &mut Frame, area: Rect) {
-        // The keys for where you are: the queue has its own.
-        let keys: &[(&str, &str)] = if self.focus == Focus::Tracks && self.right == RightView::Queue {
-            &[
-                ("enter", "play"),
-                ("d", "remove"),
-                ("J/K", "reorder"),
-                ("c", "clear upcoming"),
-                ("u", "back"),
-                ("z/r", "shuffle/repeat"),
-                ("space", "pause"),
-                ("q", "quit"),
-            ]
-        } else {
-            &[
-                ("↑↓", "move"),
-                ("→/←", "expand"),
-                ("enter", "play"),
-                ("a/A", "add/play next"),
-                ("u", "queue"),
-                ("space", "pause"),
-                ("n/p", "next/prev"),
-                ("z/r", "shuffle/repeat"),
-                ("0-5", "rate"),
-                ("/", "search"),
-                ("q", "quit"),
-            ]
-        };
-        let mut spans = vec![Span::raw(" ")];
-        for (k, d) in keys {
-            spans.push(Span::styled(*k, Style::default().fg(FG)));
-            spans.push(Span::styled(format!(" {}   ", d), Style::default().fg(FAINT)));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
 }
 
 /// One row of the queue: number, title, artist, album, time. The title gets
@@ -2621,5 +2742,260 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("track 1 of 1 · shuffle · repeat one")), "{:#?}", rows);
         // Feedback from a key shows with a tick, not a warning.
         assert!(rows.iter().any(|r| r.contains("✓ Repeat: the whole queue")), "{:#?}", rows);
+    }
+
+    // ---------- playlists ----------
+
+    use crate::test_server;
+    use serde_json::json;
+
+    fn key(app: &mut App, c: char) {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    /// Handles messages from background work until `done` holds (up to 5 s).
+    fn pump(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(app) && Instant::now() < deadline {
+            if let Ok(m) = app.rx.recv_timeout(Duration::from_millis(20)) {
+                app.on_msg(m);
+            }
+        }
+    }
+
+    fn pl_track(key: &str, title: &str, item: u64) -> serde_json::Value {
+        json!({"ratingKey": key, "title": title, "type": "track", "playlistItemID": item,
+               "grandparentTitle": "Cat Power", "parentTitle": "You Are Free", "duration": 185000})
+    }
+
+    /// An app talking to a stand-in server with two playlists: "Road trip"
+    /// (key 20, three tracks) and a smart "Recently added" (key 21).
+    fn app_with_playlists() -> (App, test_server::Log) {
+        let (base, log) = test_server::start(vec![
+            ("GET", "/playlists?", json!({"MediaContainer": {"Metadata": [
+                {"ratingKey": "20", "title": "Road trip", "playlistType": "audio", "leafCount": 3, "duration": 555000},
+                {"ratingKey": "21", "title": "Recently added", "playlistType": "audio", "smart": true, "leafCount": 1},
+            ]}})),
+            ("GET", "/playlists/20/items", json!({"MediaContainer": {"Metadata": [
+                pl_track("1", "Free", 501), pl_track("2", "Werewolf", 502), pl_track("3", "Fool", 503),
+            ]}})),
+            ("GET", "/playlists/21/items", json!({"MediaContainer": {"Metadata": [pl_track("9", "New one", 900)]}})),
+            ("POST", "/playlists?", json!({"MediaContainer": {"Metadata": [{"ratingKey": "30", "title": "Fresh", "leafCount": 2}]}})),
+        ]);
+        let mut app = app_with_album(vec![track("1", 1, "One", None), track("2", 2, "Two", None)]);
+        app.server = Server::new(Plex::new("plext-test"), &base, "token", "MACHINE");
+        app.playlist_tx = playlists::spawn_playlist_worker(app.server.clone(), app.tx.clone());
+        (app, log)
+    }
+
+    fn open_playlists(app: &mut App) {
+        key(app, 'v');
+        pump(app, |a| a.shown_playlist_tracks().is_some());
+    }
+
+    #[test]
+    fn v_switches_to_playlists_and_enter_plays_one() {
+        let (mut app, log) = app_with_playlists();
+        open_playlists(&mut app);
+        assert_eq!(app.view, LeftView::Playlists);
+        assert!(log.lock().unwrap().iter().any(|l| l == "GET /playlists?playlistType=audio&sectionID=1"));
+        let rows = render(&mut app, &Status::default());
+        let screen = rows.join("\n");
+        assert!(screen.contains("Artists · Playlists"), "{}", screen);
+        assert!(screen.contains("Recently added · smart") && screen.contains("Road trip"), "{}", screen);
+        // The first playlist shows on the right.
+        assert!(screen.contains("Recently added · smart playlist") && screen.contains("1 track"), "{}", screen);
+        assert!(screen.contains("New one") && screen.contains("Cat Power"), "{}", screen);
+        // Sorted by title: "Recently added" comes before "Road trip".
+        assert_eq!(app.selected_playlist().map(|p| p.title.as_str()), Some("Recently added"));
+        // Enter plays the highlighted playlist.
+        press(&mut app, KeyCode::Down);
+        pump(&mut app, |a| a.shown_playlist.as_deref() == Some("20") && a.shown_playlist_tracks().is_some());
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("Road trip · playlist") && screen.contains("3 tracks · 9:15"), "{}", screen);
+        press(&mut app, KeyCode::Enter);
+        let st = wait_for(&mut app, |_, q| q.items.len() == 3);
+        assert_eq!(st.queue_len, 3);
+        assert_eq!(app.queue.items[1].track.title, "Werewolf");
+        // The filter works on playlists too.
+        key(&mut app, '/');
+        for c in "road".chars() {
+            key(&mut app, c);
+        }
+        assert_eq!(app.visible_playlists().len(), 1);
+        // v goes back to the artists, and clears the filter.
+        press(&mut app, KeyCode::Enter);
+        key(&mut app, 'v');
+        assert_eq!((app.view, app.filter.as_str()), (LeftView::Artists, ""));
+    }
+
+    #[test]
+    fn p_adds_a_track_to_an_existing_playlist() {
+        let (mut app, log) = app_with_playlists();
+        // From an album's track list: P opens the picker, smart playlists aren't offered.
+        key(&mut app, 'P');
+        pump(&mut app, |a| a.editable_playlists().len() == 1);
+        let rows = render(&mut app, &Status::default());
+        let screen = rows.join("\n");
+        assert!(screen.contains("Add to playlist") && screen.contains("New playlist…"), "{}", screen);
+        assert!(screen.contains("Road trip") && !screen.contains("Recently added"), "{}", screen);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert_eq!(app.notice.as_ref().unwrap().text, "Added One to Road trip");
+        let l = test_server::wait_for(&log, |l| l.iter().any(|x| x.starts_with("PUT /playlists/20/items?uri=")));
+        let put = l.iter().find(|x| x.starts_with("PUT /playlists/20/items")).unwrap();
+        assert!(put.ends_with("library%2Fmetadata%2F1"), "{}", put);
+        assert_eq!(app.playlist("20").unwrap().count, 4, "the count goes up straight away");
+    }
+
+    #[test]
+    fn s_saves_the_queue_as_a_new_playlist() {
+        let (mut app, log) = app_with_playlists();
+        let tracks = vec![track("1", 1, "One", None), track("2", 2, "Two", None)];
+        app.player.send(Cmd::Append(tracks));
+        key(&mut app, 'u');
+        wait_for(&mut app, |_, q| q.items.len() == 2);
+        key(&mut app, 'S');
+        assert!(matches!(app.modal, Some(Modal::Input { .. })));
+        // An empty name isn't accepted.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_some());
+        for c in "Fresh".chars() {
+            key(&mut app, c);
+        }
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("New playlist") && screen.contains("› Fresh"), "{}", screen);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        pump(&mut app, |a| a.notice.as_ref().map(|n| n.text.starts_with("Created")).unwrap_or(false));
+        assert_eq!(app.notice.as_ref().unwrap().text, "Created playlist Fresh (2 tracks)");
+        let l = log.lock().unwrap().clone();
+        let post = l.iter().find(|x| x.starts_with("POST /playlists?")).unwrap();
+        assert!(post.contains("title=Fresh") && post.ends_with("library%2Fmetadata%2F1%2C2"), "{}", post);
+    }
+
+    #[test]
+    fn editing_a_playlists_tracks() {
+        let (mut app, log) = app_with_playlists();
+        open_playlists(&mut app);
+        press(&mut app, KeyCode::Down);
+        pump(&mut app, |a| a.shown_playlist.as_deref() == Some("20") && a.shown_playlist_tracks().is_some());
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.focus, Focus::Tracks);
+        // The legend shows this view's keys, and the help key is always there.
+        let rows = render(&mut app, &Status::default());
+        let legend = rows.last().unwrap();
+        assert!(legend.contains("remove") && legend.contains("reorder") && legend.contains("? all keys"), "{}", legend);
+        // Move "Free" down below "Werewolf", then remove "Fool".
+        key(&mut app, 'J');
+        let order: Vec<String> = app.shown_tracks().unwrap().iter().map(|t| t.title.clone()).collect();
+        assert_eq!(order, ["Werewolf", "Free", "Fool"]);
+        assert_eq!(app.track_state.selected(), Some(1), "the cursor follows the track");
+        key(&mut app, 'K');
+        press(&mut app, KeyCode::End);
+        key(&mut app, 'd');
+        assert_eq!(app.shown_tracks().unwrap().len(), 2);
+        let l = test_server::wait_for(&log, |l| l.iter().any(|x| x.starts_with("DELETE")));
+        let edits: Vec<&String> = l.iter().filter(|x| x.starts_with("PUT") || x.starts_with("DELETE")).collect();
+        assert_eq!(edits, [
+            "PUT /playlists/20/items/501/move?after=502",
+            "PUT /playlists/20/items/501/move",
+            "DELETE /playlists/20/items/503",
+        ]);
+        // Once saved, the playlist is fetched again from the server.
+        pump(&mut app, |a| a.playlist_pending.is_empty());
+        let n = l.iter().filter(|x| *x == "GET /playlists/20/items").count();
+        let l = test_server::wait_for(&log, |l| l.iter().filter(|x| *x == "GET /playlists/20/items").count() > n);
+        assert!(l.iter().filter(|x| *x == "GET /playlists/20/items").count() > n);
+    }
+
+    #[test]
+    fn smart_playlists_cant_be_edited() {
+        let (mut app, log) = app_with_playlists();
+        open_playlists(&mut app);
+        assert_eq!(app.shown_playlist.as_deref(), Some("21"));
+        press(&mut app, KeyCode::Right);
+        key(&mut app, 'd');
+        assert!(app.notice.as_ref().unwrap().text.starts_with("Smart playlists are built by Plex"));
+        assert_eq!(app.shown_tracks().unwrap().len(), 1);
+        let legend = render(&mut app, &Status::default()).last().unwrap().clone();
+        assert!(!legend.contains("reorder"), "{}", legend);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!log.lock().unwrap().iter().any(|x| x.starts_with("DELETE")));
+    }
+
+    #[test]
+    fn rename_and_delete_from_the_playlist_list() {
+        let (mut app, log) = app_with_playlists();
+        open_playlists(&mut app);
+        press(&mut app, KeyCode::Down);
+        // R starts from the current name.
+        key(&mut app, 'R');
+        for _ in 0.."Road trip".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "Drive".chars() {
+            key(&mut app, c);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.playlist("20").unwrap().title, "Drive");
+        // D asks first; n keeps it.
+        key(&mut app, 'D');
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("Delete Drive?"), "{}", screen);
+        key(&mut app, 'n');
+        assert!(app.playlist("20").is_some());
+        key(&mut app, 'D');
+        key(&mut app, 'y');
+        assert!(app.playlist("20").is_none());
+        let l = test_server::wait_for(&log, |l| l.iter().any(|x| x.starts_with("DELETE")));
+        let edits: Vec<&String> = l.iter().filter(|x| x.starts_with("PUT") || x.starts_with("DELETE")).collect();
+        assert_eq!(edits, ["PUT /playlists/20?title=Drive", "DELETE /playlists/20"]);
+    }
+
+    #[test]
+    fn help_lists_every_key_and_closes() {
+        let mut app = app_with_album(vec![track("1", 1, "One", None)]);
+        key(&mut app, '?');
+        let rows = render(&mut app, &Status::default());
+        let screen = rows.join("\n");
+        assert!(screen.contains(" Keys ") && screen.contains("Browsing") && screen.contains("Switch between Artists and Playlists"), "{}", screen);
+        // A short terminal scrolls the list.
+        press(&mut app, KeyCode::End);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| app.draw(f, &Status::default())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let small: String = (0..24).map(|y| row_text(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(small.contains("Quit") && !small.contains("Browsing"), "{}", small);
+        // Other keys do nothing while it's open; Esc closes it.
+        key(&mut app, 'v');
+        assert_eq!(app.view, LeftView::Artists);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn the_legend_follows_where_you_are() {
+        let mut app = app_with_album(vec![track("1", 1, "One", None)]);
+        app.focus = Focus::Tree;
+        let legend = |app: &mut App| render(app, &Status::default()).last().unwrap().clone();
+        let l = legend(&mut app);
+        assert!(l.contains("open/close") && l.contains("v playlists") && l.ends_with("? all keys "), "{}", l);
+        app.focus = Focus::Tracks;
+        assert!(legend(&mut app).contains("play from here"));
+        key(&mut app, 'u');
+        let l = legend(&mut app);
+        assert!(l.contains("save as playlist") && l.contains("clear upcoming"), "{}", l);
+        // Narrow: keys drop off the end, "? all keys" stays.
+        let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        term.draw(|f| app.draw(f, &Status::default())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let last = row_text(&buf, 23);
+        assert!(last.ends_with("? all keys ") && !last.contains("pause"), "{}", last);
     }
 }
