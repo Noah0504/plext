@@ -79,7 +79,8 @@ fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc
             status.lock().unwrap().clone()
         };
 
-        let active = matches!(st.state, PlayState::Playing | PlayState::Paused);
+        // A restored queue waiting to be resumed isn't a listening session yet.
+        let active = matches!(st.state, PlayState::Playing | PlayState::Paused) && !st.waiting;
         let current = st.track.as_ref().filter(|_| active);
 
         // The previous track ended, was skipped, or playback stopped.

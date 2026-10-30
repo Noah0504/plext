@@ -16,6 +16,8 @@ all from a single static binary for Linux.
   alongside other apps, Plext can play through PipeWire or PulseAudio instead. Setup asks which
   you want, and `plext output` switches any time.
 - **Gapless playback** between tracks of the same format; the next track is pre-fetched.
+- **A play queue** you can add albums and tracks to, reorder and trim, with shuffle and repeat.
+  It's saved when you quit and comes back paused where you left off.
 - **Formats:** FLAC, ALAC, WAV, AIFF (lossless), plus MP3, AAC, Vorbis.
 - **All release types**: albums, EPs, singles, live albums, compilations and more, grouped under
   headings when you expand an artist (using the release types Plex reads from your tags, the same
@@ -107,17 +109,48 @@ sound settings while it plays.
 | `Home` `End` / `g` `G` | Jump to the top / bottom |
 | `→` / `l` | Expand an artist; on an album, move to its track list |
 | `←` / `h` | Collapse / back to the artist list |
-| `Enter` | Play the album (in the track list, from the selected track) |
+| `Enter` | Play the album (in the track list, from the selected track), replacing the queue |
+| `a` | Add the album or track to the end of the queue |
+| `A` | Play the album or track next, right after the current track |
+| `u` | Show the queue (press again, or `←`, to go back) |
+| `z` | Shuffle on / off |
+| `r` | Repeat: off → the whole queue → this track → off |
 | `Space` | Pause / resume |
 | `n` / `p` | Next / previous track (`p` restarts the track if you're more than 3 s in) |
 | `.` `]` / `,` `[` | Seek forward / back 10 s |
-| `s` | Stop |
+| `s` | Stop (the queue stays; `Space` starts it again) |
 | `1`–`5` | Rate the track that many stars |
 | `-` / `=` | Take away / add half a star (`+` works too) |
 | `0` | Clear the track's rating |
 | `Tab` | Switch pane |
 | `/` | Filter artists (`Esc` clears) |
 | `q` / `Ctrl+C` | Quit |
+
+## The queue
+
+Pressing `Enter` on an album plays it, replacing whatever was queued. To line up more, press `a`
+on an album or a track to add it to the end of the queue, or `A` to have it play next, right
+after the current track. If nothing is playing, `Space` starts the queue.
+
+Press `u` to see the queue in the right-hand pane. Tracks already played stay at the top,
+dimmed, so `p` can go back to them; the playing track is marked ▶. There:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Play the highlighted track now |
+| `d` / `Delete` | Remove the track from the queue |
+| `J` / `K` | Move the track down / up |
+| `c` | Clear everything after the playing track |
+| `u` / `←` | Back to the album view |
+
+**Shuffle** (`z`) keeps the playing track and shuffles the rest of the queue; turning it off
+puts the original order back. With shuffle on, playing an album starts with the track you chose
+and shuffles the rest. **Repeat** (`r`) cycles through off, the whole queue, and the current
+track. Both show at the top right of the now-playing bar, and in your desktop's media controls.
+
+When you quit, the queue is saved to `~/.local/state/plext/queue.json`. Next time Plext starts
+with it paused at the same track and position; press `Space` to carry on. (A queue saved from a
+different Plex server is ignored.)
 
 ## Plex integration
 
@@ -161,7 +194,8 @@ Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors
 While Plext runs, it registers with your desktop as a media player over MPRIS, the standard
 Linux desktops use for this. GNOME and KDE then show the playing track, artist, album and cover
 in their media controls, and route the keyboard's media keys to Plext: play/pause, next,
-previous and stop. Seeking from those controls works too. Volume isn't offered there: in
+previous and stop. Seeking, shuffle and repeat work from those controls too (`playerctl shuffle
+toggle`, `playerctl loop Playlist`). Volume isn't offered there: in
 bit-perfect mode it's up to your DAC or amp, and in desktop-sound mode your desktop's own volume
 controls work as usual.
 

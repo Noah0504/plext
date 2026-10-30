@@ -10,6 +10,7 @@ mod pixelart;
 mod player;
 mod plex;
 mod pulse;
+mod queue;
 mod report;
 
 #[cfg(test)]
@@ -196,7 +197,7 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
     };
 
     let mut terminal = ratatui::init();
-    let result = app::App::new(
+    let mut app = app::App::new(
         server,
         library.key,
         header,
@@ -205,7 +206,9 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
         cfg.group_releases.unwrap_or(true),
         cfg.mpris.unwrap_or(true),
         cfg.album_art.unwrap_or(true),
-    ).run(&mut terminal);
+    );
+    app.restore_queue();
+    let result = app.run(&mut terminal);
     ratatui::restore();
     result
 }
