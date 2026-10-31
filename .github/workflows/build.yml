@@ -106,21 +106,31 @@ jobs:
             image: aarch64-musl
             qemu: qemu-aarch64
             qemu_cpu: cortex-a53
+            cflags: "-march=armv8-a"
+            rustflags: ""
           - name: armv6
             target: arm-unknown-linux-musleabihf
             image: arm-musleabihf
             qemu: qemu-arm
             qemu_cpu: arm1176
+            # Rust's arm-unknown-linux-musleabihf baseline: ARMv6 with VFPv2.
+            cflags: "-march=armv6kz -mfpu=vfp -mfloat-abi=hard -marm"
+            # alsa-lib's atomics can become libgcc calls on 32-bit Arm, and
+            # Rust doesn't link libgcc on its own.
+            rustflags: "-C link-arg=-lgcc"
           - name: armv7
             target: armv7-unknown-linux-musleabihf
             image: armv7-musleabihf
             qemu: qemu-arm
             qemu_cpu: cortex-a7
+            # Rust's armv7-unknown-linux-musleabihf baseline: ARMv7-A, VFPv3-D16, no NEON.
+            cflags: "-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+            rustflags: "-C link-arg=-lgcc"
     runs-on: ubuntu-latest
     container: ghcr.io/rust-cross/rust-musl-cross:${{ matrix.image }}
     env:
       CARGO_BUILD_TARGET: ${{ matrix.target }}
-      RUSTFLAGS: "-C target-feature=+crt-static"
+      RUSTFLAGS: "-C target-feature=+crt-static ${{ matrix.rustflags }}"
       PKG_CONFIG_ALL_STATIC: "1"
       PKG_CONFIG_ALLOW_CROSS: "1"
     steps:
@@ -161,7 +171,7 @@ jobs:
           cd /tmp/alsa-lib-${ALSA_VERSION}
           # Installed into /opt/alsa, but looking for its configuration where
           # Raspberry Pi OS (and every other distro) keeps it.
-          ./configure --host=${{ matrix.target }} CC="$CROSS_CC" \
+          ./configure --host=${{ matrix.target }} CC="$CROSS_CC" CFLAGS="-O2 ${{ matrix.cflags }}" \
             --prefix=/opt/alsa --sysconfdir=/etc --with-configdir=/usr/share/alsa \
             --enable-static --disable-shared --disable-python --disable-topology \
             --disable-ucm --disable-aload --without-debug
