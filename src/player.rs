@@ -19,6 +19,9 @@ pub enum Cmd {
     Append(Vec<Track>),
     /// Add tracks right after the current one.
     PlayNext(Vec<Track>),
+    /// Add the rest of what's playing (a big playlist still loading): mixed
+    /// in among the upcoming tracks when shuffled, else at the end.
+    AppendMixed(Vec<Track>),
     /// Remove a queue entry (by id); removing the current one skips it.
     Remove(u64),
     /// Move a queue entry up (negative) or down.
@@ -346,6 +349,14 @@ impl Engine {
     }
 
     fn start_download(&self, track: &Track) -> Result<Download, String> {
+        // Listings sometimes leave out the media file; ask for the track's details then.
+        let looked_up;
+        let track = if track.part_key.is_none() {
+            looked_up = self.server.track(&track.key).unwrap_or_else(|_| track.clone());
+            &looked_up
+        } else {
+            track
+        };
         let part = track
             .part_key
             .clone()
@@ -712,6 +723,7 @@ fn is_edit(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Append(_)
+            | Cmd::AppendMixed(_)
             | Cmd::PlayNext(_)
             | Cmd::Remove(_)
             | Cmd::Move { .. }
@@ -733,6 +745,9 @@ fn apply_edit(queue: &Arc<Mutex<Queue>>, cmd: Cmd) -> bool {
         }
         Cmd::PlayNext(t) => {
             q.play_next(t);
+        }
+        Cmd::AppendMixed(t) => {
+            q.append_mixed(t);
         }
         Cmd::Remove(id) => return q.remove(id),
         Cmd::Move { id, by } => q.move_by(id, by),
