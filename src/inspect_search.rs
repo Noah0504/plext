@@ -4,7 +4,7 @@
 //!
 //! It only reads. Paths are printed without the sign-in token.
 
-use crate::plex::{parse_search, Server};
+use crate::plex::{parse_search, tracks_titled, Server};
 use serde_json::Value;
 use std::fmt::Write;
 use std::time::Instant;
@@ -33,7 +33,27 @@ pub fn report(server: &Server, library_key: &str, query: &str) -> String {
     let _ = writeln!(o, "  answered in {} ms", started.elapsed().as_millis());
     raw_hubs(o, &v);
 
-    let r = parse_search(&v, library_key);
+    let mut r = parse_search(&v, library_key);
+
+    // Plext's fallback when the server's search returns no tracks.
+    let path = Server::track_title_path(library_key, query, LIMIT);
+    let _ = writeln!(o, "\n== Tracks by title ({})", path);
+    let started = Instant::now();
+    match server.get_raw(&path) {
+        Ok(tv) => {
+            let tracks = tracks_titled(&tv, query);
+            let _ = writeln!(o, "  answered in {} ms: {} tracks", started.elapsed().as_millis(), tracks.len());
+            if r.tracks.is_empty() {
+                r.tracks = tracks;
+            } else {
+                let _ = writeln!(o, "  (not used: the search itself found tracks)");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(o, "  FAILED: {:#}", e);
+        }
+    }
+
     let _ = writeln!(o, "\n== What the Search view shows");
     let _ = writeln!(o, "  Artists ({})", r.artists.len());
     for a in r.artists.iter().take(SHOW) {
@@ -93,9 +113,13 @@ fn raw_hubs(o: &mut String, v: &Value) {
             );
         }
     }
-    let empty = hubs.iter().filter(|h| h["Metadata"].as_array().is_none_or(|a| a.is_empty()) && h["Directory"].is_null()).count();
-    if empty > 0 {
-        let _ = writeln!(o, "  ({} empty hubs not shown)", empty);
+    let empty: Vec<String> = hubs
+        .iter()
+        .filter(|h| h["Metadata"].as_array().is_none_or(|a| a.is_empty()) && h["Directory"].as_array().is_none_or(|a| a.is_empty()))
+        .map(|h| text(&h["hubIdentifier"]))
+        .collect();
+    if !empty.is_empty() {
+        let _ = writeln!(o, "  empty hubs: {}", empty.join(", "));
     }
 }
 
