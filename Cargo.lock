@@ -1238,6 +1238,7 @@ dependencies = [
  "clap",
  "dirs",
  "image",
+ "libc",
  "pulseaudio",
  "ratatui",
  "serde",

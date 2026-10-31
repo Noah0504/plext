@@ -31,6 +31,19 @@ pub struct Config {
     pub mpris: Option<bool>,
     /// Show the album cover as pixel art beside what's playing. Default: on.
     pub album_art: Option<bool>,
+    /// Color theme: a theme's name ("nord", "gruvbox-light"…), "terminal"
+    /// for the terminal's own colors, or "auto" to follow the terminal's
+    /// background. Default: Plext's own. `T` in Plext picks one.
+    pub theme: Option<String>,
+    /// Named themes paint their own background. Default: on.
+    pub theme_background: Option<bool>,
+    /// What `theme = "auto"` uses on dark and light terminals. Default:
+    /// "plext" and "plext-light".
+    pub theme_dark: Option<String>,
+    pub theme_light: Option<String>,
+    /// Single colors changed on top of the theme, e.g. `accent = "#e5a00d"`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub colors: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -55,6 +68,17 @@ impl OutputMode {
 impl Config {
     pub fn output_mode(&self) -> OutputMode {
         self.output.unwrap_or(OutputMode::Bitperfect)
+    }
+
+    /// The settings that decide the color theme.
+    pub fn theme_settings(&self) -> crate::theme::Settings {
+        crate::theme::Settings {
+            theme: self.theme.clone(),
+            background: self.theme_background,
+            dark: self.theme_dark.clone(),
+            light: self.theme_light.clone(),
+            colors: self.colors.clone(),
+        }
     }
 }
 
@@ -143,5 +167,26 @@ mod tests {
         assert!(text.contains("output = \"system\""), "{}", text);
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.output_mode(), OutputMode::System);
+    }
+
+    #[test]
+    fn theme_settings_read_and_write_with_a_colors_table() {
+        let text = "client_id = \"x\"\ntheme = \"auto\"\ntheme_light = \"catppuccin-latte\"\ntheme_background = false\n\n[colors]\naccent = \"#ff8800\"\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        let s = cfg.theme_settings();
+        assert!(s.is_auto());
+        assert_eq!(s.light.as_deref(), Some("catppuccin-latte"));
+        assert_eq!(s.background, Some(false));
+        assert_eq!(s.colors.get("accent").map(String::as_str), Some("#ff8800"));
+        // Written back (after the server table, which comes first), it reads the same.
+        let mut cfg = cfg;
+        cfg.server = Some(ServerConfig { name: "Edison".into(), machine_id: "m".into(), url: "http://x".into(), token: "t".into() });
+        let out = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&out).unwrap();
+        assert_eq!(back.colors, cfg.colors);
+        assert_eq!(back.theme.as_deref(), Some("auto"));
+        // Without colors, no empty table.
+        let plain = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!plain.contains("[colors]"), "{}", plain);
     }
 }
