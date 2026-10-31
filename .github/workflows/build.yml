@@ -17,27 +17,10 @@ env:
   ALSA_VERSION: "1.2.13"
 
 jobs:
-  # 64-bit builds, each on its own CPU: x86_64, and aarch64 (Raspberry Pi 3, 4,
-  # 5 and Zero 2 W running a 64-bit OS) on GitHub's Arm runners, so the tests
-  # run on real Arm hardware.
-  linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: x86_64
-            target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-          - name: aarch64
-            target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  linux-x86_64:
+    runs-on: ubuntu-latest
     # Alpine uses musl, which lets us produce a fully static binary that runs on any distro.
     container: rust:alpine
-    env:
-      PKG_CONFIG_ALL_STATIC: "1"
-      CARGO_BUILD_TARGET: ${{ matrix.target }}
-      RUSTFLAGS: "-C target-feature=+crt-static"
     steps:
       - name: Install build tools
         run: apk add --no-cache build-base musl-dev pkgconf linux-headers curl tar bzip2 file ffmpeg git bash
@@ -57,66 +40,81 @@ jobs:
 
       - name: Test
         shell: bash
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           set -o pipefail
           if ! cargo test --release --locked 2>&1 | tee test.log; then
             # Surface the failure as an annotation so it's visible without downloading logs.
             msg=$(grep -vE '^\s+(Compiling|Downloaded|Downloading) ' test.log | tail -60 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
-            echo "::error title=cargo test failed (${{ matrix.name }})::${msg}"
+            echo "::error title=cargo test failed::${msg}"
             exit 1
           fi
 
       - name: Build
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           cargo build --release --locked
-          bin=target/${{ matrix.target }}/release/plext
-          file "$bin"
+          file target/x86_64-unknown-linux-musl/release/plext
           # Fail if the binary depends on any shared library.
-          if file "$bin" | grep -q "dynamically linked"; then
+          if file target/x86_64-unknown-linux-musl/release/plext | grep -q "dynamically linked"; then
             echo "binary is not static"; exit 1
           fi
-          "$bin" --version
+          ./target/x86_64-unknown-linux-musl/release/plext --version
 
       - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/plext dist/
+          cp target/x86_64-unknown-linux-musl/release/plext dist/
           cp README.md LICENSE THIRD-PARTY-LICENSES.md dist/
-          tar -C dist -czf plext-${{ matrix.name }}-linux.tar.gz plext README.md LICENSE THIRD-PARTY-LICENSES.md
-          sha256sum plext-${{ matrix.name }}-linux.tar.gz > plext-${{ matrix.name }}-linux.tar.gz.sha256
+          tar -C dist -czf plext-x86_64-linux.tar.gz plext README.md LICENSE THIRD-PARTY-LICENSES.md
+          sha256sum plext-x86_64-linux.tar.gz > plext-x86_64-linux.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4
         with:
-          name: plext-${{ matrix.name }}-linux
+          name: plext-x86_64-linux
           path: |
-            plext-${{ matrix.name }}-linux.tar.gz
-            plext-${{ matrix.name }}-linux.tar.gz.sha256
+            plext-x86_64-linux.tar.gz
+            plext-x86_64-linux.tar.gz.sha256
 
       - name: Publish release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            plext-${{ matrix.name }}-linux.tar.gz
-            plext-${{ matrix.name }}-linux.tar.gz.sha256
+            plext-x86_64-linux.tar.gz
+            plext-x86_64-linux.tar.gz.sha256
 
-  # 32-bit Arm, cross-compiled with a musl cross toolchain and tested under
-  # QEMU emulating the oldest CPU each build supports, so an instruction
-  # those CPUs lack fails the tests here rather than on someone's Pi:
-  #   armv6: Raspberry Pi 1, Zero and Zero W (ARM1176), and any Pi on a 32-bit OS
-  #   armv7: Raspberry Pi 2 and newer on a 32-bit OS (Cortex-A7)
-  linux-arm32:
+  # Arm (Raspberry Pi), cross-compiled with a musl cross toolchain and tested
+  # under QEMU emulating the oldest CPU each build supports, so an
+  # instruction those CPUs lack fails the tests here rather than on a Pi:
+  #   aarch64: Pi 3, 4, 5 and Zero 2 W on a 64-bit OS (Cortex-A53)
+  #   armv7:   Pi 2 and newer on a 32-bit OS (Cortex-A7)
+  #   armv6:   Pi 1, Zero and Zero W (ARM1176); runs on every Pi
+  linux-arm:
     strategy:
       fail-fast: false
       matrix:
         include:
+          - name: aarch64
+            target: aarch64-unknown-linux-musl
+            image: aarch64-musl
+            qemu: qemu-aarch64
+            qemu_cpu: cortex-a53
           - name: armv6
             target: arm-unknown-linux-musleabihf
             image: arm-musleabihf
+            qemu: qemu-arm
             qemu_cpu: arm1176
           - name: armv7
             target: armv7-unknown-linux-musleabihf
             image: armv7-musleabihf
+            qemu: qemu-arm
             qemu_cpu: cortex-a7
     runs-on: ubuntu-latest
     container: ghcr.io/rust-cross/rust-musl-cross:${{ matrix.image }}
@@ -125,7 +123,6 @@ jobs:
       RUSTFLAGS: "-C target-feature=+crt-static"
       PKG_CONFIG_ALL_STATIC: "1"
       PKG_CONFIG_ALLOW_CROSS: "1"
-      PKG_CONFIG_PATH: /opt/alsa/lib/pkgconfig
     steps:
       - name: Install build and test tools
         run: |
@@ -147,7 +144,15 @@ jobs:
           rustc --version
           rustup target add ${{ matrix.target }} || true
           t=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
-          echo "CARGO_TARGET_${t}_RUNNER=qemu-arm -cpu ${{ matrix.qemu_cpu }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${t}_RUNNER=${{ matrix.qemu }} -cpu ${{ matrix.qemu_cpu }}" >> "$GITHUB_ENV"
+          # The image points pkg-config at its own sysroot; look for the
+          # alsa-lib built below instead.
+          u=$(echo "${{ matrix.target }}" | tr '-' '_')
+          for v in "${{ matrix.target }}" "$u"; do
+            echo "PKG_CONFIG_PATH_${v}=/opt/alsa/lib/pkgconfig" >> "$GITHUB_ENV"
+            echo "PKG_CONFIG_LIBDIR_${v}=/opt/alsa/lib/pkgconfig" >> "$GITHUB_ENV"
+            echo "PKG_CONFIG_SYSROOT_DIR_${v}=/" >> "$GITHUB_ENV"
+          done
 
       - name: Build static alsa-lib ${{ env.ALSA_VERSION }}
         shell: bash
@@ -182,7 +187,7 @@ jobs:
           if file "$bin" | grep -q "dynamically linked"; then
             echo "binary is not static"; exit 1
           fi
-          qemu-arm -cpu ${{ matrix.qemu_cpu }} "$bin" --version
+          ${{ matrix.qemu }} -cpu ${{ matrix.qemu_cpu }} "$bin" --version
           ls -l "$bin"
 
       - name: Package
