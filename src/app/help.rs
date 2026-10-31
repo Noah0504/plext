@@ -27,6 +27,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Space", "Pause / resume"),
             ("n  p", "Next / previous track"),
             (".  ]   ,  [", "Seek forward / back 10 s"),
+            ("<  >", "Volume down / up (desktop sound; in bit-perfect mode the DAC sets it)"),
             ("s", "Stop"),
         ],
     ),

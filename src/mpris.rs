@@ -10,6 +10,7 @@
 //! Spec: https://specifications.freedesktop.org/mpris-spec/latest/
 
 use crate::covers::Covers;
+use crate::volume::Mixer;
 use crate::player::{Cmd, PlayState, Status};
 use crate::queue::Repeat;
 use crate::plex::Track;
@@ -37,13 +38,14 @@ pub struct Mpris {
 }
 
 impl Mpris {
-    pub fn spawn(status: Arc<Mutex<Status>>, commands: Sender<Cmd>, covers: Option<Covers>) -> Mpris {
+    /// `mixer` is there in desktop-sound mode, so the volume can be changed.
+    pub fn spawn(status: Arc<Mutex<Status>>, commands: Sender<Cmd>, covers: Option<Covers>, mixer: Option<Mixer>) -> Mpris {
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let handle = thread::Builder::new()
             .name("plext-mpris".into())
             .spawn(move || {
-                if let Err(e) = run(status, commands, covers, &s) {
+                if let Err(e) = run(status, commands, covers, mixer, &s) {
                     crate::log::write(&format!("mpris: media controls unavailable: {}", e));
                 }
             })
@@ -77,6 +79,8 @@ struct View {
     can_seek: bool,
     shuffle: bool,
     loop_status: &'static str,
+    /// The volume in tenths of a percent, to notice changes.
+    volume: u32,
 }
 
 fn is_active(st: &Status) -> bool {
@@ -125,6 +129,17 @@ fn view(st: &Status, covers: Option<&Covers>) -> View {
         can_seek: active && st.state != PlayState::Loading && st.dur.is_some(),
         shuffle: st.shuffle,
         loop_status: loop_status(st.repeat),
+        volume: (volume(st) * 1000.0).round() as u32,
+    }
+}
+
+/// The volume MPRIS reports: the stream's in desktop-sound mode (0 when
+/// muted), full in bit-perfect mode (the DAC or amp sets it there).
+fn volume(st: &Status) -> f64 {
+    match st.volume {
+        Some(v) if v.muted => 0.0,
+        Some(v) => v.percent as f64 / 100.0,
+        None => 1.0,
     }
 }
 
@@ -234,6 +249,7 @@ struct Player {
     status: Arc<Mutex<Status>>,
     commands: Mutex<Sender<Cmd>>,
     covers: Option<Covers>,
+    mixer: Option<Mixer>,
 }
 
 impl Player {
@@ -357,14 +373,21 @@ impl Player {
         metadata(&self.snapshot(), self.covers.as_ref())
     }
 
-    /// Always full: Plext plays bit-perfect, so volume is set on the DAC or amp.
+    /// Plext's own volume in desktop-sound mode. In bit-perfect mode it's
+    /// always full and can't change: the DAC or amp sets the volume.
     #[zbus(property)]
     fn volume(&self) -> f64 {
-        1.0
+        volume(&self.snapshot())
     }
 
     #[zbus(property)]
-    fn set_volume(&self, _volume: f64) {}
+    fn set_volume(&self, value: f64) {
+        if let Some(m) = &self.mixer {
+            if value.is_finite() && self.snapshot().volume.is_some() {
+                m.set((value.clamp(0.0, 1.0) * 100.0).round() as u32);
+            }
+        }
+    }
 
     /// Clients read this when they need it and extrapolate in between, so
     /// changes aren't announced (the spec says not to); jumps get `Seeked`.
@@ -438,12 +461,14 @@ fn run(
     status: Arc<Mutex<Status>>,
     commands: Sender<Cmd>,
     covers: Option<Covers>,
+    mixer: Option<Mixer>,
     stop: &AtomicBool,
 ) -> zbus::Result<()> {
     let player = Player {
         status: status.clone(),
         commands: Mutex::new(commands),
         covers: covers.clone(),
+        mixer,
     };
     let conn = blocking::connection::Builder::session()?
         .serve_at(OBJECT_PATH, Root)?
@@ -505,6 +530,9 @@ fn run(
             }
             if now.loop_status != last.loop_status {
                 announce(p.loop_status_changed(&emitter));
+            }
+            if now.volume != last.volume {
+                announce(p.volume_changed(&emitter));
             }
             last = now;
         }
@@ -651,7 +679,7 @@ mod live {
             ..Default::default()
         }));
         let (tx, rx) = mpsc::channel();
-        let _mpris = Mpris::spawn(status.clone(), tx, None);
+        let _mpris = Mpris::spawn(status.clone(), tx, None, None);
         let end = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < end {
             let cmd = match rx.recv_timeout(Duration::from_millis(100)) {

@@ -124,6 +124,9 @@ pub struct OutputInfo {
     pub rate: u32,
     pub fmt: SampleFmt,
     pub route: Route,
+    /// The sound server's id for Plext's stream (its "sink input"), whose
+    /// volume the volume keys change. None for ALSA.
+    pub stream: Option<u32>,
 }
 
 impl OutputInfo {
@@ -289,6 +292,7 @@ impl AlsaOutput {
                 rate: spec.rate,
                 fmt,
                 route: if is_direct(device) { Route::Direct } else { Route::AlsaPlugins },
+                stream: None,
             },
             pcm,
             spec,

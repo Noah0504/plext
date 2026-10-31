@@ -8,6 +8,7 @@ mod search;
 
 use crate::covers::Covers;
 use crate::mpris::Mpris;
+use crate::volume::{self, Mixer};
 use crate::output::Route;
 use crate::pixelart::{self, PixelArt};
 use crate::player::{Cmd, PlayState, Player, QueueView, Status};
@@ -178,6 +179,8 @@ pub struct App {
     player: Player,
     _reporter: Option<Reporter>,
     _mpris: Option<Mpris>,
+    /// Changes Plext's volume in desktop-sound mode (None in bit-perfect mode).
+    mixer: Option<Mixer>,
     covers: Option<Covers>,
     /// Show the cover as pixel art in a taller now-playing area.
     album_art: bool,
@@ -284,7 +287,9 @@ impl App {
         album_art: bool,
     ) -> App {
         let (tx, rx) = mpsc::channel();
+        let desktop_sound = matches!(target, crate::output::Target::SoundServer { .. });
         let player = Player::spawn(server.clone(), target);
+        let mixer = desktop_sound.then(|| Mixer::spawn(player.status_handle()));
         let reporter = report_playback.then(|| {
             Reporter::spawn(
                 server.clone(),
@@ -293,12 +298,13 @@ impl App {
             )
         });
         let covers = (mpris || album_art).then(|| Covers::open(server.clone())).flatten();
-        let mpris = mpris.then(|| Mpris::spawn(player.status_handle(), player.commander(), covers.clone()));
+        let mpris = mpris.then(|| Mpris::spawn(player.status_handle(), player.commander(), covers.clone(), mixer.clone()));
         let rate_tx = spawn_rater(server.clone(), tx.clone());
         let playlist_tx = playlists::spawn_playlist_worker(server.clone(), tx.clone());
         let mut app = App {
             _reporter: reporter,
             _mpris: mpris,
+            mixer,
             covers,
             album_art,
             truecolor: pixelart::truecolor(),
@@ -1035,6 +1041,8 @@ impl App {
             KeyCode::Char('n') => self.player.send(Cmd::Next),
             KeyCode::Char('p') => self.player.send(Cmd::Prev),
             KeyCode::Char('s') => self.player.send(Cmd::Stop),
+            KeyCode::Char('<') => self.volume_key(-1),
+            KeyCode::Char('>') => self.volume_key(1),
             KeyCode::Char('.') | KeyCode::Char(']') => self.player.send(Cmd::SeekBy(10.0)),
             KeyCode::Char(',') | KeyCode::Char('[') => self.player.send(Cmd::SeekBy(-10.0)),
             KeyCode::Char('0'..='5') | KeyCode::Char('-') | KeyCode::Char('=') | KeyCode::Char('+') => {
@@ -1048,6 +1056,23 @@ impl App {
                 (Focus::Tracks, RightView::Album) => self.tracks_key(k.code),
                 (Focus::Tracks, RightView::Queue) => self.queue_key(k.code),
             },
+        }
+    }
+
+    /// `<` / `>`: Plext's volume down or up a step, in desktop-sound mode.
+    fn volume_key(&mut self, steps: i32) {
+        let Some(m) = self.mixer.clone() else {
+            return self.say("Bit-perfect: set the volume on your DAC or amp".into());
+        };
+        let st = self.player.status();
+        if st.output.is_none() {
+            return self.say("Play something first: the volume is Plext's own, in your sound settings".into());
+        }
+        m.step(steps);
+        // Shown at once; the now-playing bar shows the volume the sound server reports.
+        if let Some(v) = st.volume {
+            let to = volume::stepped(v.percent, steps);
+            self.say(format!("Volume {}%{}", to, if v.muted { " (muted in your sound settings)" } else { "" }));
         }
     }
 
@@ -2029,10 +2054,14 @@ fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, banner: Option<Bann
             };
             let arrow = Span::styled("  →  ", Style::default().fg(DIM));
             let device = Span::styled(o.label.clone(), Style::default().fg(BRIGHT));
-            vec![
-                vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(mode, Style::default().fg(DIM))],
-                vec![verdict, arrow, device],
-            ]
+            let mut v = Vec::new();
+            if let (Route::SoundServer(_), Some(vol)) = (o.route, st.volume) {
+                let vol = if vol.muted { " · muted".to_string() } else { format!(" · vol {}%", vol.percent) };
+                v.push(vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(format!("{}{}", mode, vol), Style::default().fg(DIM))]);
+            }
+            v.push(vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(mode, Style::default().fg(DIM))]);
+            v.push(vec![verdict, arrow, device]);
+            v
         }
         None => vec![Vec::new()],
     };
@@ -2193,7 +2222,17 @@ fn draw_details(f: &mut Frame, area: Rect, st: &Status, banner: Option<Banner>) 
                     vec![format!(" · {} · via ALSA plugins ", o.fmt.name()), " · via ALSA plugins ".into(), " ".into()]
                 }
                 Route::SoundServer(kind) => {
-                    vec![format!(" · via {} · vol: system ", kind), format!(" · via {} ", kind), " ".into()]
+                    let vol = match st.volume {
+                        Some(v) if v.muted => " · muted".to_string(),
+                        Some(v) => format!(" · vol {}%", v.percent),
+                        None => String::new(),
+                    };
+                    vec![
+                        format!(" · via {}{} ", kind, vol),
+                        format!(" · via {} ", kind),
+                        format!("{} ", vol),
+                        " ".into(),
+                    ]
                 }
             };
             modes.into_iter().map(|m| vec![out.clone(), device.clone(), dim(m)]).collect()
@@ -2579,7 +2618,7 @@ mod tests {
             bits: 16,
             duration_secs: Some(185.0),
         });
-        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, route: Route::Direct });
+        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, route: Route::Direct, stream: None });
         let rows = tall_rows(&mut app, &st, 140);
         assert!(rows[7].contains("FLAC · 16-bit / 44.1 kHz · stereo · 641 kbps"), "{}", rows[7]);
         assert!(inside(&rows[7]).ends_with("◆ BIT-PERFECT  →  Schiit Modi+ · exclusive"), "{}", rows[7]);
@@ -2608,6 +2647,7 @@ mod tests {
             rate: 44_100,
             fmt: SampleFmt::S16,
             route: Route::SoundServer("PipeWire"),
+            stream: Some(7),
         });
         // Tall layout.
         let mut app = app_with_album(vec![t.clone()]);
@@ -2615,13 +2655,25 @@ mod tests {
         let rows = tall_rows(&mut app, &st, 140);
         assert!(inside(&rows[7]).ends_with("→  Built-in Audio · via PipeWire"), "{}", rows[7]);
         assert!(!rows.iter().any(|r| r.contains("BIT-PERFECT")));
-        // Compact layout.
+        // Compact layout; the volume shows once the sound server reports it.
         let mut app = app_with_album(vec![t.clone()]);
         app.album_art = false;
-        let buf = render_sized(&mut app, &st, 140, 40);
-        let screen: Vec<String> = (0..40).map(|y| row_text(&buf, y)).collect();
-        assert!(screen.iter().any(|l| l.contains("out: Built-in Audio · via PipeWire · vol: system")), "{:#?}", screen);
-        assert!(!screen.iter().any(|l| l.contains("BIT-PERFECT")));
+        let screen = |app: &mut App, st: &Status| -> Vec<String> {
+            let buf = render_sized(app, st, 140, 40);
+            (0..40).map(|y| row_text(&buf, y)).collect()
+        };
+        let rows = screen(&mut app, &st);
+        assert!(rows.iter().any(|l| l.contains("out: Built-in Audio · via PipeWire ")), "{:#?}", rows);
+        assert!(!rows.iter().any(|l| l.contains("BIT-PERFECT") || l.contains("vol")));
+        st.volume = Some(crate::pulse::StreamVolume { percent: 65, muted: false });
+        assert!(screen(&mut app, &st).iter().any(|l| l.contains("out: Built-in Audio · via PipeWire · vol 65%")));
+        st.volume = Some(crate::pulse::StreamVolume { percent: 65, muted: true });
+        assert!(screen(&mut app, &st).iter().any(|l| l.contains("via PipeWire · muted")));
+        let mut app = app_with_album(vec![t.clone()]);
+        app.album_art = true;
+        st.volume = Some(crate::pulse::StreamVolume { percent: 40, muted: false });
+        let rows = tall_rows(&mut app, &st, 140);
+        assert!(inside(&rows[7]).ends_with("→  Built-in Audio · via PipeWire · vol 40%"), "{}", rows[7]);
     }
 
     #[test]
@@ -2700,7 +2752,7 @@ mod tests {
             bits: 16,
             duration_secs: Some(185.0),
         });
-        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, route: Route::Direct });
+        st.output = Some(OutputInfo { label: "Schiit Modi+".into(), rate: 44_100, fmt: SampleFmt::S16, route: Route::Direct, stream: None });
         let buf = render_sized(&mut app, &st, 80, 24);
         let screen: Vec<String> = (0..24).map(|y| row_text(&buf, y)).collect();
 
@@ -3679,5 +3731,27 @@ mod tests {
         key(&mut app, 'm');
         assert_eq!(app.radio.as_ref().map(|r| r.title.as_str()), Some("Werewolf radio"));
         test_server::wait_for(&log, |l| l.iter().any(|x| x.starts_with("GET /library/metadata/2/nearest")));
+    }
+
+    #[test]
+    fn volume_keys_explain_bit_perfect_and_step_desktop_sound() {
+        use crate::output::{OutputInfo, Route, SampleFmt};
+        let mut app = app_with_album(vec![track("1", 1, "One", None)]);
+        key(&mut app, '>');
+        assert!(app.notice.as_ref().unwrap().text.contains("DAC or amp"));
+
+        app.mixer = Some(Mixer::detached());
+        key(&mut app, '>');
+        assert!(app.notice.as_ref().unwrap().text.starts_with("Play something first"));
+        {
+            let h = app.player.status_handle();
+            let mut s = h.lock().unwrap();
+            s.output = Some(OutputInfo { label: "Speakers".into(), rate: 44_100, fmt: SampleFmt::S16, route: Route::SoundServer("PipeWire"), stream: Some(3) });
+            s.volume = Some(crate::pulse::StreamVolume { percent: 67, muted: false });
+        }
+        key(&mut app, '>');
+        assert_eq!(app.notice.as_ref().unwrap().text, "Volume 70%");
+        key(&mut app, '<');
+        assert_eq!(app.notice.as_ref().unwrap().text, "Volume 65%");
     }
 }

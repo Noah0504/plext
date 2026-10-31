@@ -15,6 +15,7 @@ mod plex;
 mod pulse;
 mod queue;
 mod report;
+mod volume;
 #[cfg(test)]
 mod test_server;
 

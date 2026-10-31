@@ -9,6 +9,10 @@
   Play an album, or a track's album from that track, with `Enter`; queue with `a` / `A`; add to a
   playlist with `P`; start a mix with `m`; open an artist in the Artists view. Search is also the
   fourth view `v` cycles through.
+- **Volume in desktop-sound mode.** `<` and `>` turn Plext's volume down and up in 5% steps, and
+  the now-playing bar shows it. It's Plext's own volume in your desktop's sound settings, so
+  changes made there show up in Plext too. MPRIS clients (`playerctl volume`, desktop media
+  widgets) can read and set it. In bit-perfect mode the DAC or amp still sets the volume.
 - `plext inspect search <words>` shows what your server's search returns, for troubleshooting.
   `plext inspect` now also takes an artist name without quotes (`plext inspect Cat Power`).
 
