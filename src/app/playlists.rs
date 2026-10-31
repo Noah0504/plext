@@ -9,6 +9,33 @@
 use super::*;
 use crate::plex::{Playlist, PlaylistTracks};
 
+/// Tracks in the first page of a playlist (shown quickly) and in each page after.
+const FIRST_PAGE: usize = 200;
+const PAGE: usize = 1000;
+
+/// A playlist's tracks on their way, page by page.
+pub(super) struct Load {
+    gen: u64,
+    loaded: usize,
+    total: usize,
+    /// The first load: pages are shown as they arrive. Otherwise it's a
+    /// refresh, collected here and swapped in once complete, so the list on
+    /// screen doesn't shrink and regrow.
+    progressive: bool,
+    buf: PlaylistTracks,
+    /// Fetch again once this load finishes (an edit was saved meanwhile).
+    reload_after: bool,
+}
+
+/// Where the rest of a still-loading playlist goes as it arrives.
+pub(super) struct Feed {
+    key: String,
+    gen: u64,
+    /// It's playing: mix the rest in when shuffled. Otherwise it was added
+    /// to the queue, and the rest follows at the end.
+    playing: bool,
+}
+
 /// A playlist change waiting to be saved to Plex.
 pub(super) enum PlaylistJob {
     Create { title: String, keys: Vec<String> },
@@ -108,17 +135,59 @@ impl App {
         });
     }
 
-    /// Fetches a playlist's tracks; the old list stays on screen until the new
-    /// one arrives.
+    /// Fetches a playlist's tracks a page at a time. The first time, pages
+    /// show as they arrive; after that, the old list stays on screen until
+    /// the whole new one is in.
     pub(super) fn load_playlist_tracks(&mut self, key: &str) {
-        if !matches!(self.playlist_tracks.get(key), Some(Loadable::Ready(_))) {
+        if let Some(l) = self.playlist_loads.get_mut(key) {
+            if l.progressive {
+                // Let the first load finish (it may be feeding the queue), then fetch again.
+                l.reload_after = true;
+                return;
+            }
+        }
+        let progressive = !matches!(self.playlist_tracks.get(key), Some(Loadable::Ready(_)));
+        if progressive {
             self.playlist_tracks.insert(key.to_string(), Loadable::Loading);
         }
-        let (s, k, tx) = (self.server.clone(), key.to_string(), self.tx.clone());
+        self.next_load += 1;
+        let gen = self.next_load;
+        self.playlist_loads.insert(
+            key.to_string(),
+            Load { gen, loaded: 0, total: 0, progressive, buf: PlaylistTracks::default(), reload_after: false },
+        );
+        self.live_loads.lock().unwrap().insert(key.to_string(), gen);
+        let (s, k, tx, live) = (self.server.clone(), key.to_string(), self.tx.clone(), self.live_loads.clone());
         thread::spawn(move || {
-            let r = s.playlist_tracks(&k).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::PlaylistTracks(k, r));
+            let mut start = 0;
+            loop {
+                let size = if start == 0 { FIRST_PAGE } else { PAGE };
+                let (page, total, last) = match s.playlist_page(&k, start, size) {
+                    Ok((pt, total)) => {
+                        let n = pt.tracks.len();
+                        start += n;
+                        (Ok(pt), total, n == 0 || start >= total)
+                    }
+                    Err(e) => (Err(e.to_string()), 0, true),
+                };
+                let msg = Msg::PlaylistPage { key: k.clone(), gen, total, page, last };
+                if tx.send(msg).is_err() || last {
+                    break;
+                }
+                // Stop if a newer load of this playlist has started.
+                if live.lock().unwrap().get(&k) != Some(&gen) {
+                    break;
+                }
+            }
         });
+    }
+
+    /// (loaded, total) while a playlist is still arriving for the first time.
+    pub(super) fn still_loading(&self, key: &str) -> Option<(usize, usize)> {
+        self.playlist_loads
+            .get(key)
+            .filter(|l| l.progressive)
+            .map(|l| (l.loaded, l.total.max(l.loaded)))
     }
 
     fn pending_edits(&self) -> u32 {
@@ -151,37 +220,99 @@ impl App {
         }
     }
 
-    pub(super) fn on_playlist_tracks(&mut self, key: String, r: Result<PlaylistTracks, String>) {
-        if self.playlist_pending.get(&key).copied().unwrap_or(0) > 0 {
+    pub(super) fn on_playlist_page(
+        &mut self,
+        key: String,
+        gen: u64,
+        total: usize,
+        page: Result<PlaylistTracks, String>,
+        last: bool,
+    ) {
+        let Some(load) = self.playlist_loads.get_mut(&key).filter(|l| l.gen == gen) else { return };
+        let progressive = load.progressive;
+        // A refresh fetched while edits were saving may be out of date;
+        // another starts once they're done.
+        if !progressive && self.playlist_pending.get(&key).copied().unwrap_or(0) > 0 {
+            self.playlist_loads.remove(&key);
             return;
         }
-        match r {
-            Ok(pt) => {
-                for t in &pt.tracks {
-                    if self.pending_ratings.get(&t.key).copied().unwrap_or(0) == 0 {
-                        self.ratings.insert(t.key.clone(), t.rating);
-                    }
-                }
-                if self.shown_playlist.as_deref() == Some(key.as_str()) {
-                    let last = pt.tracks.len().saturating_sub(1);
-                    if let Some(sel) = self.track_state.selected() {
-                        self.track_state.select(Some(sel.min(last)));
-                    }
-                }
-                self.playlist_tracks.insert(key.clone(), Loadable::Ready(pt));
-                let (now, later): (Vec<_>, Vec<_>) =
-                    std::mem::take(&mut self.playlist_when_loaded).into_iter().partition(|(k, _)| *k == key);
-                self.playlist_when_loaded = later;
-                for (_, action) in now {
-                    self.playlist_action(&key, action);
-                }
-            }
+        let pt = match page {
+            Ok(pt) => pt,
             Err(e) => {
+                let reload = load.reload_after;
+                self.playlist_loads.remove(&key);
                 self.playlist_when_loaded.retain(|(k, _)| *k != key);
-                if !matches!(self.playlist_tracks.get(&key), Some(Loadable::Ready(_))) {
-                    self.playlist_tracks.insert(key, Loadable::Failed(e));
+                if self.feed.as_ref().map(|f| f.key == key).unwrap_or(false) {
+                    self.feed = None;
+                }
+                match self.playlist_tracks.get(&key) {
+                    Some(Loadable::Ready(have)) if !have.tracks.is_empty() => {
+                        self.warn(format!("Couldn't load all of the playlist: {}", e))
+                    }
+                    _ => {
+                        self.playlist_tracks.insert(key.clone(), Loadable::Failed(e));
+                    }
+                }
+                if reload {
+                    self.load_playlist_tracks(&key);
+                }
+                return;
+            }
+        };
+        for t in &pt.tracks {
+            if self.pending_ratings.get(&t.key).copied().unwrap_or(0) == 0 {
+                self.ratings.insert(t.key.clone(), t.rating);
+            }
+        }
+        load.loaded += pt.tracks.len();
+        load.total = total;
+        if progressive {
+            // The rest of a playlist that's already playing or queued.
+            if let Some(f) = self.feed.as_ref().filter(|f| f.key == key && f.gen == gen) {
+                if !pt.tracks.is_empty() {
+                    let tracks = pt.tracks.clone();
+                    self.player.send(if f.playing { Cmd::AppendMixed(tracks) } else { Cmd::Append(tracks) });
                 }
             }
+            match self.playlist_tracks.get_mut(&key) {
+                Some(Loadable::Ready(have)) => {
+                    have.tracks.extend(pt.tracks);
+                    have.item_ids.extend(pt.item_ids);
+                }
+                _ => {
+                    self.playlist_tracks.insert(key.clone(), Loadable::Ready(pt));
+                }
+            }
+        } else {
+            load.buf.tracks.extend(pt.tracks);
+            load.buf.item_ids.extend(pt.item_ids);
+        }
+        if !last {
+            return;
+        }
+        // All in.
+        let load = self.playlist_loads.remove(&key).unwrap();
+        self.playlist_fetched.insert(key.clone(), Instant::now());
+        if !progressive {
+            self.playlist_tracks.insert(key.clone(), Loadable::Ready(load.buf));
+        }
+        if self.feed.as_ref().map(|f| f.key == key).unwrap_or(false) {
+            self.feed = None;
+        }
+        if self.shown_playlist.as_deref() == Some(key.as_str()) {
+            let n = self.shown_playlist_tracks().map(|pt| pt.tracks.len()).unwrap_or(0);
+            if let Some(sel) = self.track_state.selected() {
+                self.track_state.select(Some(sel.min(n.saturating_sub(1))));
+            }
+        }
+        let (now, later): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.playlist_when_loaded).into_iter().partition(|(k, _)| *k == key);
+        self.playlist_when_loaded = later;
+        for (_, action) in now {
+            self.playlist_action(&key, action);
+        }
+        if load.reload_after {
+            self.load_playlist_tracks(&key);
         }
     }
 
@@ -272,10 +403,44 @@ impl App {
     pub(super) fn sync_shown_playlist(&mut self) {
         let Some(key) = self.selected_playlist().map(|p| p.key.clone()) else { return };
         if self.shown_playlist.as_deref() != Some(key.as_str()) {
-            self.shown_playlist = Some(key.clone());
+            if let Some(old) = self.shown_playlist.replace(key.clone()) {
+                self.drop_unneeded_load(&old);
+            }
             self.track_state.select(Some(0));
-            // Fetched again on each visit, so changes made elsewhere show up.
-            self.load_playlist_tracks(&key);
+            self.revisit_playlist(&key);
+        }
+    }
+
+    /// Fetches a playlist again on a visit, so changes made elsewhere show
+    /// up; not if it's already on its way or was fetched in the last minute
+    /// (big playlists take a while).
+    fn revisit_playlist(&mut self, key: &str) {
+        if self.playlist_loads.contains_key(key) {
+            return;
+        }
+        let fresh = self.playlist_fetched.get(key).map(|t| t.elapsed() < Duration::from_secs(60)).unwrap_or(false);
+        if fresh && matches!(self.playlist_tracks.get(key), Some(Loadable::Ready(_))) {
+            return;
+        }
+        self.load_playlist_tracks(key);
+    }
+
+    /// Stops loading a playlist you've moved past, unless it's still needed
+    /// (playing or queued as it loads, or waiting to be). A half-loaded one
+    /// is forgotten, to load afresh next time.
+    fn drop_unneeded_load(&mut self, key: &str) {
+        let Some(load) = self.playlist_loads.get(key) else { return };
+        let needed = self.feed.as_ref().map(|f| f.key == key).unwrap_or(false)
+            || self.playlist_when_loaded.iter().any(|(k, _)| k == key)
+            || load.reload_after;
+        if needed {
+            return;
+        }
+        let progressive = load.progressive;
+        self.playlist_loads.remove(key);
+        self.live_loads.lock().unwrap().remove(key);
+        if progressive {
+            self.playlist_tracks.remove(key);
         }
     }
 
@@ -296,7 +461,7 @@ impl App {
             // Fetched again each time, so playlists made elsewhere show up.
             self.load_playlists();
             if let Some(k) = self.shown_playlist.clone() {
-                self.load_playlist_tracks(&k);
+                self.revisit_playlist(&k);
             } else {
                 self.sync_shown_playlist();
             }
@@ -350,10 +515,13 @@ impl App {
     fn act_on_playlist(&mut self, action: Action) {
         let Some(p) = self.selected_playlist().cloned() else { return };
         self.sync_shown_playlist();
+        // Usable as soon as its first page is in (see playlist_action).
         if matches!(self.playlist_tracks.get(&p.key), Some(Loadable::Ready(_))) {
             self.playlist_action(&p.key, action);
         } else {
-            self.load_playlist_tracks(&p.key);
+            if !self.playlist_loads.contains_key(&p.key) {
+                self.load_playlist_tracks(&p.key);
+            }
             if matches!(action, Action::Play(_)) {
                 self.when_loaded.clear();
                 self.playlist_when_loaded.clear();
@@ -362,21 +530,47 @@ impl App {
         }
     }
 
-    /// Plays or queues a playlist whose tracks have loaded.
+    /// Plays or queues a playlist whose tracks have (at least partly)
+    /// loaded. A big playlist still arriving starts playing (or is queued)
+    /// with what's in, and the rest follows as it loads; playing next and
+    /// adding to another playlist wait until it's all in.
     pub(super) fn playlist_action(&mut self, key: &str, action: Action) {
         let Some(Loadable::Ready(pt)) = self.playlist_tracks.get(key) else { return };
         let tracks = pt.tracks.clone();
         let title = self.playlist(key).map(|p| p.title.clone()).unwrap_or_else(|| "the playlist".into());
-        if tracks.is_empty() {
+        let loading = self.still_loading(key);
+        if tracks.is_empty() && loading.is_none() {
             self.say(format!("{} is empty", title));
             return;
         }
+        if let Some((_, total)) = loading {
+            if matches!(action, Action::PlayNext | Action::Pick) || tracks.is_empty() {
+                self.playlist_when_loaded.push((key.to_string(), action));
+                self.say(format!("Loading all {} tracks of {}…", total, title));
+                return;
+            }
+        }
+        let gen = self.playlist_loads.get(key).map(|l| l.gen).unwrap_or(0);
         match action {
             Action::Play(i) => {
                 let index = i.min(tracks.len() - 1);
+                self.when_loaded.clear();
+                self.feed = loading.map(|_| Feed { key: key.to_string(), gen, playing: true });
                 self.player.send(Cmd::Play { queue: tracks, index });
+                if let Some((_, total)) = loading {
+                    self.say(format!("Playing {}: the rest of its {} tracks join the queue as they load", title, total));
+                }
             }
-            Action::Append | Action::PlayNext => self.queue_tracks(tracks, action, &title),
+            Action::Append => {
+                if let Some((_, total)) = loading {
+                    self.feed = Some(Feed { key: key.to_string(), gen, playing: false });
+                    self.player.send(Cmd::Append(tracks));
+                    self.say(format!("Adding {} ({} tracks) to the queue as it loads", title, total));
+                } else {
+                    self.queue_tracks(tracks, action, &title);
+                }
+            }
+            Action::PlayNext => self.queue_tracks(tracks, action, &title),
             Action::Pick => self.open_picker(tracks, title),
         }
     }
@@ -687,7 +881,14 @@ impl App {
                     if p.count == 1 { "" } else { "s" },
                     mmss(p.duration_ms as f64 / 1000.0)
                 );
-                fit_pane_titles(area.width, name, kind, Vec::new(), vec![format!(" {} ", summary)])
+                let rights = match self.still_loading(&p.key) {
+                    Some((n, total)) if n > 0 => vec![
+                        format!(" loading {} of {} · {} ", n, total, summary),
+                        format!(" loading {} of {} ", n, total),
+                    ],
+                    _ => vec![format!(" {} ", summary)],
+                };
+                fit_pane_titles(area.width, name, kind, Vec::new(), rights)
             }
             None => (Line::from(Span::styled(" Tracks ", title_style(focused))), String::new()),
         };

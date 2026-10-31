@@ -135,6 +135,26 @@ impl Queue {
         n
     }
 
+    /// Adds the rest of something already playing (a big playlist still
+    /// loading). With shuffle on they're mixed in among the tracks still to
+    /// come, so the whole thing is shuffled; otherwise they go at the end.
+    pub fn append_mixed(&mut self, tracks: Vec<Track>) -> usize {
+        if !self.shuffle || self.items.is_empty() {
+            return self.append(tracks);
+        }
+        let new = self.entries(tracks);
+        let n = new.len();
+        self.unshuffled.extend(new.iter().map(|e| e.id));
+        for e in new {
+            let lo = self.pos + 1;
+            let span = (self.items.len() + 1 - lo) as u64;
+            let at = lo + (self.random() % span) as usize;
+            self.items.insert(at, e);
+        }
+        self.changed();
+        n
+    }
+
     /// Adds tracks right after the current one (at the start if the queue is
     /// empty). Returns how many were added.
     pub fn play_next(&mut self, tracks: Vec<Track>) -> usize {
@@ -506,6 +526,26 @@ mod tests {
         let mut e = Queue::new();
         e.play_next(tracks("p q"));
         assert_eq!((keys(&e).as_str(), cur(&e)), ("p q", "p"));
+    }
+
+    #[test]
+    fn the_rest_of_a_big_playlist_is_mixed_in_when_shuffled() {
+        let mut q = Queue::new();
+        q.replace(tracks("a b c"), 0);
+        q.append_mixed(tracks("d e"));
+        assert_eq!(keys(&q), "a b c d e", "in order without shuffle");
+        let mut s = Queue::new();
+        s.set_shuffle(true);
+        s.replace(tracks("p0 p1 p2 p3 p4 p5 p6 p7"), 0);
+        let later: Vec<Track> = (0..40).map(|i| t(&format!("x{}", i))).collect();
+        s.append_mixed(later);
+        assert_eq!(s.len(), 48);
+        assert_eq!(cur(&s), "p0", "the playing track stays first");
+        // Spread through the queue, not all at the end.
+        let first_x = s.items().iter().position(|e| e.track.key.starts_with('x')).unwrap();
+        assert!(first_x < 10, "first late track at {}", first_x);
+        s.set_shuffle(false);
+        assert!(keys(&s).ends_with("x38 x39") && keys(&s).starts_with("p0 p1"));
     }
 
     #[test]

@@ -591,15 +591,41 @@ impl Server {
         Ok(out)
     }
 
-    pub fn playlist_tracks(&self, playlist_key: &str) -> Result<PlaylistTracks> {
-        let v = self.get(&format!("/playlists/{}/items", encode(playlist_key)))?;
+    /// Up to `size` of a playlist's tracks, starting at `start`, and how many
+    /// it has in all. Big playlists (thousands of tracks) load a page at a
+    /// time this way instead of in one huge response.
+    ///
+    /// The listing has what playback needs (the media file) but not the
+    /// stream details albums fetch for their format column; the playlist
+    /// view doesn't show that, and the player reads the format from the file.
+    pub fn playlist_page(&self, playlist_key: &str, start: usize, size: usize) -> Result<(PlaylistTracks, usize)> {
+        let v = self.get(&format!(
+            "/playlists/{}/items?X-Plex-Container-Start={}&X-Plex-Container-Size={}",
+            encode(playlist_key),
+            start,
+            size
+        ))?;
         let mut out = PlaylistTracks::default();
-        for m in items(&v, "Metadata").filter(|m| m["type"].as_str().map_or(true, |t| t == "track")) {
+        let all: Vec<&Value> = items(&v, "Metadata").collect();
+        for m in all.iter().filter(|m| m["type"].as_str().map_or(true, |t| t == "track")) {
             out.tracks.push(parse_track(m));
             out.item_ids.push(m["playlistItemID"].as_u64().unwrap_or(0));
         }
-        self.fill_stream_details(&mut out.tracks);
-        Ok(out)
+        let mc = &v["MediaContainer"];
+        let total = mc["totalSize"]
+            .as_u64()
+            .or_else(|| mc["leafCount"].as_u64())
+            .map(|n| n as usize)
+            // No total given: assume this page is the last unless it's full.
+            .unwrap_or(if all.len() >= size { start + all.len() + 1 } else { start + all.len() });
+        Ok((out, total))
+    }
+
+    /// One track's full details (used when a track arrives without its media file).
+    pub fn track(&self, key: &str) -> Result<Track> {
+        let v = self.get(&format!("/library/metadata/{}", encode(key)))?;
+        let t = items(&v, "Metadata").next().map(parse_track);
+        t.ok_or_else(|| anyhow!("track {} not found", key))
     }
 
     /// "server://…/library/metadata/1,2,3": how Plex refers to a set of items.
@@ -930,13 +956,14 @@ mod tests {
                 {"ratingKey": "21", "title": "All Music", "playlistType": "audio", "smart": true, "leafCount": 900},
                 {"ratingKey": "22", "title": "Movies", "playlistType": "video"},
             ]}})),
-            ("GET", "/playlists/20/items", json!({"MediaContainer": {"Metadata": [
-                {"ratingKey": "5", "title": "Free", "type": "track", "playlistItemID": 101, "grandparentTitle": "Cat Power"},
+            ("GET", "/playlists/20/items", json!({"MediaContainer": {"totalSize": 3, "Metadata": [
+                {"ratingKey": "5", "title": "Free", "type": "track", "playlistItemID": 101, "grandparentTitle": "Cat Power",
+                 "Media": [{"Part": [{"key": "/library/parts/5/f.flac", "container": "flac"}]}]},
                 {"ratingKey": "6", "title": "Werewolf", "type": "track", "playlistItemID": 102},
                 {"ratingKey": "5", "title": "Free", "type": "track", "playlistItemID": 103},
             ]}})),
-            ("GET", "/library/metadata/5,6", json!({"MediaContainer": {"Metadata": [
-                {"ratingKey": "5", "title": "Free", "Media": [{"Part": [{"key": "/library/parts/5/f.flac", "Stream": [{"streamType": 2, "bitDepth": 24, "samplingRate": 96000}]}]}]},
+            ("GET", "/library/metadata/6", json!({"MediaContainer": {"Metadata": [
+                {"ratingKey": "6", "title": "Werewolf", "Media": [{"Part": [{"key": "/library/parts/6/w.flac"}]}]},
             ]}})),
         ]);
         let lists = server.playlists("3").unwrap();
@@ -945,12 +972,17 @@ mod tests {
         assert_eq!((lists[1].count, lists[1].duration_ms), (2, 400000));
         assert_eq!(log.lock().unwrap()[0], "GET /playlists?playlistType=audio&sectionID=3");
 
-        let pt = server.playlist_tracks("20").unwrap();
+        let (pt, total) = server.playlist_page("20", 0, 500).unwrap();
+        assert_eq!(total, 3);
         assert_eq!(pt.item_ids, [101, 102, 103]);
         assert_eq!(pt.tracks[0].artist, "Cat Power");
-        // Stream details were filled in for both copies of the same track.
-        assert_eq!((pt.tracks[0].bit_depth, pt.tracks[2].sample_rate), (Some(24), Some(96000)));
         assert_eq!(pt.tracks[0].part_key.as_deref(), Some("/library/parts/5/f.flac"));
+        // One request for the page; no per-track detail requests.
+        let l = log.lock().unwrap().clone();
+        assert_eq!(l.last().unwrap(), "GET /playlists/20/items?X-Plex-Container-Start=0&X-Plex-Container-Size=500");
+        assert_eq!(l.len(), 2);
+        // A track that arrives without its media file can be looked up.
+        assert_eq!(server.track("6").unwrap().part_key.as_deref(), Some("/library/parts/6/w.flac"));
     }
 
     #[test]

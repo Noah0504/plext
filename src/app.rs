@@ -50,7 +50,14 @@ enum Msg {
     Albums(String, Result<Vec<Album>, String>),
     Tracks(String, Result<Vec<Track>, String>),
     Playlists(Result<Vec<Playlist>, String>),
-    PlaylistTracks(String, Result<PlaylistTracks, String>),
+    /// A page of a playlist's tracks, from load number `gen`.
+    PlaylistPage {
+        key: String,
+        gen: u64,
+        total: usize,
+        page: Result<PlaylistTracks, String>,
+        last: bool,
+    },
     PlaylistDone(playlists::PlaylistDone),
     /// A rating change finished saving to Plex (or failed to).
     Rated {
@@ -208,6 +215,17 @@ pub struct App {
     playlists: Option<Loadable<Vec<Playlist>>>,
     playlist_state: ListState,
     playlist_tracks: HashMap<String, Loadable<PlaylistTracks>>,
+    /// Playlists whose tracks are loading, page by page.
+    playlist_loads: HashMap<String, playlists::Load>,
+    /// The current load of each playlist, shared with the loading threads
+    /// so a superseded load stops fetching.
+    live_loads: std::sync::Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    next_load: u64,
+    /// When each playlist was last fetched in full.
+    playlist_fetched: HashMap<String, Instant>,
+    /// A big playlist that started playing (or was queued) before it had all
+    /// loaded: its remaining pages go into the queue as they arrive.
+    feed: Option<playlists::Feed>,
     /// The playlist shown on the right in the Playlists view.
     shown_playlist: Option<String>,
     /// Playlists to play or queue once their tracks arrive.
@@ -292,6 +310,11 @@ impl App {
             playlists: None,
             playlist_state: ListState::default().with_selected(Some(0)),
             playlist_tracks: HashMap::new(),
+            playlist_loads: HashMap::new(),
+            live_loads: Default::default(),
+            next_load: 0,
+            playlist_fetched: HashMap::new(),
+            feed: None,
             shown_playlist: None,
             playlist_when_loaded: Vec::new(),
             playlist_pending: HashMap::new(),
@@ -564,7 +587,7 @@ impl App {
                 }
             }
             Msg::Playlists(r) => self.on_playlists(r),
-            Msg::PlaylistTracks(k, r) => self.on_playlist_tracks(k, r),
+            Msg::PlaylistPage { key, gen, total, page, last } => self.on_playlist_page(key, gen, total, page, last),
             Msg::PlaylistDone(d) => self.on_playlist_done(d),
             Msg::Rated { key, wanted, previous, result } => {
                 if let Some(n) = self.pending_ratings.get_mut(&key) {
@@ -765,6 +788,8 @@ impl App {
     fn play_album(&mut self, album_key: &str, index: usize) {
         if let Some(Loadable::Ready(t)) = self.tracks.get(album_key) {
             if !t.is_empty() {
+                // A new queue: stop adding a big playlist's remaining tracks.
+                self.feed = None;
                 self.player.send(Cmd::Play {
                     queue: t.clone(),
                     index: index.min(t.len() - 1),
@@ -1072,6 +1097,7 @@ impl App {
             KeyCode::Char('c') => {
                 let upcoming = n.saturating_sub(self.queue.pos + 1);
                 if upcoming > 0 {
+                    self.feed = None;
                     self.player.send(Cmd::ClearUpcoming);
                     self.say(format!("Cleared {} upcoming track{}", upcoming, if upcoming == 1 { "" } else { "s" }));
                 }
@@ -2787,8 +2813,7 @@ mod tests {
             ("POST", "/playlists?", json!({"MediaContainer": {"Metadata": [{"ratingKey": "30", "title": "Fresh", "leafCount": 2}]}})),
         ]);
         let mut app = app_with_album(vec![track("1", 1, "One", None), track("2", 2, "Two", None)]);
-        app.server = Server::new(Plex::new("plext-test"), &base, "token", "MACHINE");
-        app.playlist_tx = playlists::spawn_playlist_worker(app.server.clone(), app.tx.clone());
+        use_server(&mut app, &base);
         (app, log)
     }
 
@@ -2909,9 +2934,10 @@ mod tests {
         ]);
         // Once saved, the playlist is fetched again from the server.
         pump(&mut app, |a| a.playlist_pending.is_empty());
-        let n = l.iter().filter(|x| *x == "GET /playlists/20/items").count();
-        let l = test_server::wait_for(&log, |l| l.iter().filter(|x| *x == "GET /playlists/20/items").count() > n);
-        assert!(l.iter().filter(|x| *x == "GET /playlists/20/items").count() > n);
+        let fetches = |l: &[String]| l.iter().filter(|x| x.starts_with("GET /playlists/20/items")).count();
+        let n = fetches(&l);
+        let l = test_server::wait_for(&log, |l| fetches(l) > n);
+        assert!(fetches(&l) > n);
     }
 
     #[test]
@@ -2997,5 +3023,122 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let last = row_text(&buf, 23);
         assert!(last.ends_with("? all keys ") && !last.contains("pause"), "{}", last);
+    }
+
+    /// A playlist of 1,450 tracks ("t0".."t1449") served in pages, the pages
+    /// after the first taking `slow_ms` each; and a small one, "Road trip".
+    fn app_with_big_playlist(slow_ms: u64) -> (App, test_server::Log) {
+        let page = |from: usize, to: usize| {
+            let items: Vec<serde_json::Value> = (from..to)
+                .map(|i| {
+                    let mut t = pl_track(&format!("t{}", i), &format!("Song {}", i), 10_000 + i as u64);
+                    t["Media"] = json!([{"Part": [{"key": format!("/library/parts/{}/f.flac", i), "container": "flac"}]}]);
+                    t
+                })
+                .collect();
+            json!({"MediaContainer": {"totalSize": 1450, "size": to - from, "Metadata": items}})
+        };
+        let (base, log) = test_server::start_slow(
+            vec![
+                ("GET", "/playlists?", json!({"MediaContainer": {"Metadata": [
+                    {"ratingKey": "40", "title": "All Music", "playlistType": "audio", "smart": true, "leafCount": 1450},
+                    {"ratingKey": "20", "title": "Road trip", "playlistType": "audio", "leafCount": 3},
+                ]}})),
+                ("GET", "/playlists/40/items?X-Plex-Container-Start=0&", page(0, 200)),
+                ("GET", "/playlists/40/items?X-Plex-Container-Start=200&", page(200, 1200)),
+                ("GET", "/playlists/40/items?X-Plex-Container-Start=1200&", page(1200, 1450)),
+                ("GET", "/playlists/20/items", json!({"MediaContainer": {"totalSize": 3, "Metadata": [
+                    pl_track("1", "Free", 501), pl_track("2", "Werewolf", 502), pl_track("3", "Fool", 503),
+                ]}})),
+            ],
+            // The media itself is slow too, so the first track stays loading
+            // (and the queue position stays put) while the test looks.
+            vec![("Container-Start=200&", slow_ms), ("/library/parts/", 2000)],
+        );
+        let mut app = app_with_album(vec![track("1", 1, "One", None)]);
+        use_server(&mut app, &base);
+        (app, log)
+    }
+
+    /// Points everything at the stand-in server, the player included.
+    fn use_server(app: &mut App, base: &str) {
+        app.server = Server::new(Plex::new("plext-test"), base, "token", "MACHINE");
+        app.playlist_tx = playlists::spawn_playlist_worker(app.server.clone(), app.tx.clone());
+        app.player = Player::spawn(app.server.clone(), crate::output::Target::Alsa("null".into()));
+    }
+
+    fn shown_len(app: &App) -> usize {
+        app.shown_playlist_tracks().map(|pt| pt.tracks.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_big_playlist_shows_its_first_page_and_loads_the_rest_in_pages() {
+        let (mut app, log) = app_with_big_playlist(300);
+        key(&mut app, 'v');
+        pump(&mut app, |a| shown_len(a) == 200);
+        assert_eq!(shown_len(&app), 200, "the first page shows straight away");
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("loading 200 of 1450"), "{}", screen);
+        pump(&mut app, |a| shown_len(a) == 1450 && a.still_loading("40").is_none());
+        assert_eq!(shown_len(&app), 1450);
+        let tracks = &app.shown_playlist_tracks().unwrap().tracks;
+        assert_eq!((tracks[0].key.as_str(), tracks[1449].key.as_str()), ("t0", "t1449"));
+        // Three page requests, and no per-track detail requests.
+        let l = log.lock().unwrap().clone();
+        assert_eq!(l.iter().filter(|x| x.starts_with("GET /playlists/40/items")).count(), 3);
+        assert!(!l.iter().any(|x| x.starts_with("GET /library/metadata")), "{:?}", l);
+        // Coming back within a minute doesn't fetch it all again.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Up);
+        pump(&mut app, |_| false);
+        assert_eq!(log.lock().unwrap().iter().filter(|x| x.starts_with("GET /playlists/40/items")).count(), 3);
+    }
+
+    #[test]
+    fn playing_a_big_playlist_starts_at_once_and_the_rest_joins_the_queue() {
+        let (mut app, _log) = app_with_big_playlist(300);
+        key(&mut app, 'v');
+        pump(&mut app, |a| shown_len(a) == 200);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.notice.as_ref().unwrap().text.contains("join the queue as they load"));
+        let st = wait_for(&mut app, |st, _| st.queue_len == 200);
+        assert_eq!(st.queue_len, 200, "plays with the first page");
+        pump(&mut app, |a| a.still_loading("40").is_none());
+        let st = wait_for(&mut app, |st, _| st.queue_len == 1450);
+        assert_eq!(st.queue_len, 1450);
+        let keys: Vec<String> = app.player.queue().items.iter().map(|e| e.track.key.clone()).collect();
+        assert_eq!(keys, (0..1450).map(|i| format!("t{}", i)).collect::<Vec<_>>(), "in order without shuffle");
+    }
+
+    #[test]
+    fn shuffled_the_rest_of_a_big_playlist_is_mixed_in() {
+        let (mut app, _log) = app_with_big_playlist(300);
+        key(&mut app, 'z');
+        key(&mut app, 'v');
+        pump(&mut app, |a| shown_len(a) == 200);
+        press(&mut app, KeyCode::Enter);
+        pump(&mut app, |a| a.still_loading("40").is_none());
+        wait_for(&mut app, |st, _| st.queue_len == 1450);
+        let q = app.player.queue();
+        assert_eq!(q.items.len(), 1450);
+        // Tracks from later pages turn up early, not only after the first 200.
+        let early_late = q.items.iter().take(100).filter(|e| e.track.key[1..].parse::<usize>().unwrap() >= 200).count();
+        assert!(early_late > 30, "only {} of the first 100 are from later pages", early_late);
+    }
+
+    #[test]
+    fn moving_past_a_big_playlist_stops_loading_it() {
+        let (mut app, log) = app_with_big_playlist(1500);
+        key(&mut app, 'v');
+        pump(&mut app, |a| shown_len(a) == 200);
+        press(&mut app, KeyCode::Down);
+        assert!(app.still_loading("40").is_none() && app.playlist_tracks.get("40").is_none());
+        pump(&mut app, |a| a.shown_playlist_tracks().is_some());
+        assert_eq!(app.shown_playlist.as_deref(), Some("20"));
+        // The page that was on its way is ignored, and no more are asked for.
+        thread::sleep(Duration::from_millis(1700));
+        pump(&mut app, |_| false);
+        assert!(app.playlist_tracks.get("40").is_none());
+        assert!(!log.lock().unwrap().iter().any(|x| x.contains("Container-Start=1200")));
     }
 }

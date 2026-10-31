@@ -19,6 +19,9 @@ pub enum Cmd {
     Append(Vec<Track>),
     /// Add tracks right after the current one.
     PlayNext(Vec<Track>),
+    /// Add the rest of what's playing (a big playlist still loading): mixed
+    /// in among the upcoming tracks when shuffled, else at the end.
+    AppendMixed(Vec<Track>),
     /// Remove a queue entry (by id); removing the current one skips it.
     Remove(u64),
     /// Move a queue entry up (negative) or down.
@@ -188,7 +191,16 @@ impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.tx.send(Cmd::Quit);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            // Normally it stops at once. If it's stuck waiting on the server
+            // (retrying a download that won't start), don't hold up quitting:
+            // the process is exiting anyway.
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -208,6 +220,15 @@ enum End {
     /// A problem with the output device: stop the queue.
     Fatal(String),
     Command(Cmd),
+}
+
+enum Between {
+    /// Nothing changed: carry on.
+    Carry,
+    /// The current track changed: start it from the top.
+    Moved,
+    /// Stop playing, handing back a command that interrupted, if any.
+    Stop(Option<Cmd>),
 }
 
 struct Engine {
@@ -346,6 +367,14 @@ impl Engine {
     }
 
     fn start_download(&self, track: &Track) -> Result<Download, String> {
+        // Listings sometimes leave out the media file; ask for the track's details then.
+        let looked_up;
+        let track = if track.part_key.is_none() {
+            looked_up = self.server.track(&track.key).unwrap_or_else(|_| track.clone());
+            &looked_up
+        } else {
+            track
+        };
         let part = track
             .part_key
             .clone()
@@ -364,6 +393,13 @@ impl Engine {
         // repeat on) can't spin forever.
         let mut failures = 0usize;
         let pending = loop {
+            // Keys pressed between tracks (say, while one track after another
+            // fails to load) are handled before starting the next.
+            match self.between_tracks() {
+                Between::Carry => {}
+                Between::Moved => start = 0.0,
+                Between::Stop(c) => break c,
+            }
             let entry = self.queue.lock().unwrap().current().cloned();
             let Some(entry) = entry else {
                 break None;
@@ -442,6 +478,39 @@ impl Engine {
             s.pos = 0.0;
         });
         pending
+    }
+
+    /// Handles commands waiting between two tracks.
+    fn between_tracks(&mut self) -> Between {
+        let mut moved = false;
+        loop {
+            let cmd = match self.rx.try_recv() {
+                Ok(c) => c,
+                Err(TryRecvError::Empty) => return if moved { Between::Moved } else { Between::Carry },
+                Err(TryRecvError::Disconnected) => return Between::Stop(Some(Cmd::Quit)),
+            };
+            match cmd {
+                Cmd::Quit | Cmd::Play { .. } | Cmd::Restore(_) => return Between::Stop(Some(cmd)),
+                Cmd::Stop => return Between::Stop(None),
+                Cmd::Next => {
+                    if !self.with_queue(|q| q.next()) {
+                        return Between::Stop(None);
+                    }
+                    moved = true;
+                }
+                Cmd::Prev => {
+                    self.with_queue(|q| q.prev());
+                    moved = true;
+                }
+                Cmd::Jump(id) => moved |= self.with_queue(|q| q.jump(id)),
+                c if is_edit(&c) => {
+                    moved |= apply_edit(&self.queue, c);
+                    self.publish();
+                }
+                // Pausing or seeking applies to a track that's playing.
+                _ => {}
+            }
+        }
     }
 
     fn flush(&mut self) {
@@ -712,6 +781,7 @@ fn is_edit(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Append(_)
+            | Cmd::AppendMixed(_)
             | Cmd::PlayNext(_)
             | Cmd::Remove(_)
             | Cmd::Move { .. }
@@ -733,6 +803,9 @@ fn apply_edit(queue: &Arc<Mutex<Queue>>, cmd: Cmd) -> bool {
         }
         Cmd::PlayNext(t) => {
             q.play_next(t);
+        }
+        Cmd::AppendMixed(t) => {
+            q.append_mixed(t);
         }
         Cmd::Remove(id) => return q.remove(id),
         Cmd::Move { id, by } => q.move_by(id, by),
