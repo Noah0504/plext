@@ -18,6 +18,10 @@ all from a single static binary for Linux.
 - **Gapless playback** between tracks of the same format; the next track is pre-fetched.
 - **A play queue** you can add albums and tracks to, reorder and trim, with shuffle and repeat.
   It's saved when you quit and comes back paused where you left off.
+- **Discover: stations and mixes.** Plex's stations (Library Radio, Deep Cuts and more), track
+  radio and artist mixes built from Plex's sonic analysis, sonic adventures from one track to
+  another, and the shelves your library offers, like Recently Played. Stations and mixes keep
+  going until you play something else.
 - **Your Plex playlists**: browse and play them, add to them, make new ones, reorder, rename and
   delete. Changes are saved to Plex, so they show up in Plexamp and the Plex apps too.
 - **Formats:** FLAC, ALAC, WAV, AIFF (lossless), plus MP3, AAC, Vorbis.
@@ -116,10 +120,12 @@ window listing every shortcut.
 | `→` / `l` | Expand an artist; on an album or playlist, move to its track list |
 | `←` / `h` | Collapse / back to the artist list |
 | `Enter` | Play the album or playlist (in the track list, from the selected track), replacing the queue |
-| `v` | Switch the left pane between Artists and Playlists |
+| `v` | Switch the left pane: Artists → Playlists → Discover |
 | `a` | Add the album or track to the end of the queue |
 | `A` | Play the album or track next, right after the current track |
 | `P` | Add the album, track or playlist to a playlist, or start a new one |
+| `m` | Start a mix: track radio from the highlighted track, an artist mix from an artist (or from what's playing) |
+| `M` | Sonic adventure from what's playing to the highlighted track |
 | `u` | Show the queue (press again, or `←`, to go back) |
 | `z` | Shuffle on / off |
 | `r` | Repeat: off → the whole queue → this track → off |
@@ -191,6 +197,35 @@ Plexamp and the Plex apps too; if one can't be saved, Plext says so and shows th
 server has it. Smart playlists are built by Plex from rules, so their tracks can't be edited
 (you can still play, rename or delete them). Plext fetches the list again each time you switch
 to it, so playlists changed elsewhere show up.
+
+## Discover
+
+Press `v` until the left pane shows **Discover**. It has three parts:
+
+- **Stations** are your Plex server's own, such as Library Radio, Deep Cuts Radio and Time Travel
+  Radio. `Enter` plays one.
+- **Mixes** start from the track that's playing: **Track radio** plays tracks that sound like it,
+  and **Artist mix** plays that artist and artists who sound like them, a few tracks each.
+  `Enter` starts one. **Sonic adventure** explains the `M` key (below).
+- **Your library** lists the shelves your server suggests, like Recently Played, Recently Added,
+  Most Played in December or Haven't Played in 5 Months. `→` opens one on the right: `Enter` plays
+  an album or opens an artist in the Artists view, and `a` / `A` queue an album.
+
+You don't have to go to Discover to start a mix: press `m` on any track (in an album, a playlist
+or the queue) for track radio, or on an artist for an artist mix. With nothing highlighted, `m`
+starts track radio from what's playing.
+
+**Stations and mixes keep going.** When the queue gets down to its last few tracks, Plext adds
+more, skipping ones it has already queued, until you play something else (or clear the queue
+with `c`). The queue view shows which mix is running.
+
+**Sonic adventure** (`M`): highlight any track and press `M`, and the queue travels from the track
+that's playing to that one, through tracks whose sound lies in between. What's playing carries on;
+the path replaces what was queued after it.
+
+Mixes and sonic adventures use Plex's sonic analysis, which needs Plex Pass and sonic analysis
+turned on in your Plex server's settings for the music library. `plext inspect mixes` shows what
+your server offers.
 
 ## Plex integration
 

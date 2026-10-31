@@ -1,6 +1,7 @@
 //! A stand-in Plex server for tests: records each request ("GET /path?query")
 //! and answers from a list of routes (the first whose method and path prefix
-//! match), or with an empty 200.
+//! match), or with an empty 200. A route's answer `{"__seq": [a, b, …]}`
+//! gives a different answer each time.
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -50,11 +51,23 @@ fn answer(conn: std::net::TcpStream, routes: &[(&'static str, &'static str, Valu
             if let Some((_, ms)) = slow.iter().find(|(part, _)| path.contains(part)) {
                 std::thread::sleep(std::time::Duration::from_millis(*ms));
             }
-            let body = routes
-                .iter()
-                .find(|(m, p, _)| *m == method && path.starts_with(p))
-                .map(|(_, _, v)| v.to_string())
-                .unwrap_or_default();
+            let route = routes.iter().find(|(m, p, _)| *m == method && path.starts_with(p));
+            let body = match route {
+                // {"__seq": [a, b, …]}: answer a the first time, b the next, and so
+                // on, repeating the last.
+                Some((m, p, v)) if v["__seq"].is_array() => {
+                    let n = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|l| l.strip_prefix(&format!("{} ", m)).map(|x| x.starts_with(p)).unwrap_or(false))
+                        .count();
+                    let seq = v["__seq"].as_array().unwrap();
+                    seq.get(n.saturating_sub(1)).or(seq.last()).map(|x| x.to_string()).unwrap_or_default()
+                }
+                Some((_, _, v)) => v.to_string(),
+                None => String::new(),
+            };
             let mut w = conn;
             let _ = write!(
                 w,
