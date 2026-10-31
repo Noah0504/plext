@@ -99,6 +99,7 @@ sound settings while it plays.
 | `plext device` | List output devices for the current mode; `plext device <name>` sets the default |
 | `plext status` | Show the server, library, output mode, device, and config and log file locations |
 | `plext inspect "Artist"` | Show what your server reports about an artist's releases |
+| `plext inspect mixes` | Show what your server offers for mixes, stations and sonic features (read-only) |
 | `plext --device <name>` | Play through a different device for this session only |
 | `plext --output <mode>` | Use the other mode (`bitperfect` or `system`) for this session only |
 

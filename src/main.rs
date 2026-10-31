@@ -3,6 +3,7 @@ mod config;
 mod covers;
 mod decode;
 mod download;
+mod inspect_mixes;
 mod log;
 mod mpris;
 mod output;
@@ -57,7 +58,8 @@ enum Command {
     Device { name: Option<String> },
     /// Show the current configuration
     Status,
-    /// Show what the server reports about an artist's releases (for troubleshooting)
+    /// Show what the server reports about an artist's releases, or with
+    /// `mixes`, what it offers for mixes and stations (for troubleshooting)
     Inspect { artist: String },
 }
 
@@ -138,7 +140,9 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Inspect { artist }) => inspect(&mut cfg, &artist),
+        Some(Command::Inspect { artist }) if artist.eq_ignore_ascii_case("mixes") => inspect_mixes(&mut cfg),
+        // An artist actually called "Mixes": `plext inspect "artist:Mixes"`.
+        Some(Command::Inspect { artist }) => inspect(&mut cfg, artist.strip_prefix("artist:").unwrap_or(&artist)),
         None => run(&mut cfg, cli.output, cli.device),
     }
 }
@@ -241,6 +245,16 @@ fn connect(plex_client: &Plex, cfg: &mut Config) -> Result<ServerConfig> {
     cfg.server = Some(updated.clone());
     cfg.save()?;
     Ok(updated)
+}
+
+fn inspect_mixes(cfg: &mut Config) -> Result<()> {
+    let plex_client = Plex::new(&cfg.client_id);
+    let server_cfg = connect(&plex_client, cfg)?;
+    let library = cfg.library.clone().context("no library chosen; run `plext login`")?;
+    let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token, &server_cfg.machine_id);
+    eprintln!("Asking {} about mixes and stations (this can take a few seconds)…\n", server_cfg.name);
+    print!("{}", inspect_mixes::report(&server, &library.key));
+    Ok(())
 }
 
 fn inspect(cfg: &mut Config, name: &str) -> Result<()> {
