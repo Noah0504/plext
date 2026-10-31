@@ -3,7 +3,9 @@ mod config;
 mod covers;
 mod decode;
 mod download;
+mod inspect;
 mod inspect_mixes;
+mod inspect_search;
 mod log;
 mod mpris;
 mod output;
@@ -58,9 +60,13 @@ enum Command {
     Device { name: Option<String> },
     /// Show the current configuration
     Status,
-    /// Show what the server reports about an artist's releases, or with
-    /// `mixes`, what it offers for mixes and stations (for troubleshooting)
-    Inspect { artist: String },
+    /// Show what the server reports about an artist's releases; with
+    /// `mixes`, what it offers for mixes and stations; with `search <words>`,
+    /// what its search finds (for troubleshooting)
+    Inspect {
+        #[arg(required = true, num_args = 1..)]
+        what: Vec<String>,
+    },
 }
 
 fn main() {
@@ -140,9 +146,22 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Inspect { artist }) if artist.eq_ignore_ascii_case("mixes") => inspect_mixes(&mut cfg),
-        // An artist actually called "Mixes": `plext inspect "artist:Mixes"`.
-        Some(Command::Inspect { artist }) => inspect(&mut cfg, artist.strip_prefix("artist:").unwrap_or(&artist)),
+        Some(Command::Inspect { what }) => {
+            let first = what[0].to_lowercase();
+            if what.len() == 1 && first == "mixes" {
+                inspect_mixes(&mut cfg)
+            } else if first == "search" {
+                let query = what[1..].join(" ");
+                if query.trim().is_empty() {
+                    bail!("say what to search for: `plext inspect search radiohead`");
+                }
+                inspect_search(&mut cfg, &query)
+            } else {
+                // An artist actually called "Mixes" or "Search": `plext inspect "artist:Mixes"`.
+                let name = what.join(" ");
+                inspect(&mut cfg, name.strip_prefix("artist:").unwrap_or(&name))
+            }
+        }
         None => run(&mut cfg, cli.output, cli.device),
     }
 }
@@ -257,6 +276,16 @@ fn inspect_mixes(cfg: &mut Config) -> Result<()> {
     Ok(())
 }
 
+fn inspect_search(cfg: &mut Config, query: &str) -> Result<()> {
+    let plex_client = Plex::new(&cfg.client_id);
+    let server_cfg = connect(&plex_client, cfg)?;
+    let library = cfg.library.clone().context("no library chosen; run `plext login`")?;
+    let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token, &server_cfg.machine_id);
+    eprintln!("Searching {} for \"{}\"…\n", library.title, query);
+    print!("{}", inspect_search::report(&server, &library.key, query));
+    Ok(())
+}
+
 fn inspect(cfg: &mut Config, name: &str) -> Result<()> {
     let plex_client = Plex::new(&cfg.client_id);
     let server_cfg = connect(&plex_client, cfg)?;
@@ -269,6 +298,7 @@ fn inspect(cfg: &mut Config, name: &str) -> Result<()> {
         .find(|a| a.title.to_lowercase() == wanted)
         .or_else(|| artists.iter().find(|a| a.title.to_lowercase().contains(&wanted)))
         .with_context(|| format!("no artist matching \"{}\"", name))?;
+    print!("{}", inspect::header(&format!("releases check for \"{}\"", artist.title)));
     println!("{} (ratingKey {})\n", artist.title, artist.key);
     let albums = server.albums(&library.key, &artist.key)?;
     let raw = server.album_details_raw(&library.key, &artist.key)?;

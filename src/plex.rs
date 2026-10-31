@@ -8,7 +8,7 @@ use std::time::Duration;
 pub const PRODUCT: &str = "Plext";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Artist {
     pub key: String,
     pub title: String,
@@ -46,6 +46,27 @@ pub struct HubItem {
     pub year: Option<u32>,
 }
 
+/// An album found by a search, with who it's by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundAlbum {
+    pub album: Album,
+    pub artist: String,
+}
+
+/// What a search found in the library, best matches first.
+#[derive(Debug, Clone, Default)]
+pub struct SearchResults {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<FoundAlbum>,
+    pub tracks: Vec<Track>,
+}
+
+impl SearchResults {
+    pub fn is_empty(&self) -> bool {
+        self.artists.is_empty() && self.albums.is_empty() && self.tracks.is_empty()
+    }
+}
+
 /// A playlist on the server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Playlist {
@@ -66,7 +87,7 @@ pub struct PlaylistTracks {
     pub item_ids: Vec<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Album {
     pub key: String,
     pub title: String,
@@ -131,7 +152,7 @@ impl ReleaseKind {
 
     /// Reads the release type from an album's `Format` and `Subformat` tags
     /// (e.g. Format "EP", Subformat "Live").
-    fn from_metadata(m: &Value) -> ReleaseKind {
+    pub(crate) fn from_metadata(m: &Value) -> ReleaseKind {
         let tags: Vec<String> = ["Format", "Subformat"]
             .iter()
             .flat_map(|k| m[*k].as_array().into_iter().flatten())
@@ -676,6 +697,42 @@ impl Server {
         t.ok_or_else(|| anyhow!("track {} not found", key))
     }
 
+    // ---------- search ----------
+
+    /// The path `search` asks, for `plext inspect search`.
+    pub fn search_path(library_key: &str, query: &str, limit: usize) -> String {
+        format!("/hubs/search?query={}&sectionId={}&limit={}", encode(query), encode(library_key), limit)
+    }
+
+    /// Artists, albums and tracks in this library matching `query` (up to
+    /// `limit` of each), as Plex ranks them. Plex matches words anywhere in
+    /// titles, and finds tracks by artist or album name too.
+    ///
+    /// Some servers' search leaves its track list empty (Noah's does, on
+    /// Plex 1.43); then tracks whose title contains the words are fetched
+    /// from the library directly.
+    pub fn search(&self, library_key: &str, query: &str, limit: usize) -> Result<SearchResults> {
+        let v = self.get(&Self::search_path(library_key, query, limit))?;
+        let mut found = parse_search(&v, library_key);
+        if found.tracks.is_empty() {
+            if let Ok(v) = self.get(&Self::track_title_path(library_key, query, limit)) {
+                found.tracks = tracks_titled(&v, query);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Tracks in the library whose title contains `query` (Plex's `title`
+    /// filter matches anywhere in the title, ignoring case).
+    pub fn track_title_path(library_key: &str, query: &str, limit: usize) -> String {
+        format!(
+            "/library/sections/{}/all?type=10&title={}&X-Plex-Container-Start=0&X-Plex-Container-Size={}",
+            encode(library_key),
+            encode(query),
+            limit
+        )
+    }
+
     // ---------- discover: hubs, stations, sonic features ----------
 
     /// The library's suggestion rows, stations included.
@@ -923,6 +980,57 @@ fn merge(base: Track, full: Track) -> Track {
         rating: full.rating.or(base.rating),
         thumb: full.thumb.or(base.thumb),
     }
+}
+
+/// The music hubs of a `/hubs/search` answer. Results from another
+/// library (a server may ignore `sectionId`) are left out.
+pub(crate) fn parse_search(v: &Value, library_key: &str) -> SearchResults {
+    let mut out = SearchResults::default();
+    for h in items(v, "Hub") {
+        let entries = h["Metadata"].as_array().into_iter().flatten().chain(h["Directory"].as_array().into_iter().flatten());
+        for m in entries {
+            let section = str_of(&m["librarySectionID"]);
+            if !section.is_empty() && section != library_key {
+                continue;
+            }
+            let kind = m["type"].as_str().unwrap_or_else(|| h["type"].as_str().unwrap_or(""));
+            match kind {
+                "artist" => out.artists.push(Artist { key: str_of(&m["ratingKey"]), title: str_of(&m["title"]) }),
+                "album" => out.albums.push(FoundAlbum {
+                    album: Album {
+                        key: str_of(&m["ratingKey"]),
+                        title: str_of(&m["title"]),
+                        year: m["year"].as_u64().map(|y| y as u32),
+                        kind: ReleaseKind::from_metadata(m),
+                    },
+                    artist: str_of(&m["parentTitle"]),
+                }),
+                "track" => out.tracks.push(parse_track(m)),
+                _ => {}
+            }
+        }
+    }
+    // The same item can come back in more than one hub.
+    let mut seen = std::collections::HashSet::new();
+    out.artists.retain(|a| seen.insert(format!("ar{}", a.key)));
+    out.albums.retain(|a| seen.insert(format!("al{}", a.album.key)));
+    out.tracks.retain(|t| seen.insert(format!("tr{}", t.key)));
+    out
+}
+
+/// The tracks of a title-filter answer, closest titles first: exactly the
+/// words, then titles starting with them, then the rest in Plex's order.
+pub(crate) fn tracks_titled(v: &Value, query: &str) -> Vec<Track> {
+    let q = query.trim().to_lowercase();
+    let mut tracks: Vec<Track> = items(v, "Metadata")
+        .filter(|m| m["type"].as_str().is_none_or(|t| t == "track"))
+        .map(parse_track)
+        .collect();
+    tracks.sort_by_key(|t| {
+        let title = t.title.to_lowercase();
+        (title != q, !title.starts_with(&q))
+    });
+    tracks
 }
 
 fn parse_hub_item(m: &Value) -> HubItem {
@@ -1201,5 +1309,58 @@ mod tests {
         assert!(l.iter().any(|x| x == "GET /library/metadata/1/nearest?limit=25&maxDistance=0.25"), "{:?}", l);
         assert!(l.iter().any(|x| x == "GET /library/sections/36/computePath?startID=1&endID=9"), "{:?}", l);
         assert!(l.iter().any(|x| x.starts_with("GET /library/sections/36/all?viewCount%3E=1&type=8&X-Plex-Container-Start=0")), "{:?}", l);
+    }
+
+    #[test]
+    fn when_search_finds_no_tracks_they_are_looked_up_by_title() {
+        // As Noah's server answers: albums and artists, but no tracks.
+        let (server, log) = fake_server(vec![
+            ("GET", "/hubs/search?", json!({"MediaContainer": {"Hub": [
+                {"type": "album", "hubIdentifier": "album", "Metadata": [
+                    {"ratingKey": "179182", "title": "Carrying Your Love with Me", "type": "album",
+                     "parentTitle": "George Strait", "librarySectionID": 36}]},
+                {"type": "track", "hubIdentifier": "track", "size": 0},
+                {"type": "movie", "hubIdentifier": "movie", "Metadata": [
+                    {"ratingKey": "1", "title": "Carrying On", "type": "movie", "librarySectionID": 1}]},
+            ]}})),
+            ("GET", "/library/sections/36/all?type=10", json!({"MediaContainer": {"Metadata": [
+                {"ratingKey": "9", "title": "Still Carrying Your Love", "type": "track", "grandparentTitle": "Someone"},
+                {"ratingKey": "8", "title": "Carrying Your Love with Me", "type": "track", "grandparentTitle": "George Strait",
+                 "parentTitle": "Carrying Your Love with Me", "parentRatingKey": "179182"},
+                {"ratingKey": "7", "title": "carrying your love", "type": "track"},
+            ]}})),
+        ]);
+        let r = server.search("36", "Carrying Your Love", 30).unwrap();
+        assert_eq!(r.albums.len(), 1);
+        let titles: Vec<&str> = r.tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["carrying your love", "Carrying Your Love with Me", "Still Carrying Your Love"]);
+        let l = log.lock().unwrap().clone();
+        assert_eq!(l[1], "GET /library/sections/36/all?type=10&title=Carrying%20Your%20Love&X-Plex-Container-Start=0&X-Plex-Container-Size=30");
+    }
+
+    #[test]
+    fn search_finds_artists_albums_and_tracks_in_this_library() {
+        let (server, log) = fake_server(vec![("GET", "/hubs/search?", json!({"MediaContainer": {"Hub": [
+            {"type": "artist", "hubIdentifier": "artist", "Metadata": [
+                {"ratingKey": "77", "title": "Cat Power", "type": "artist", "librarySectionID": 36}]},
+            {"type": "album", "hubIdentifier": "album", "Metadata": [
+                {"ratingKey": "100", "title": "You Are Free", "type": "album", "parentTitle": "Cat Power", "year": 2003,
+                 "librarySectionID": 36},
+                {"ratingKey": "300", "title": "Free (audiobook)", "type": "album", "librarySectionID": 12}]},
+            {"type": "track", "hubIdentifier": "track", "Metadata": [
+                {"ratingKey": "5", "title": "Free", "type": "track", "grandparentTitle": "Cat Power",
+                 "parentTitle": "You Are Free", "parentRatingKey": "100", "librarySectionID": "36"}]},
+            {"type": "track", "hubIdentifier": "track.lyrics", "Metadata": [
+                {"ratingKey": "5", "title": "Free", "type": "track", "librarySectionID": 36}]},
+            {"type": "genre", "hubIdentifier": "genre", "Directory": [{"title": "Free jazz", "type": "genre"}]},
+        ]}}))]);
+        let r = server.search("36", "free & easy", 20).unwrap();
+        assert_eq!(r.artists, vec![Artist { key: "77".into(), title: "Cat Power".into() }]);
+        assert_eq!(r.albums.len(), 1, "other libraries and genres are left out");
+        assert_eq!((r.albums[0].album.title.as_str(), r.albums[0].artist.as_str(), r.albums[0].album.year), ("You Are Free", "Cat Power", Some(2003)));
+        assert_eq!(r.tracks.len(), 1, "a track found twice is listed once");
+        assert_eq!((r.tracks[0].title.as_str(), r.tracks[0].album_key.as_deref()), ("Free", Some("100")));
+        let l = log.lock().unwrap().clone();
+        assert_eq!(l, vec!["GET /hubs/search?query=free%20%26%20easy&sectionId=36&limit=20"]);
     }
 }

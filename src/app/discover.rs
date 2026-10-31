@@ -245,7 +245,7 @@ impl App {
     }
 
     /// Plays or queues an album by key, loading its tracks first if need be.
-    fn album_key_action(&mut self, key: &str, action: Action) {
+    pub(super) fn album_key_action(&mut self, key: &str, action: Action) {
         if matches!(self.tracks.get(key), Some(Loadable::Ready(_))) {
             self.album_action(key, action);
         } else {
@@ -258,7 +258,7 @@ impl App {
     }
 
     /// Shows an artist in the Artists view, opened.
-    fn open_artist(&mut self, key: &str) {
+    pub(super) fn open_artist(&mut self, key: &str) {
         let Some(i) = (match &self.artists {
             Loadable::Ready(a) => a.iter().position(|x| x.key == key),
             _ => None,
@@ -284,9 +284,11 @@ impl App {
             (Focus::Tracks, RightView::Queue, _) => {
                 self.queue_state.selected().and_then(|i| self.queue.items.get(i)).map(|e| e.track.clone())
             }
-            (Focus::Tracks, RightView::Album, LeftView::Artists | LeftView::Playlists) => {
+            (Focus::Tracks, RightView::Album, LeftView::Artists | LeftView::Playlists)
+            | (Focus::Tracks, RightView::Album, LeftView::Search) => {
                 self.track_state.selected().and_then(|i| self.shown_tracks()?.get(i).cloned())
             }
+            (Focus::Tree, _, LeftView::Search) => self.search_track(),
             _ => None,
         };
         if let Some(t) = track {
@@ -306,6 +308,7 @@ impl App {
                 .and_then(|i| self.shelf_items().get(i).cloned())
                 .filter(|it| it.kind == "artist")
                 .map(|it| (it.key, it.title)),
+            (Focus::Tree, LeftView::Search) => self.search_artist(),
             _ => None,
         };
         if let Some((key, name)) = artist {
@@ -420,6 +423,7 @@ impl App {
             (Focus::Tracks, RightView::Album) if self.view != LeftView::Discover => {
                 self.track_state.selected().and_then(|i| self.shown_tracks()?.get(i).cloned())
             }
+            (Focus::Tree, _) if self.view == LeftView::Search => self.search_track(),
             _ => None,
         };
         let Some(target) = target else {

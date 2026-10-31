@@ -444,13 +444,21 @@ impl App {
         }
     }
 
-    /// Switches the left pane between artists and playlists.
+    /// `v`: the next view in the left pane.
     pub(super) fn toggle_view(&mut self) {
-        self.view = match self.view {
+        let next = match self.view {
             LeftView::Artists => LeftView::Playlists,
             LeftView::Playlists => LeftView::Discover,
-            LeftView::Discover => LeftView::Artists,
+            LeftView::Discover => LeftView::Search,
+            LeftView::Search => LeftView::Artists,
         };
+        // Search doesn't start typing here, so v keeps cycling (f does).
+        self.enter_view(next);
+    }
+
+    /// Shows `view` in the left pane.
+    pub(super) fn enter_view(&mut self, view: LeftView) {
+        self.view = view;
         self.filter.clear();
         self.filtering = false;
         self.focus = Focus::Tree;
@@ -458,6 +466,9 @@ impl App {
             self.right = RightView::Album;
         }
         self.track_state.select(Some(0));
+        if self.view == LeftView::Search {
+            self.sync_search();
+        }
         if self.view == LeftView::Discover {
             // Fetched again each time: the shelves change as you listen.
             self.load_discover();
