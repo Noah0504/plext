@@ -3,6 +3,7 @@ mod config;
 mod covers;
 mod decode;
 mod download;
+mod inspect;
 mod inspect_mixes;
 mod inspect_search;
 mod log;
@@ -297,6 +298,7 @@ fn inspect(cfg: &mut Config, name: &str) -> Result<()> {
         .find(|a| a.title.to_lowercase() == wanted)
         .or_else(|| artists.iter().find(|a| a.title.to_lowercase().contains(&wanted)))
         .with_context(|| format!("no artist matching \"{}\"", name))?;
+    print!("{}", inspect::header(&format!("releases check for \"{}\"", artist.title)));
     println!("{} (ratingKey {})\n", artist.title, artist.key);
     let albums = server.albums(&library.key, &artist.key)?;
     let raw = server.album_details_raw(&library.key, &artist.key)?;

@@ -109,9 +109,9 @@ sound settings while it plays.
 | `plext output` | Choose bit-perfect or desktop sound; `plext output bitperfect` / `plext output system` sets it directly |
 | `plext device` | List output devices for the current mode; `plext device <name>` sets the default |
 | `plext status` | Show the server, library, output mode, device, and config and log file locations |
-| `plext inspect "Artist"` | Show what your server reports about an artist's releases |
-| `plext inspect mixes` | Show what your server offers for mixes, stations and sonic features (read-only) |
-| `plext inspect search <words>` | Show what your server's search finds for those words (read-only) |
+| `plext inspect "Artist"` | Show what your server reports about an artist's releases (for troubleshooting) |
+| `plext inspect mixes` | Show what your server offers for mixes, stations and sonic features (for troubleshooting) |
+| `plext inspect search <words>` | Show what your server's search finds for those words (for troubleshooting) |
 | `plext --device <name>` | Play through a different device for this session only |
 | `plext --output <mode>` | Use the other mode (`bitperfect` or `system`) for this session only |
 
@@ -362,6 +362,11 @@ server in its own sample rate and bit depth, and the server takes it from there.
 - **DSD** isn't supported yet.
 
 ## Troubleshooting
+
+The `plext inspect` commands below only read from your server and change nothing. They show
+what your server sends next to what Plext makes of it, which tells you whether a problem is the
+server's or Plext's. If you open an [issue](https://github.com/Noah0504/plext/issues), include
+their output: it shows names from your library, but never your sign-in token.
 
 - **"Device is busy."** Your desktop sound server (PipeWire or PulseAudio) is holding the DAC.
   Stop other audio, or set the DAC's profile to *Off* in your sound settings

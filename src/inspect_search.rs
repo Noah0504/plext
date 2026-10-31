@@ -1,8 +1,7 @@
 //! `plext inspect search <words>`: asks the server's search what it finds,
 //! and prints both what came back and what Plext makes of it, so search
-//! can be checked against a real library.
-//!
-//! It only reads. Paths are printed without the sign-in token.
+//! can be checked against a real library. Follows the rules in
+//! `inspect.rs`.
 
 use crate::plex::{parse_search, tracks_titled, Server};
 use serde_json::Value;
@@ -17,8 +16,7 @@ pub const LIMIT: usize = crate::app::SEARCH_LIMIT;
 pub fn report(server: &Server, library_key: &str, query: &str) -> String {
     let mut out = String::new();
     let o = &mut out;
-    let _ = writeln!(o, "Plext {} — search check for \"{}\"", env!("CARGO_PKG_VERSION"), query);
-    let _ = writeln!(o, "(Read-only. Paste everything from here down into the chat.)\n");
+    o.push_str(&crate::inspect::header(&format!("search check for \"{}\"", query)));
 
     let path = Server::search_path(library_key, query, LIMIT);
     let _ = writeln!(o, "== Server's answer ({})", path);

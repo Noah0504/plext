@@ -12,6 +12,12 @@
 - `plext inspect search <words>` shows what your server's search returns, for troubleshooting.
   `plext inspect` now also takes an artist name without quotes (`plext inspect Cat Power`).
 
+### Changed
+
+- The `plext inspect` commands now all start the same way: they say they only read from your
+  server, and where to report a problem (the output of `plext inspect mixes` used to ask you to
+  paste it into a chat, a leftover from testing).
+
 ## 0.6.0
 
 A big release: desktop sound, a play queue, your Plex playlists, and a new Discover view with

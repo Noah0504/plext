@@ -1,9 +1,7 @@
 //! `plext inspect mixes`: asks the server what it offers for mixes and
-//! stations, and prints what comes back, so the Mixes view can be built
-//! around what servers actually return. Plex doesn't document these
-//! endpoints; they're the ones Plexamp and python-plexapi use.
-//!
-//! It only reads. Paths are printed without the sign-in token.
+//! stations, and prints what comes back, so you can see why a mix or
+//! station won't start. Plex doesn't document these endpoints; they're the
+//! ones Plexamp and python-plexapi use. Follows the rules in `inspect.rs`.
 
 use crate::plex::Server;
 use serde_json::Value;
@@ -16,8 +14,7 @@ const SHOW: usize = 5;
 pub fn report(server: &Server, library_key: &str) -> String {
     let mut out = String::new();
     let o = &mut out;
-    let _ = writeln!(o, "Plext {} — mixes check", env!("CARGO_PKG_VERSION"));
-    let _ = writeln!(o, "(Read-only. Paste everything from here down into the chat.)\n");
+    o.push_str(&crate::inspect::header("mixes and stations check"));
 
     // ---- the server
     section(o, "Server", "/");
