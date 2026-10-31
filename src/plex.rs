@@ -1,6 +1,6 @@
 //! Minimal Plex client: link-code sign-in, server discovery and music library browsing.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::io::Read;
 use std::time::Duration;
@@ -12,6 +12,26 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Artist {
     pub key: String,
     pub title: String,
+}
+
+/// A playlist on the server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Playlist {
+    pub key: String,
+    pub title: String,
+    /// Built by Plex from rules; its tracks can't be edited by hand.
+    pub smart: bool,
+    pub count: u32,
+    pub duration_ms: u64,
+}
+
+/// A playlist's tracks. `item_ids[i]` is Plex's id for `tracks[i]`'s place
+/// in the playlist (the same track can appear twice), used to remove or
+/// move it.
+#[derive(Debug, Clone, Default)]
+pub struct PlaylistTracks {
+    pub tracks: Vec<Track>,
+    pub item_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -534,22 +554,138 @@ impl Server {
     pub fn tracks(&self, album_key: &str) -> Result<Vec<Track>> {
         let v = self.get(&format!("/library/metadata/{}/children", album_key))?;
         let mut tracks: Vec<Track> = items(&v, "Metadata").map(parse_track).collect();
+        self.fill_stream_details(&mut tracks);
+        tracks.sort_by_key(|t| (t.disc.unwrap_or(1), t.index.unwrap_or(u32::MAX)));
+        Ok(tracks)
+    }
 
-        // The children listing usually lacks bit depth / sample rate. A batched
-        // metadata request for all tracks returns the full stream details.
-        let keys: Vec<&str> = tracks.iter().map(|t| t.key.as_str()).collect();
-        if !keys.is_empty() {
-            if let Ok(detail) = self.get(&format!("/library/metadata/{}", keys.join(","))) {
+    /// Listings usually lack bit depth / sample rate. Batched metadata
+    /// requests return the full stream details. Best-effort: tracks keep
+    /// what they have if this fails.
+    fn fill_stream_details(&self, tracks: &mut [Track]) {
+        let mut keys: Vec<String> = tracks.iter().map(|t| t.key.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        for chunk in keys.chunks(50) {
+            if let Ok(detail) = self.get(&format!("/library/metadata/{}", chunk.join(","))) {
                 for d in items(&detail, "Metadata") {
                     let full = parse_track(d);
-                    if let Some(t) = tracks.iter_mut().find(|t| t.key == full.key) {
-                        *t = merge(t.clone(), full);
+                    for t in tracks.iter_mut().filter(|t| t.key == full.key) {
+                        *t = merge(t.clone(), full.clone());
                     }
                 }
             }
         }
-        tracks.sort_by_key(|t| (t.disc.unwrap_or(1), t.index.unwrap_or(u32::MAX)));
-        Ok(tracks)
+    }
+
+    // ---------- playlists ----------
+
+    /// The audio playlists with music from this library, sorted by title.
+    pub fn playlists(&self, library_key: &str) -> Result<Vec<Playlist>> {
+        let v = self.get(&format!("/playlists?playlistType=audio&sectionID={}", encode(library_key)))?;
+        let mut out: Vec<Playlist> = items(&v, "Metadata")
+            .filter(|m| m["playlistType"].as_str().map_or(true, |t| t == "audio"))
+            .map(parse_playlist)
+            .collect();
+        out.sort_by_key(|p| p.title.to_lowercase());
+        Ok(out)
+    }
+
+    pub fn playlist_tracks(&self, playlist_key: &str) -> Result<PlaylistTracks> {
+        let v = self.get(&format!("/playlists/{}/items", encode(playlist_key)))?;
+        let mut out = PlaylistTracks::default();
+        for m in items(&v, "Metadata").filter(|m| m["type"].as_str().map_or(true, |t| t == "track")) {
+            out.tracks.push(parse_track(m));
+            out.item_ids.push(m["playlistItemID"].as_u64().unwrap_or(0));
+        }
+        self.fill_stream_details(&mut out.tracks);
+        Ok(out)
+    }
+
+    /// "server://…/library/metadata/1,2,3": how Plex refers to a set of items.
+    fn items_uri(&self, keys: &[String]) -> String {
+        format!(
+            "server://{}/com.plexapp.plugins.library/library/metadata/{}",
+            self.machine_id,
+            keys.join(",")
+        )
+    }
+
+    fn send(&self, method: &str, path_and_query: &str) -> Result<Value> {
+        let url = format!("{}{}", self.base, path_and_query);
+        let resp = self
+            .plex
+            .req(method, &url, Some(&self.token))
+            .timeout(Duration::from_secs(20))
+            .call()
+            .map_err(describe)?;
+        // Some of these answer with an empty body.
+        let text = resp.into_string().unwrap_or_default();
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// Creates a playlist holding `track_keys`, in order. Returns it.
+    pub fn create_playlist(&self, title: &str, track_keys: &[String]) -> Result<Playlist> {
+        if track_keys.is_empty() {
+            bail!("a new playlist needs at least one track");
+        }
+        // Long lists go in pieces: one URL can only be so long.
+        let (first, rest) = track_keys.split_at(track_keys.len().min(PLAYLIST_BATCH));
+        let v = self.send(
+            "POST",
+            &format!(
+                "/playlists?type=audio&smart=0&title={}&uri={}",
+                encode(title),
+                encode(&self.items_uri(first))
+            ),
+        )?;
+        let created = items(&v, "Metadata")
+            .next()
+            .map(parse_playlist)
+            .ok_or_else(|| anyhow!("Plex didn't return the new playlist"))?;
+        if !rest.is_empty() {
+            self.add_to_playlist(&created.key, rest)?;
+        }
+        Ok(Playlist {
+            count: track_keys.len() as u32,
+            ..created
+        })
+    }
+
+    /// Adds tracks to the end of a playlist.
+    pub fn add_to_playlist(&self, playlist_key: &str, track_keys: &[String]) -> Result<()> {
+        for chunk in track_keys.chunks(PLAYLIST_BATCH) {
+            self.send(
+                "PUT",
+                &format!("/playlists/{}/items?uri={}", encode(playlist_key), encode(&self.items_uri(chunk))),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_from_playlist(&self, playlist_key: &str, item_id: u64) -> Result<()> {
+        self.send("DELETE", &format!("/playlists/{}/items/{}", encode(playlist_key), item_id))?;
+        Ok(())
+    }
+
+    /// Moves an item to just after `after`, or to the top when `after` is None.
+    pub fn move_in_playlist(&self, playlist_key: &str, item_id: u64, after: Option<u64>) -> Result<()> {
+        let mut path = format!("/playlists/{}/items/{}/move", encode(playlist_key), item_id);
+        if let Some(a) = after {
+            path.push_str(&format!("?after={}", a));
+        }
+        self.send("PUT", &path)?;
+        Ok(())
+    }
+
+    pub fn rename_playlist(&self, playlist_key: &str, title: &str) -> Result<()> {
+        self.send("PUT", &format!("/playlists/{}?title={}", encode(playlist_key), encode(title)))?;
+        Ok(())
+    }
+
+    pub fn delete_playlist(&self, playlist_key: &str) -> Result<()> {
+        self.send("DELETE", &format!("/playlists/{}", encode(playlist_key)))?;
+        Ok(())
     }
 
     /// Downloads an image such as an album cover, scaled down by the server to
@@ -635,6 +771,24 @@ fn merge(base: Track, full: Track) -> Track {
         container: full.container.or(base.container),
         rating: full.rating.or(base.rating),
         thumb: full.thumb.or(base.thumb),
+    }
+}
+
+/// Tracks per request when adding to a playlist, to keep URLs short.
+const PLAYLIST_BATCH: usize = 100;
+
+fn parse_playlist(m: &Value) -> Playlist {
+    Playlist {
+        key: str_of(&m["ratingKey"]),
+        title: str_of(&m["title"]),
+        smart: match &m["smart"] {
+            Value::Bool(b) => *b,
+            Value::Number(n) => n.as_u64() == Some(1),
+            Value::String(s) => s == "1" || s == "true",
+            _ => false,
+        },
+        count: m["leafCount"].as_u64().unwrap_or(0) as u32,
+        duration_ms: m["duration"].as_u64().unwrap_or(0),
     }
 }
 
@@ -761,5 +915,75 @@ mod tests {
         assert_eq!(parse_rating(&Value::Null), None);
         assert_eq!(parse_track(&json!({"ratingKey": 5, "title": "Free", "userRating": 9.0})).rating, Some(9));
         assert_eq!(parse_track(&json!({"ratingKey": 5, "title": "Free"})).rating, None);
+    }
+
+    fn fake_server(routes: Vec<(&'static str, &'static str, Value)>) -> (Server, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let (base, log) = crate::test_server::start(routes);
+        (Server::new(Plex::new("plext-test"), &base, "tok", "MACHINE"), log)
+    }
+
+    #[test]
+    fn lists_this_librarys_audio_playlists_and_their_tracks() {
+        let (server, log) = fake_server(vec![
+            ("GET", "/playlists?", json!({"MediaContainer": {"Metadata": [
+                {"ratingKey": "20", "title": "road trip", "playlistType": "audio", "leafCount": 2, "duration": 400000},
+                {"ratingKey": "21", "title": "All Music", "playlistType": "audio", "smart": true, "leafCount": 900},
+                {"ratingKey": "22", "title": "Movies", "playlistType": "video"},
+            ]}})),
+            ("GET", "/playlists/20/items", json!({"MediaContainer": {"Metadata": [
+                {"ratingKey": "5", "title": "Free", "type": "track", "playlistItemID": 101, "grandparentTitle": "Cat Power"},
+                {"ratingKey": "6", "title": "Werewolf", "type": "track", "playlistItemID": 102},
+                {"ratingKey": "5", "title": "Free", "type": "track", "playlistItemID": 103},
+            ]}})),
+            ("GET", "/library/metadata/5,6", json!({"MediaContainer": {"Metadata": [
+                {"ratingKey": "5", "title": "Free", "Media": [{"Part": [{"key": "/library/parts/5/f.flac", "Stream": [{"streamType": 2, "bitDepth": 24, "samplingRate": 96000}]}]}]},
+            ]}})),
+        ]);
+        let lists = server.playlists("3").unwrap();
+        assert_eq!(lists.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), ["All Music", "road trip"]);
+        assert!(lists[0].smart && !lists[1].smart);
+        assert_eq!((lists[1].count, lists[1].duration_ms), (2, 400000));
+        assert_eq!(log.lock().unwrap()[0], "GET /playlists?playlistType=audio&sectionID=3");
+
+        let pt = server.playlist_tracks("20").unwrap();
+        assert_eq!(pt.item_ids, [101, 102, 103]);
+        assert_eq!(pt.tracks[0].artist, "Cat Power");
+        // Stream details were filled in for both copies of the same track.
+        assert_eq!((pt.tracks[0].bit_depth, pt.tracks[2].sample_rate), (Some(24), Some(96000)));
+        assert_eq!(pt.tracks[0].part_key.as_deref(), Some("/library/parts/5/f.flac"));
+    }
+
+    #[test]
+    fn playlist_edits_send_the_right_requests() {
+        let (server, log) = fake_server(vec![(
+            "POST",
+            "/playlists?",
+            json!({"MediaContainer": {"Metadata": [{"ratingKey": "30", "title": "Mix & Match", "leafCount": 2}]}}),
+        )]);
+        let keys: Vec<String> = (1..=150).map(|i| i.to_string()).collect();
+        let created = server.create_playlist("Mix & Match", &keys).unwrap();
+        assert_eq!((created.key.as_str(), created.count), ("30", 150));
+        server.remove_from_playlist("30", 7).unwrap();
+        server.move_in_playlist("30", 7, Some(9)).unwrap();
+        server.move_in_playlist("30", 7, None).unwrap();
+        server.rename_playlist("30", "Road trip").unwrap();
+        server.delete_playlist("30").unwrap();
+        let log = log.lock().unwrap();
+        let uri = |range: std::ops::RangeInclusive<u32>| {
+            encode(&format!(
+                "server://MACHINE/com.plexapp.plugins.library/library/metadata/{}",
+                range.map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+            ))
+        };
+        assert_eq!(log[0], format!("POST /playlists?type=audio&smart=0&title=Mix%20%26%20Match&uri={}", uri(1..=100)));
+        assert_eq!(log[1], format!("PUT /playlists/30/items?uri={}", uri(101..=150)));
+        assert_eq!(&log[2..], [
+            "DELETE /playlists/30/items/7",
+            "PUT /playlists/30/items/7/move?after=9",
+            "PUT /playlists/30/items/7/move",
+            "PUT /playlists/30?title=Road%20trip",
+            "DELETE /playlists/30",
+        ]);
+        assert!(server.create_playlist("Empty", &[]).is_err());
     }
 }

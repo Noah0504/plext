@@ -18,6 +18,8 @@ all from a single static binary for Linux.
 - **Gapless playback** between tracks of the same format; the next track is pre-fetched.
 - **A play queue** you can add albums and tracks to, reorder and trim, with shuffle and repeat.
   It's saved when you quit and comes back paused where you left off.
+- **Your Plex playlists**: browse and play them, add to them, make new ones, reorder, rename and
+  delete. Changes are saved to Plex, so they show up in Plexamp and the Plex apps too.
 - **Formats:** FLAC, ALAC, WAV, AIFF (lossless), plus MP3, AAC, Vorbis.
 - **All release types**: albums, EPs, singles, live albums, compilations and more, grouped under
   headings when you expand an artist (using the release types Plex reads from your tags, the same
@@ -102,16 +104,21 @@ sound settings while it plays.
 
 ## Keys
 
+The bottom line of the screen shows the keys for wherever you are. Press `?` (or `F1`) for a
+window listing every shortcut.
+
 | Key | Action |
 | --- | --- |
 | `↑` `↓` / `j` `k` | Move |
 | `PgUp` `PgDn` | Move a page |
 | `Home` `End` / `g` `G` | Jump to the top / bottom |
-| `→` / `l` | Expand an artist; on an album, move to its track list |
+| `→` / `l` | Expand an artist; on an album or playlist, move to its track list |
 | `←` / `h` | Collapse / back to the artist list |
-| `Enter` | Play the album (in the track list, from the selected track), replacing the queue |
+| `Enter` | Play the album or playlist (in the track list, from the selected track), replacing the queue |
+| `v` | Switch the left pane between Artists and Playlists |
 | `a` | Add the album or track to the end of the queue |
 | `A` | Play the album or track next, right after the current track |
+| `P` | Add the album, track or playlist to a playlist, or start a new one |
 | `u` | Show the queue (press again, or `←`, to go back) |
 | `z` | Shuffle on / off |
 | `r` | Repeat: off → the whole queue → this track → off |
@@ -123,7 +130,8 @@ sound settings while it plays.
 | `-` / `=` | Take away / add half a star (`+` works too) |
 | `0` | Clear the track's rating |
 | `Tab` | Switch pane |
-| `/` | Filter artists (`Esc` clears) |
+| `/` | Filter the list: artists or playlists (`Esc` clears) |
+| `?` / `F1` | Show every shortcut |
 | `q` / `Ctrl+C` | Quit |
 
 ## The queue
@@ -141,6 +149,8 @@ dimmed, so `p` can go back to them; the playing track is marked ▶. There:
 | `d` / `Delete` | Remove the track from the queue |
 | `J` / `K` | Move the track down / up |
 | `c` | Clear everything after the playing track |
+| `S` | Save the queue as a new playlist |
+| `P` | Add the highlighted track to a playlist |
 | `u` / `←` | Back to the album view |
 
 **Shuffle** (`z`) keeps the playing track and shuffles the rest of the queue; turning it off
@@ -151,6 +161,30 @@ track. Both show at the top right of the now-playing bar, and in your desktop's 
 When you quit, the queue is saved to `~/.local/state/plext/queue.json`. Next time Plext starts
 with it paused at the same track and position; press `Space` to carry on. (A queue saved from a
 different Plex server is ignored.)
+
+## Playlists
+
+Press `v` to switch the left pane from your artists to your playlists (and back). Plext lists the
+audio playlists with music from the library you chose; smart playlists are marked *smart*.
+Select one to see its tracks on the right. Playlists play and queue just like albums: `Enter`
+plays one (replacing the queue), `a` adds it to the queue, and `A` plays it next.
+
+To add to a playlist, press `P` on an album, a track, a playlist, or a track in the queue. A
+window lists your playlists, plus **New playlist…**, which asks for a name. In the queue view,
+`S` saves the whole queue as a new playlist.
+
+| Key | Where | Action |
+| --- | --- | --- |
+| `d` / `Delete` | A playlist's tracks | Remove the track from the playlist |
+| `J` / `K` | A playlist's tracks | Move the track down / up |
+| `R` | The playlist list | Rename the playlist |
+| `D` | The playlist list | Delete the playlist (asks first) |
+
+Changes show at once and are saved to your Plex server in the background, so they appear in
+Plexamp and the Plex apps too; if one can't be saved, Plext says so and shows the playlist as the
+server has it. Smart playlists are built by Plex from rules, so their tracks can't be edited
+(you can still play, rename or delete them). Plext fetches the list again each time you switch
+to it, so playlists changed elsewhere show up.
 
 ## Plex integration
 

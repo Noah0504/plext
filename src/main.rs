@@ -12,6 +12,8 @@ mod plex;
 mod pulse;
 mod queue;
 mod report;
+#[cfg(test)]
+mod test_server;
 
 #[cfg(test)]
 mod bitperfect_tests;
