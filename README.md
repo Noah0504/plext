@@ -16,6 +16,7 @@ lossless and high-res audio untouched, all from a single static binary for Linux
   alongside other apps, Plext can play through PipeWire or PulseAudio instead. Setup asks which
   you want, and `plext output` switches any time.
 - **Gapless playback** between tracks of the same format; the next track is pre-fetched.
+- **Search** your whole library for artists, albums and tracks, and play or queue what you find.
 - **A play queue** you can add albums and tracks to, reorder and trim, with shuffle and repeat.
   It's saved when you quit and comes back paused where you left off.
 - **Discover: stations and mixes.** Plex's stations (Library Radio, Deep Cuts and more), track
@@ -71,7 +72,8 @@ plext                # start playing
 ```
 
 Inside Plext, the bottom line always shows the keys for where you are, and `?` lists them all.
-`v` switches the left pane between your artists, your playlists and Discover (stations and mixes).
+`v` switches the left pane between your artists, your playlists, Discover (stations and mixes)
+and Search; `f` searches from anywhere.
 
 The first time, Plext asks how to play your music:
 
@@ -109,6 +111,7 @@ sound settings while it plays.
 | `plext status` | Show the server, library, output mode, device, and config and log file locations |
 | `plext inspect "Artist"` | Show what your server reports about an artist's releases |
 | `plext inspect mixes` | Show what your server offers for mixes, stations and sonic features (read-only) |
+| `plext inspect search <words>` | Show what your server's search finds for those words (read-only) |
 | `plext --device <name>` | Play through a different device for this session only |
 | `plext --output <mode>` | Use the other mode (`bitperfect` or `system`) for this session only |
 
@@ -125,7 +128,9 @@ window listing every shortcut.
 | `→` / `l` | Expand an artist; on an album or playlist, move to its track list |
 | `←` / `h` | Collapse / back to the artist list |
 | `Enter` | Play the album or playlist (in the track list, from the selected track), replacing the queue |
-| `v` | Switch the left pane: Artists → Playlists → Discover |
+| `v` | Switch the left pane: Artists → Playlists → Discover → Search |
+| `f` | Search the library for artists, albums and tracks |
+| `/` | Filter the artist (or playlist) list by name |
 | `a` | Add the album or track to the end of the queue |
 | `A` | Play the album or track next, right after the current track |
 | `P` | Add the album, track or playlist to a playlist, or start a new one |
@@ -202,6 +207,23 @@ Plexamp and the Plex apps too; if one can't be saved, Plext says so and shows th
 server has it. Smart playlists are built by Plex from rules, so their tracks can't be edited
 (you can still play, rename or delete them). Plext fetches the list again each time you switch
 to it, so playlists changed elsewhere show up.
+
+## Search
+
+Press `f` anywhere and type. Results come as you pause (or press `Enter`), from Plex's own search,
+so words can match anywhere in a name, and tracks turn up by their artist or album too. They're
+grouped into **Artists**, **Albums** and **Tracks**, best matches first.
+
+- On an album or track, its album's tracks show on the right (with the track you found
+  highlighted). `Enter` plays the album, or the track's album from that track; `→` moves to the
+  track list.
+- On an artist, their releases show on the right; `Enter` or `→` opens them in the Artists view.
+- `a` / `A` queue an album or track, `P` adds it to a playlist, and `m` starts track radio from a
+  track or an artist mix from an artist.
+
+While typing, `↓` goes to the results, `Esc` stops typing and `Ctrl+U` clears the search. `f`
+(or `/`) changes the search; `v` moves on to the next view and the results stay for when you
+come back. `/` in Artists and Playlists still filters that list by name.
 
 ## Discover
 
@@ -358,6 +380,8 @@ server in its own sample rate and bit depth, and the server takes it from there.
 - **A mix won't start.** Track radio, artist mixes and sonic adventures need Plex Pass and sonic
   analysis on the music library; the message in the now-playing bar says which call failed.
   `plext inspect mixes` shows what your server offers.
+- **Search misses something.** Plext shows what your Plex server's search returns.
+  `plext inspect search <words>` prints the server's raw answer next to what Plext makes of it.
 - **A release is in the wrong group.** Plext uses the release type Plex reads from your tags.
   `plext inspect "Artist"` shows what the server reports for each release.
 

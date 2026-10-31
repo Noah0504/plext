@@ -4,6 +4,7 @@
 mod discover;
 mod help;
 mod playlists;
+mod search;
 
 use crate::covers::Covers;
 use crate::mpris::Mpris;
@@ -43,6 +44,9 @@ const HALF_STAR: Color = Color::Rgb(0x8a, 0x6a, 0x2a);
 /// Width of the rating column: five stars and a gap before the format.
 const RATING_W: usize = 7;
 
+/// Search results asked for, of each kind (artists, albums, tracks).
+pub const SEARCH_LIMIT: usize = 30;
+
 enum Msg {
     /// A cover finished turning into pixel art (keyed by its Plex thumb path).
     /// The third value is the width in columns it was made for.
@@ -65,6 +69,8 @@ enum Msg {
     Shelf(String, Result<Vec<HubItem>, String>),
     /// Tracks for a running mix.
     Radio(discover::Batch),
+    /// What a search found.
+    Found(search::Found),
     /// A sonic adventure's path, from the track that was playing.
     Adventure { from: String, to: String, result: Result<Vec<Track>, String> },
     /// A rating change finished saving to Plex (or failed to).
@@ -112,6 +118,7 @@ enum LeftView {
     Artists,
     Playlists,
     Discover,
+    Search,
 }
 
 /// What the right pane shows.
@@ -252,6 +259,8 @@ pub struct App {
     shelf_state: ListState,
     /// A station or mix that keeps the queue topped up.
     radio: Option<discover::Radio>,
+    /// The Search view.
+    search: search::Search,
     quit: bool,
     /// The last error we've seen from the player, and when it appeared.
     seen_error_seq: u64,
@@ -342,6 +351,7 @@ impl App {
             shelves: HashMap::new(),
             shelf_state: ListState::default().with_selected(Some(0)),
             radio: None,
+            search: search::Search::default(),
             quit: false,
             seen_error_seq: 0,
             error_since: None,
@@ -358,6 +368,7 @@ impl App {
             let status = self.player.status();
             self.refresh_queue(&status);
             self.radio_tick(&status);
+            self.search_tick();
             // Cheap to ask, and the font size can change while we run.
             self.art_cols = art_columns();
             self.update_art(&status);
@@ -433,6 +444,8 @@ impl App {
                         _ => None,
                     })
                 })
+                // Found by a search (a track's album isn't fully known).
+                .or_else(|| self.search.album.as_ref().map(|(_, a)| a).filter(|a| a.key == key))
         });
         let mut parts = vec![t.album.clone()];
         if let Some(a) = album {
@@ -580,7 +593,7 @@ impl App {
                             self.ratings.insert(t.key.clone(), t.rating);
                         }
                     }
-                    let shown = self.shown_album.as_ref().map(|(_, a)| a.key == k).unwrap_or(false);
+                    let shown = self.right_album().map(|(_, a)| a.key == k).unwrap_or(false);
                     if shown {
                         let last = tracks.len().saturating_sub(1);
                         if let Some(sel) = self.track_state.selected() {
@@ -599,6 +612,7 @@ impl App {
                 if !ready {
                     // Nothing to play or add after all; the error shows in the pane.
                     self.when_loaded.retain(|(pk, _)| *pk != k);
+                    self.search.forget_play(&k);
                 }
                 if ready {
                     let (now, later): (Vec<_>, Vec<_>) =
@@ -607,6 +621,7 @@ impl App {
                     for (_, action) in now {
                         self.album_action(&k, action);
                     }
+                    self.search_tracks_loaded();
                 }
             }
             Msg::Playlists(r) => self.on_playlists(r),
@@ -615,6 +630,7 @@ impl App {
             Msg::Hubs(r) => self.on_hubs(r),
             Msg::Shelf(id, r) => self.on_shelf(id, r),
             Msg::Radio(b) => self.on_radio(b),
+            Msg::Found(r) => self.on_found(r),
             Msg::Adventure { from, to, result } => self.on_adventure(from, to, result),
             Msg::Rated { key, wanted, previous, result } => {
                 if let Some(n) = self.pending_ratings.get_mut(&key) {
@@ -800,12 +816,22 @@ impl App {
         self.sync_shown_album();
     }
 
+    /// The album on the right: the one under the cursor in Artists, or the
+    /// one found in Search.
+    fn right_album(&self) -> Option<&(String, Album)> {
+        if self.view == LeftView::Search {
+            self.search.album.as_ref()
+        } else {
+            self.shown_album.as_ref()
+        }
+    }
+
     /// The tracks in the right pane: the album's, or the playlist's.
     fn shown_tracks(&self) -> Option<&Vec<Track>> {
         if self.view == LeftView::Playlists {
             return self.shown_playlist_tracks().map(|pt| &pt.tracks);
         }
-        let (_, al) = self.shown_album.as_ref()?;
+        let (_, al) = self.right_album()?;
         match self.tracks.get(&al.key) {
             Some(Loadable::Ready(t)) => Some(t),
             _ => None,
@@ -911,6 +937,7 @@ impl App {
             LeftView::Artists => self.shown_album.is_some(),
             LeftView::Playlists => self.shown_playlist.is_some(),
             LeftView::Discover => !self.shelf_items().is_empty(),
+            LeftView::Search => self.search.album.is_some(),
         }
     }
 
@@ -925,7 +952,7 @@ impl App {
                 self.playlist_state.select(Some(0));
                 self.sync_shown_playlist();
             }
-            LeftView::Discover => {}
+            LeftView::Discover | LeftView::Search => {}
         }
     }
 
@@ -938,6 +965,10 @@ impl App {
         }
         if self.modal.is_some() {
             self.modal_key(k);
+            return;
+        }
+        if self.search.typing && self.view == LeftView::Search {
+            self.search_type_key(k);
             return;
         }
         if self.filtering {
@@ -960,8 +991,10 @@ impl App {
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('/') if self.view == LeftView::Discover => {
-                self.say("Filtering works in Artists and Playlists".into());
+                self.say("Filtering works in Artists and Playlists · f searches the library".into());
             }
+            KeyCode::Char('f') => self.open_search(),
+            KeyCode::Char('/') if self.view == LeftView::Search => self.open_search(),
             KeyCode::Char('/') => {
                 self.focus = Focus::Tree;
                 self.filtering = true;
@@ -1010,6 +1043,7 @@ impl App {
             _ => match (self.focus, self.right) {
                 (Focus::Tree, _) if self.view == LeftView::Playlists => self.playlist_list_key(k.code),
                 (Focus::Tree, _) if self.view == LeftView::Discover => self.discover_list_key(k.code),
+                (Focus::Tree, _) if self.view == LeftView::Search => self.search_list_key(k.code),
                 (Focus::Tree, _) => self.tree_key(k.code),
                 (Focus::Tracks, RightView::Album) => self.tracks_key(k.code),
                 (Focus::Tracks, RightView::Queue) => self.queue_key(k.code),
@@ -1165,8 +1199,8 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.track_state.select(Some(0)),
             KeyCode::End | KeyCode::Char('G') => self.track_state.select(Some(n.saturating_sub(1))),
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
-            KeyCode::Enter if self.view == LeftView::Artists => {
-                if let Some((_, al)) = self.shown_album.clone() {
+            KeyCode::Enter if matches!(self.view, LeftView::Artists | LeftView::Search) => {
+                if let Some((_, al)) = self.right_album().cloned() {
                     self.play_album(&al.key, cur);
                 }
             }
@@ -1207,11 +1241,13 @@ impl App {
             LeftView::Artists => self.draw_tree(f, main[0]),
             LeftView::Playlists => self.draw_playlist_list(f, main[0]),
             LeftView::Discover => self.draw_discover_list(f, main[0]),
+            LeftView::Search => self.draw_search_list(f, main[0]),
         }
         match (self.right, self.view) {
             (RightView::Album, LeftView::Artists) => self.draw_tracks(f, main[1], st),
             (RightView::Album, LeftView::Playlists) => self.draw_playlist_tracks(f, main[1], st),
             (RightView::Album, LeftView::Discover) => self.draw_discover_right(f, main[1]),
+            (RightView::Album, LeftView::Search) => self.draw_search_right(f, main[1], st),
             (RightView::Queue, _) => self.draw_queue(f, main[1], st),
         }
         // Errors stay up long enough to read, even if the next track has started.
@@ -1259,7 +1295,7 @@ impl App {
         f.render_widget(Paragraph::new(left), area);
         let count = match (self.view, &self.artists, &self.playlists) {
             (LeftView::Playlists, _, Some(Loadable::Ready(p))) => format!("{} playlists ", p.len()),
-            (LeftView::Playlists | LeftView::Discover, _, _) => "".into(),
+            (LeftView::Playlists | LeftView::Discover | LeftView::Search, _, _) => "".into(),
             (_, Loadable::Ready(a), _) => format!("{} artists ", a.len()),
             (_, Loadable::Loading, _) => "loading… ".into(),
             (_, Loadable::Failed(_), _) => "".into(),
@@ -1284,7 +1320,8 @@ impl App {
     /// "/ filter", or what you're filtering by, for the left pane `width`
     /// wide. The hint goes when there's no room for it beside the title.
     fn filter_label(&self, width: u16) -> String {
-        let fits = |label: &str| 32 + label.chars().count() + 4 <= width as usize;
+        let title_w = self.view_switcher_for(false, width).width();
+        let fits = |label: &str| title_w + label.chars().count() + 4 <= width as usize;
         let label = self.filter_label_text();
         if fits(&label) || self.filtering || !self.filter.is_empty() {
             label
@@ -1303,16 +1340,23 @@ impl App {
         }
     }
 
-    /// The view switcher for a left pane `width` wide: all three views when
-    /// they fit, else the current one and a reminder of the key.
+    /// The view switcher for a left pane `width` wide: all the views when
+    /// they fit (closer together if need be), else the current one and a
+    /// reminder of the key.
     fn view_switcher_for(&self, focused: bool, width: u16) -> Line<'static> {
-        if width >= 36 {
-            return self.view_switcher(focused);
+        let full = self.view_switcher(focused);
+        if full.width() + 4 <= width as usize {
+            return full;
+        }
+        let tight = self.view_switcher_sep(focused, "  ");
+        if tight.width() + 2 <= width as usize {
+            return tight;
         }
         let name = match self.view {
             LeftView::Artists => "Artists",
             LeftView::Playlists => "Playlists",
             LeftView::Discover => "Discover",
+            LeftView::Search => "Search",
         };
         Line::from(vec![
             Span::raw(" "),
@@ -1321,18 +1365,24 @@ impl App {
         ])
     }
 
-    /// The left pane's title: "Artists · Playlists · Discover", the current one lit.
+    /// The left pane's title: "Artists · Playlists · Discover · Search", the current one lit.
     fn view_switcher(&self, focused: bool) -> Line<'static> {
+        self.view_switcher_sep(focused, " · ")
+    }
+
+    fn view_switcher_sep(&self, focused: bool, sep: &'static str) -> Line<'static> {
         let on = title_style(focused);
         let off = Style::default().fg(FAINT);
         let pick = |v: LeftView| if self.view == v { on } else { off };
         Line::from(vec![
             Span::raw(" "),
             Span::styled("Artists", pick(LeftView::Artists)),
-            Span::styled(" · ", Style::default().fg(FAINT)),
+            Span::styled(sep, Style::default().fg(FAINT)),
             Span::styled("Playlists", pick(LeftView::Playlists)),
-            Span::styled(" · ", Style::default().fg(FAINT)),
+            Span::styled(sep, Style::default().fg(FAINT)),
             Span::styled("Discover", pick(LeftView::Discover)),
+            Span::styled(sep, Style::default().fg(FAINT)),
+            Span::styled("Search", pick(LeftView::Search)),
             Span::raw(" "),
         ])
     }
@@ -1441,7 +1491,7 @@ impl App {
     }
 
     fn draw_tracks(&mut self, f: &mut Frame, area: Rect, st: &Status) {
-        let (title, right) = match &self.shown_album {
+        let (title, right) = match self.right_album() {
             Some((artist, al)) => {
                 let name = Span::styled(al.title.clone(), title_style(self.focus == Focus::Tracks));
                 let by = Span::styled(format!(" · {}", artist), Style::default().fg(DIM));
@@ -1479,7 +1529,7 @@ impl App {
         let inner_w = inner.width as usize;
 
         let message = |text: String, color: Color| List::new(vec![ListItem::new(Span::styled(text, Style::default().fg(color)))]);
-        let tracks = match self.shown_album.as_ref().and_then(|(_, al)| self.tracks.get(&al.key)) {
+        let tracks = match self.right_album().and_then(|(_, al)| self.tracks.get(&al.key)) {
             None => {
                 f.render_widget(message(" Select an album on the left (→ to expand an artist).".into(), DIM), inner);
                 return;
@@ -2915,10 +2965,12 @@ mod tests {
             key(&mut app, c);
         }
         assert_eq!(app.visible_playlists().len(), 1);
-        // v moves on to Discover, and clears the filter; again, back to the artists.
+        // v moves on to Discover, and clears the filter; then Search, and back to the artists.
         press(&mut app, KeyCode::Enter);
         key(&mut app, 'v');
         assert_eq!((app.view, app.filter.as_str()), (LeftView::Discover, ""));
+        key(&mut app, 'v');
+        assert_eq!((app.view, app.search.typing), (LeftView::Search, false));
         key(&mut app, 'v');
         assert_eq!(app.view, LeftView::Artists);
     }
@@ -3349,7 +3401,8 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         pump_mix(&mut app, |a, _| a.player.queue().items.len() == 4);
         assert!(app.radio.is_some());
-        // Back to the album, and play it.
+        // Back to the album (past Search), and play it.
+        key(&mut app, 'v');
         key(&mut app, 'v');
         app.focus = Focus::Tracks;
         press(&mut app, KeyCode::Enter);
@@ -3438,5 +3491,193 @@ mod tests {
         pump_mix(&mut app, |a, _| a.radio.is_none());
         let n = app.notice.as_ref().unwrap();
         assert!(n.error && n.text.contains("Plex Pass and sonic analysis"), "{}", n.text);
+    }
+
+    // ---------- search ----------
+
+    fn found_track(key: &str, title: &str) -> serde_json::Value {
+        json!({"ratingKey": key, "title": title, "type": "track", "grandparentTitle": "Cat Power",
+               "parentTitle": "You Are Free", "parentRatingKey": "100", "librarySectionID": 1,
+               "Media": [{"Part": [{"key": format!("/library/parts/{}/f.flac", key)}]}]})
+    }
+
+    /// An app talking to a stand-in server whose search finds Cat Power,
+    /// "You Are Free" (key 100: tracks 1-3) and the track "Werewolf" (2).
+    fn app_with_search() -> (App, test_server::Log) {
+        // Media takes a while, so a track that starts stays the one playing.
+        let (base, log) = test_server::start_slow(vec![
+            ("GET", "/hubs/search?", json!({"MediaContainer": {"Hub": [
+                {"type": "artist", "hubIdentifier": "artist", "Metadata": [
+                    {"ratingKey": "77", "title": "Cat Power", "type": "artist"}]},
+                {"type": "album", "hubIdentifier": "album", "Metadata": [
+                    {"ratingKey": "100", "title": "You Are Free", "type": "album", "parentTitle": "Cat Power", "year": 2003}]},
+                {"type": "track", "hubIdentifier": "track", "Metadata": [found_track("2", "Werewolf")]},
+            ]}})),
+            ("GET", "/library/metadata/100/children", json!({"MediaContainer": {"Metadata": [
+                found_track("1", "I Don't Blame You"), found_track("2", "Werewolf"), found_track("3", "Fool"),
+            ]}})),
+            ("GET", "/library/sections/1/all?type=9", json!({"MediaContainer": {"Metadata": [
+                {"ratingKey": "100", "title": "You Are Free", "type": "album", "year": 2003},
+                {"ratingKey": "101", "title": "Sun", "type": "album", "year": 2012}]}})),
+        ], vec![("/library/parts/", 3000)]);
+        let mut app = app_with_album(vec![track("1", 1, "One", None)]);
+        use_server(&mut app, &base);
+        // Nothing loaded yet: the found album's tracks come from the server.
+        app.tracks.clear();
+        app.shown_album = None;
+        app.focus = Focus::Tree;
+        app.artists = Loadable::Ready(vec![
+            Artist { key: "70".into(), title: "Beach House".into() },
+            Artist { key: "77".into(), title: "Cat Power".into() },
+        ]);
+        (app, log)
+    }
+
+    fn search_for(app: &mut App, words: &str) {
+        key(app, 'f');
+        for c in words.chars() {
+            key(app, c);
+        }
+        press(app, KeyCode::Enter);
+        pump(app, |a| a.search.results.is_some() && !a.search.searching);
+    }
+
+    #[test]
+    fn f_searches_the_library_for_artists_albums_and_tracks() {
+        let (mut app, log) = app_with_search();
+        key(&mut app, 'f');
+        assert_eq!((app.view, app.search.typing), (LeftView::Search, true));
+        for c in "free".chars() {
+            key(&mut app, c);
+        }
+        // While typing, letters go into the search, not to other keys.
+        assert_eq!(app.player.status().state, PlayState::Stopped);
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("› free▏"), "{}", screen);
+        assert!(screen.contains("search now"), "the legend is for typing: {}", screen);
+
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.search.typing);
+        pump(&mut app, |a| a.search.results.is_some());
+        let l = log.lock().unwrap().clone();
+        assert!(l.iter().any(|x| x == "GET /hubs/search?query=free&sectionId=1&limit=30"), "{:?}", l);
+
+        let screen = render(&mut app, &Status::default()).join("\n");
+        for want in ["Search", "3 found", "Artists", "Cat Power", "Albums", "You Are Free", "2003", "Tracks", "Werewolf"] {
+            assert!(screen.contains(want), "missing {:?} in\n{}", want, screen);
+        }
+        // The first result is highlighted (headings are skipped), and an
+        // artist shows their releases on the right.
+        assert_eq!(app.search_row(), Some(search::SRow::Artist(0)));
+        pump(&mut app, |a| matches!(a.albums.get("77"), Some(Loadable::Ready(_))));
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("Sun") && screen.contains("2012"), "{}", screen);
+    }
+
+    #[test]
+    fn a_track_found_shows_its_album_and_enter_plays_from_it() {
+        let (mut app, _log) = app_with_search();
+        search_for(&mut app, "werewolf");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.search_row(), Some(search::SRow::Album(0)));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.search_row(), Some(search::SRow::Track(0)));
+        // Its album shows on the right with the track highlighted.
+        pump(&mut app, |a| matches!(a.tracks.get("100"), Some(Loadable::Ready(_))));
+        assert_eq!(app.track_state.selected(), Some(1));
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("I Don't Blame You") && screen.contains("Fool"), "{}", screen);
+
+        press(&mut app, KeyCode::Enter);
+        let st = wait_for(&mut app, |_, q| q.items.len() == 3);
+        assert_eq!(queue_keys(&app), ["1", "2", "3"]);
+        assert_eq!(st.queue_pos, 1);
+    }
+
+    #[test]
+    fn enter_on_a_track_before_its_album_loads_plays_once_it_does() {
+        let (mut app, _log) = app_with_search();
+        search_for(&mut app, "werewolf");
+        // Straight to the track and Enter, without waiting for its album.
+        app.search.state.select(Some(5));
+        app.tracks.remove("100");
+        app.search.album = None;
+        app.search_list_key(KeyCode::Enter);
+        pump(&mut app, |a| a.search.play_when_loaded_is_empty());
+        let st = wait_for(&mut app, |_, q| q.items.len() == 3);
+        assert_eq!(st.queue_pos, 1);
+    }
+
+    #[test]
+    fn results_queue_albums_and_tracks_and_open_artists() {
+        let (mut app, _log) = app_with_search();
+        search_for(&mut app, "free");
+        // a on the album adds all of it; A on the track plays it next.
+        press(&mut app, KeyCode::Down);
+        key(&mut app, 'a');
+        pump(&mut app, |a| a.notice.as_ref().map(|n| n.text.contains("You Are Free")).unwrap_or(false));
+        assert!(app.notice.as_ref().unwrap().text.starts_with("Added You Are Free (3 tracks)"));
+        press(&mut app, KeyCode::Down);
+        key(&mut app, 'A');
+        assert!(app.notice.as_ref().unwrap().text.starts_with("Playing next: Werewolf"));
+        wait_for(&mut app, |_, q| q.items.len() == 4);
+
+        // Enter on the artist opens them in Artists.
+        key(&mut app, 'g');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, LeftView::Artists);
+        assert_eq!(app.current_row(), Some(Row::Artist(1)));
+        assert_eq!(app.expanded.get("77"), Some(&true));
+        // And f comes back to the results, with the search ready to change.
+        key(&mut app, 'f');
+        assert_eq!(app.view, LeftView::Search);
+        assert_eq!(app.search.query, "free");
+        assert!(app.search.results.is_some());
+    }
+
+    #[test]
+    fn searching_waits_for_a_pause_in_typing() {
+        let (mut app, log) = app_with_search();
+        key(&mut app, 'f');
+        key(&mut app, 'c');
+        key(&mut app, 'a');
+        app.search_tick();
+        let searched = |l: &[String]| l.iter().filter(|x| x.starts_with("GET /hubs/search")).count();
+        assert_eq!(searched(&log.lock().unwrap()), 0, "not while still typing");
+        thread::sleep(Duration::from_millis(350));
+        app.search_tick();
+        let l = test_server::wait_for(&log, |l| searched(l) == 1);
+        assert!(l.iter().any(|x| x == "GET /hubs/search?query=ca&sectionId=1&limit=30"), "{:?}", l);
+        assert!(app.search.typing, "you can keep typing while results come in");
+        // One letter waits for Enter.
+        press(&mut app, KeyCode::Backspace);
+        thread::sleep(Duration::from_millis(350));
+        app.search_tick();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(searched(&log.lock().unwrap()), 1);
+        // Esc stops typing and puts back what the results are for.
+        pump(&mut app, |a| a.search.results.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.search.typing, app.search.query.as_str()), (false, "ca"));
+    }
+
+    #[test]
+    fn an_older_search_answering_late_is_ignored() {
+        let (mut app, _log) = app_with_search();
+        search_for(&mut app, "free");
+        let before = app.search.results.clone().unwrap().tracks.len();
+        app.on_found(search::Found::stale_for_test(app.search_gen().wrapping_sub(1)));
+        assert_eq!(app.search.results.as_ref().unwrap().tracks.len(), before);
+        assert!(!app.search.searching);
+    }
+
+    #[test]
+    fn m_on_a_found_track_starts_track_radio() {
+        let (mut app, log) = app_with_search();
+        search_for(&mut app, "werewolf");
+        app.search.state.select(Some(5));
+        key(&mut app, 'm');
+        assert_eq!(app.radio.as_ref().map(|r| r.title.as_str()), Some("Werewolf radio"));
+        test_server::wait_for(&log, |l| l.iter().any(|x| x.starts_with("GET /library/metadata/2/nearest")));
     }
 }

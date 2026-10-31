@@ -15,8 +15,9 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("→  l", "Open an artist; go to an album's or playlist's tracks"),
             ("←  h", "Close / go back"),
             ("Tab", "Switch pane"),
-            ("v", "Switch view: Artists → Playlists → Discover"),
+            ("v", "Switch view: Artists → Playlists → Discover → Search"),
             ("/", "Filter the list (Esc clears)"),
+            ("f", "Search the library for artists, albums and tracks"),
         ],
     ),
     (
@@ -69,6 +70,22 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Search",
+        &[
+            ("f", "Search (anywhere); type, and results come as you pause"),
+            ("Enter", "While typing: search now and go to the results"),
+            ("↓", "While typing: go to the results"),
+            ("Esc", "While typing: stop typing"),
+            ("Ctrl+U", "While typing: clear the search"),
+            ("", "In the results:"),
+            ("Enter", "Play an album, or a track's album from that track; open an artist"),
+            ("→", "Go to the album's tracks; open an artist in Artists"),
+            ("a  A  P", "Add an album or track to the queue / play next / add to a playlist"),
+            ("m", "Track radio from a track, artist mix from an artist"),
+            ("f  /", "Change the search"),
+        ],
+    ),
+    (
         "Ratings",
         &[("1 – 5", "Rate the track that many stars"), ("-  =", "Half a star less / more"), ("0", "Clear the rating")],
     ),
@@ -83,6 +100,9 @@ impl App {
     fn legend(&self) -> Vec<(&'static str, &'static str)> {
         if self.filtering {
             return vec![("type", "to filter"), ("enter", "done"), ("esc", "clear")];
+        }
+        if self.search.typing && self.view == LeftView::Search {
+            return vec![("type", "to search"), ("enter", "search now"), ("↓", "results"), ("esc", "stop typing")];
         }
         let smart = self.shown_playlist.as_deref().and_then(|k| self.playlist(k)).map(|p| p.smart).unwrap_or(false);
         match (self.focus, self.right, self.view) {
@@ -146,12 +166,24 @@ impl App {
                 ("space", "pause"),
                 ("n/p", "next/prev"),
             ],
+            (Focus::Tree, _, LeftView::Search) => vec![
+                ("↑↓", "move"),
+                ("enter", "play / open"),
+                ("→", "tracks"),
+                ("a/A", "add/play next"),
+                ("P", "add to playlist"),
+                ("m", "mix"),
+                ("f", "new search"),
+                ("v", "artists"),
+                ("space", "pause"),
+            ],
             (Focus::Tree, _, LeftView::Artists) => vec![
                 ("↑↓", "move"),
                 ("→/←", "open/close"),
                 ("enter", "play"),
                 ("a/A", "add/play next"),
                 ("P", "add to playlist"),
+                ("f", "search"),
                 ("v", "playlists"),
                 ("u", "queue"),
                 ("space", "pause"),
