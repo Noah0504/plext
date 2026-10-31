@@ -13,6 +13,13 @@
   the now-playing bar shows it. It's Plext's own volume in your desktop's sound settings, so
   changes made there show up in Plext too. MPRIS clients (`playerctl volume`, desktop media
   widgets) can read and set it. In bit-perfect mode the DAC or amp still sets the volume.
+- **Color themes.** `T` opens a picker that shows each theme as you move and saves the one you
+  keep. Built in: Plext (the default) and Plext Light, Catppuccin (Mocha, Macchiato, Frappé,
+  Latte), Dracula and Alucard, Everforest, GitHub, Gruvbox, Kanagawa, Nord and Nord Light, One
+  Dark and One Light, Rosé Pine (and Moon, Dawn), Solarized, and Tokyo Night (Night, Storm, Day).
+  `terminal` uses your terminal's own colors, and `auto` picks a dark or light theme by asking
+  your terminal what its background is. Themes paint their own background unless you set
+  `theme_background = false`, and a `[colors]` table changes single colors.
 - `plext inspect search <words>` shows what your server's search returns, for troubleshooting.
   `plext inspect` now also takes an artist name without quotes (`plext inspect Cat Power`).
 

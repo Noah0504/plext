@@ -560,16 +560,16 @@ impl App {
         let now = playing.track.as_ref().filter(|_| playing.state != PlayState::Stopped);
         let inner_w = area.width.saturating_sub(2) as usize;
         let items: Vec<ListItem> = match &self.discover {
-            None | Some(Loadable::Loading) => vec![ListItem::new(Span::styled(" Loading…", Style::default().fg(DIM)))],
+            None | Some(Loadable::Loading) => vec![ListItem::new(Span::styled(" Loading…", Style::default().fg(th().dim)))],
             Some(Loadable::Failed(e)) => {
-                vec![ListItem::new(Span::styled(format!(" Couldn't load Discover: {}", e), Style::default().fg(WARN)))]
+                vec![ListItem::new(Span::styled(format!(" Couldn't load Discover: {}", e), Style::default().fg(th().warn)))]
             }
             Some(Loadable::Ready(_)) => rows
                 .iter()
                 .map(|r| match *r {
                     DRow::Heading(t) => ListItem::new(Span::styled(
                         format!(" {}", t),
-                        Style::default().fg(FAINT).add_modifier(Modifier::BOLD),
+                        Style::default().fg(th().faint).add_modifier(Modifier::BOLD),
                     )),
                     DRow::Station(i, j) => {
                         let name = &hubs[i].items[j].title;
@@ -586,7 +586,7 @@ impl App {
                         };
                         ListItem::new(Line::from(vec![
                             Span::raw("   "),
-                            Span::styled(truncate(&label, inner_w.saturating_sub(4)), Style::default().fg(FG)),
+                            Span::styled(truncate(&label, inner_w.saturating_sub(4)), Style::default().fg(th().fg)),
                         ]))
                     }
                     DRow::Shelf(i) => line_item(&hubs[i].title, false, inner_w),
@@ -595,8 +595,8 @@ impl App {
         };
         let list = List::new(items).block(block).scroll_padding(3).highlight_style(
             Style::default()
-                .bg(SEL_BG)
-                .fg(BRIGHT)
+                .bg(th().sel)
+                .fg(th().bright)
                 .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
         );
         f.render_stateful_widget(list, area, &mut self.discover_state);
@@ -663,9 +663,9 @@ impl App {
         let lines: Vec<Line> = std::iter::once(Line::from(""))
             .chain(body.into_iter().map(|l| {
                 let style = if l.starts_with("enter") || l.starts_with('m') || l.starts_with('M') || l.starts_with(' ') {
-                    Style::default().fg(DIM)
+                    Style::default().fg(th().dim)
                 } else {
-                    Style::default().fg(FG)
+                    Style::default().fg(th().fg)
                 };
                 Line::from(Span::styled(l, style))
             }))
@@ -687,7 +687,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, it)| {
-                let style = if selected == Some(i) && focused { Style::default().fg(BRIGHT) } else { Style::default().fg(FG) };
+                let style = if selected == Some(i) && focused { Style::default().fg(th().bright) } else { Style::default().fg(th().fg) };
                 let mut detail = Vec::new();
                 if !it.by.is_empty() {
                     detail.push(it.by.clone());
@@ -701,14 +701,14 @@ impl App {
                 let rest = truncate(&detail, room.saturating_sub(name.chars().count()));
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {}", name), style),
-                    Span::styled(rest, Style::default().fg(DIM)),
+                    Span::styled(rest, Style::default().fg(th().dim)),
                 ]))
             })
             .collect();
         let list = List::new(rows)
             .block(block)
             .scroll_padding(2)
-            .highlight_style(Style::default().bg(if focused { SEL_BG } else { Color::Reset }));
+            .highlight_style(Style::default().bg(if focused { th().sel } else { th().bg }));
         f.render_stateful_widget(list, area, &mut self.shelf_state);
     }
 }
@@ -717,8 +717,8 @@ impl App {
 fn line_item(name: &str, on: bool, width: usize) -> ListItem<'static> {
     let mark = if on { " ♪ " } else { "   " };
     ListItem::new(Line::from(vec![
-        Span::styled(mark, Style::default().fg(ACCENT)),
-        Span::styled(truncate(name, width.saturating_sub(4)), Style::default().fg(FG)),
+        Span::styled(mark, Style::default().fg(th().accent)),
+        Span::styled(truncate(name, width.saturating_sub(4)), Style::default().fg(th().fg)),
     ]))
 }
 

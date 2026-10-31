@@ -114,6 +114,9 @@ pub(super) enum Modal {
     Confirm { key: String, title: String },
     /// Every shortcut (see help.rs).
     Help { scroll: u16 },
+    /// The theme picker (see themes.rs): the highlighted theme, and whether
+    /// themes paint their background.
+    Themes { sel: usize, background: bool },
 }
 
 pub(super) enum InputFor {
@@ -768,6 +771,7 @@ impl App {
                 _ => Some(Modal::Confirm { key, title }),
             },
             Modal::Help { scroll } => self.help_key(k.code, scroll),
+            Modal::Themes { sel, background } => self.themes_key(k.code, sel, background),
         };
     }
 
@@ -826,7 +830,7 @@ impl App {
         let vis_len = self.visible_playlists().len();
         if let Some(sel) = self.playlist_state.selected().filter(|_| vis_len > 0) {
             block = block.title_bottom(
-                Line::from(Span::styled(format!(" {} of {} ", sel + 1, vis_len), Style::default().fg(FAINT)))
+                Line::from(Span::styled(format!(" {} of {} ", sel + 1, vis_len), Style::default().fg(th().faint)))
                     .alignment(Alignment::Right),
             );
         }
@@ -834,17 +838,17 @@ impl App {
         let inner_w = area.width.saturating_sub(2) as usize;
         let items: Vec<ListItem> = match &self.playlists {
             None | Some(Loadable::Loading) => {
-                vec![ListItem::new(Span::styled(" Loading playlists…", Style::default().fg(DIM)))]
+                vec![ListItem::new(Span::styled(" Loading playlists…", Style::default().fg(th().dim)))]
             }
             Some(Loadable::Failed(e)) => vec![ListItem::new(Span::styled(
                 format!(" Couldn't load playlists: {}", e),
-                Style::default().fg(WARN),
+                Style::default().fg(th().warn),
             ))],
             Some(Loadable::Ready(list)) if list.is_empty() => vec![
-                ListItem::new(Span::styled(" No playlists in this library yet.", Style::default().fg(DIM))),
+                ListItem::new(Span::styled(" No playlists in this library yet.", Style::default().fg(th().dim))),
                 ListItem::new(""),
-                ListItem::new(Span::styled(" Press P on an album or track", Style::default().fg(FAINT))),
-                ListItem::new(Span::styled(" to start one.", Style::default().fg(FAINT))),
+                ListItem::new(Span::styled(" Press P on an album or track", Style::default().fg(th().faint))),
+                ListItem::new(Span::styled(" to start one.", Style::default().fg(th().faint))),
             ],
             Some(Loadable::Ready(_)) => self
                 .visible_playlists()
@@ -859,10 +863,10 @@ impl App {
                     let pad = inner_w.saturating_sub(used);
                     ListItem::new(Line::from(vec![
                         Span::raw(" "),
-                        Span::styled(title, Style::default().fg(FG)),
-                        Span::styled(tag, Style::default().fg(FAINT)),
+                        Span::styled(title, Style::default().fg(th().fg)),
+                        Span::styled(tag, Style::default().fg(th().faint)),
                         Span::raw(" ".repeat(pad)),
-                        Span::styled(count, Style::default().fg(FAINT)),
+                        Span::styled(count, Style::default().fg(th().faint)),
                         Span::raw(" "),
                     ]))
                 })
@@ -870,8 +874,8 @@ impl App {
         };
         let list = List::new(items).block(block).scroll_padding(3).highlight_style(
             Style::default()
-                .bg(SEL_BG)
-                .fg(BRIGHT)
+                .bg(th().sel)
+                .fg(th().bright)
                 .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
         );
         let mut state = self.playlist_state.clone();
@@ -890,7 +894,7 @@ impl App {
                 let name = Span::styled(p.title.clone(), title_style(focused));
                 let kind = Span::styled(
                     if p.smart { " · smart playlist" } else { " · playlist" }.to_string(),
-                    Style::default().fg(DIM),
+                    Style::default().fg(th().dim),
                 );
                 let summary = format!(
                     "{} track{} · {}",
@@ -916,22 +920,22 @@ impl App {
         let message = |text: String, color: Color| Paragraph::new(Span::styled(text, Style::default().fg(color)));
 
         let Some(p) = playlist else {
-            f.render_widget(message(" Select a playlist on the left.".into(), DIM), inner);
+            f.render_widget(message(" Select a playlist on the left.".into(), th().dim), inner);
             return;
         };
         let pt = match self.playlist_tracks.get(&p.key) {
             Some(Loadable::Ready(pt)) => pt,
             Some(Loadable::Failed(e)) => {
-                f.render_widget(message(format!(" Couldn't load the playlist: {}", e), WARN), inner);
+                f.render_widget(message(format!(" Couldn't load the playlist: {}", e), th().warn), inner);
                 return;
             }
             _ => {
-                f.render_widget(message(" Loading tracks…".into(), DIM), inner);
+                f.render_widget(message(" Loading tracks…".into(), th().dim), inner);
                 return;
             }
         };
         if pt.tracks.is_empty() {
-            f.render_widget(message(" This playlist is empty. Press P on an album or track to add to it.".into(), DIM), inner);
+            f.render_widget(message(" This playlist is empty. Press P on an album or track to add to it.".into(), th().dim), inner);
             return;
         }
 
@@ -939,12 +943,12 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
             .split(inner);
-        let head = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
+        let head = Style::default().fg(th().bright).add_modifier(Modifier::BOLD);
         f.render_widget(
             Paragraph::new(playlist_line("#", "Title", "Artist", vec![Span::styled("Rating", head)], "Time", inner_w, [head; 4])),
             parts[0],
         );
-        f.render_widget(Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(BORDER))), parts[1]);
+        f.render_widget(Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(th().border))), parts[1]);
 
         let playing_key = st.track.as_ref().filter(|_| st.state != PlayState::Stopped).map(|t| t.key.clone());
         let selected = self.track_state.selected();
@@ -956,14 +960,14 @@ impl App {
                 let playing = playing_key.as_deref() == Some(t.key.as_str());
                 let num = if playing { "▶".to_string() } else { (i + 1).to_string() };
                 let styles = if playing {
-                    [Style::default().fg(ACCENT).add_modifier(Modifier::BOLD); 4]
+                    [Style::default().fg(th().accent).add_modifier(Modifier::BOLD); 4]
                 } else if selected == Some(i) {
-                    [Style::default().fg(BRIGHT); 4]
+                    [Style::default().fg(th().bright); 4]
                 } else {
-                    [Style::default().fg(FAINT), Style::default().fg(FG), Style::default().fg(DIM), Style::default().fg(DIM)]
+                    [Style::default().fg(th().faint), Style::default().fg(th().fg), Style::default().fg(th().dim), Style::default().fg(th().dim)]
                 };
                 let stars = match self.rating_of(t) {
-                    Some(r) => star_spans(r, if playing { DIM } else { FAINT }),
+                    Some(r) => star_spans(r, if playing { th().dim } else { th().faint }),
                     None => Vec::new(),
                 };
                 let time = t.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
@@ -972,7 +976,7 @@ impl App {
             .collect();
         let list = List::new(items)
             .scroll_padding(2)
-            .highlight_style(Style::default().bg(if focused { SEL_BG } else { Color::Reset }));
+            .highlight_style(Style::default().bg(if focused { th().sel } else { th().bg }));
         f.render_stateful_widget(list, parts[2], &mut self.track_state);
     }
 
@@ -986,7 +990,7 @@ impl App {
                 let mut lines: Vec<Line> = vec![
                     Line::from(Span::styled(
                         truncate(&format!(" Adding {}{}", what, count), area.width.saturating_sub(8) as usize),
-                        Style::default().fg(DIM),
+                        Style::default().fg(th().dim),
                     )),
                     Line::from(""),
                 ];
@@ -1002,18 +1006,18 @@ impl App {
                     let on = i == *sel;
                     let name = truncate(name, inner_w.saturating_sub(n.len() + 3));
                     let pad = inner_w.saturating_sub(name.chars().count() + n.len() + 2);
-                    let style = if on { Style::default().fg(BRIGHT).bg(SEL_BG).add_modifier(Modifier::BOLD) } else { Style::default().fg(FG) };
+                    let style = if on { Style::default().fg(th().bright).bg(th().sel).add_modifier(Modifier::BOLD) } else { Style::default().fg(th().fg) };
                     lines.push(Line::from(vec![
                         Span::styled(format!(" {}", name), style),
                         Span::styled(" ".repeat(pad), style),
-                        Span::styled(format!("{} ", n), if on { style } else { Style::default().fg(FAINT) }),
+                        Span::styled(format!("{} ", n), if on { style } else { Style::default().fg(th().faint) }),
                     ]));
                 }
                 if loading {
-                    lines.push(Line::from(Span::styled(" Loading your playlists…", Style::default().fg(FAINT))));
+                    lines.push(Line::from(Span::styled(" Loading your playlists…", Style::default().fg(th().faint))));
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(" ↑↓ choose   enter add   esc cancel", Style::default().fg(FAINT))));
+                lines.push(Line::from(Span::styled(" ↑↓ choose   enter add   esc cancel", Style::default().fg(th().faint))));
                 draw_window(f, " Add to playlist ", lines, w);
             }
             Some(Modal::Input { purpose, text }) => {
@@ -1032,15 +1036,15 @@ impl App {
                     text.chars().skip(n.saturating_sub(room)).collect()
                 };
                 let lines = vec![
-                    Line::from(Span::styled(truncate(&prompt, w.saturating_sub(4) as usize), Style::default().fg(DIM))),
+                    Line::from(Span::styled(truncate(&prompt, w.saturating_sub(4) as usize), Style::default().fg(th().dim))),
                     Line::from(""),
                     Line::from(vec![
-                        Span::styled(" › ", Style::default().fg(ACCENT)),
-                        Span::styled(shown, Style::default().fg(BRIGHT)),
-                        Span::styled("▏", Style::default().fg(ACCENT)),
+                        Span::styled(" › ", Style::default().fg(th().accent)),
+                        Span::styled(shown, Style::default().fg(th().bright)),
+                        Span::styled("▏", Style::default().fg(th().accent)),
                     ]),
                     Line::from(""),
-                    Line::from(Span::styled(" enter save   esc cancel", Style::default().fg(FAINT))),
+                    Line::from(Span::styled(" enter save   esc cancel", Style::default().fg(th().faint))),
                 ];
                 draw_window(f, title, lines, w);
             }
@@ -1049,18 +1053,22 @@ impl App {
                 let lines = vec![
                     Line::from(Span::styled(
                         truncate(&format!(" Delete {}?", title), w.saturating_sub(4) as usize),
-                        Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+                        Style::default().fg(th().bright).add_modifier(Modifier::BOLD),
                     )),
-                    Line::from(Span::styled(" It's deleted from your Plex server. This can't be undone.", Style::default().fg(DIM))),
+                    Line::from(Span::styled(" It's deleted from your Plex server. This can't be undone.", Style::default().fg(th().dim))),
                     Line::from(""),
                     Line::from(vec![
-                        Span::styled(" y", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
-                        Span::styled(" delete   ", Style::default().fg(FAINT)),
-                        Span::styled("n", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
-                        Span::styled(" keep it", Style::default().fg(FAINT)),
+                        Span::styled(" y", Style::default().fg(th().warn).add_modifier(Modifier::BOLD)),
+                        Span::styled(" delete   ", Style::default().fg(th().faint)),
+                        Span::styled("n", Style::default().fg(th().fg).add_modifier(Modifier::BOLD)),
+                        Span::styled(" keep it", Style::default().fg(th().faint)),
                     ]),
                 ];
                 draw_window(f, " Delete playlist ", lines, w);
+            }
+            Some(Modal::Themes { sel, background }) => {
+                let (sel, background) = (*sel, *background);
+                self.draw_themes(f, sel, background);
             }
             Some(Modal::Help { scroll }) => {
                 let scroll = *scroll;
@@ -1085,9 +1093,9 @@ pub(super) fn draw_window(f: &mut Frame, title: &str, lines: Vec<Line>, width: u
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Line::from(Span::styled(title.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))))
-        .style(Style::default().bg(Color::Reset));
+        .border_style(Style::default().fg(th().accent))
+        .title(Line::from(Span::styled(title.to_string(), Style::default().fg(th().accent).add_modifier(Modifier::BOLD))))
+        .style(Style::default().fg(th().fg).bg(th().bg));
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 

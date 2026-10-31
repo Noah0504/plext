@@ -5,6 +5,7 @@ mod discover;
 mod help;
 mod playlists;
 mod search;
+mod themes;
 
 use crate::covers::Covers;
 use crate::mpris::Mpris;
@@ -28,20 +29,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const ACCENT: Color = Color::Rgb(0xe5, 0xa0, 0x0d);
-const FG: Color = Color::Rgb(0xc9, 0xd1, 0xd9);
-const BRIGHT: Color = Color::Rgb(0xe6, 0xed, 0xf3);
-const DIM: Color = Color::Rgb(0x8b, 0x94, 0x9e);
-const FAINT: Color = Color::Rgb(0x6e, 0x76, 0x81);
-/// Unfocused pane edges. Light enough to stay visible on dark terminal
-/// backgrounds (the old #30363d vanished against themes like Nord).
-const BORDER: Color = Color::Rgb(0x54, 0x5c, 0x66);
-const SEL_BG: Color = Color::Rgb(0x1f, 0x26, 0x30);
-const GOOD: Color = Color::Rgb(0x7e, 0xe7, 0x87);
-const WARN: Color = Color::Rgb(0xf0, 0x88, 0x3e);
-/// A half star: the accent at about half strength, so 4½ stars reads as
-/// "almost five" while still lining up in any terminal font.
-const HALF_STAR: Color = Color::Rgb(0x8a, 0x6a, 0x2a);
+/// The theme the interface is drawn with (see `theme.rs`).
+use crate::theme::current as th;
 /// Width of the rating column: five stars and a gap before the format.
 const RATING_W: usize = 7;
 
@@ -264,6 +253,8 @@ pub struct App {
     radio: Option<discover::Radio>,
     /// The Search view.
     search: search::Search,
+    /// The color theme's settings.
+    theme: themes::ThemeSetup,
     quit: bool,
     /// The last error we've seen from the player, and when it appeared.
     seen_error_seq: u64,
@@ -358,6 +349,7 @@ impl App {
             shelf_state: ListState::default().with_selected(Some(0)),
             radio: None,
             search: search::Search::default(),
+            theme: themes::ThemeSetup::default(),
             quit: false,
             seen_error_seq: 0,
             error_since: None,
@@ -1018,6 +1010,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.open_help(),
+            KeyCode::Char('T') => self.open_themes(),
             KeyCode::Char('v') => self.toggle_view(),
             KeyCode::Char('u') => self.toggle_queue_view(),
             KeyCode::Char('z') => {
@@ -1245,7 +1238,7 @@ impl App {
     fn draw(&mut self, f: &mut Frame, st: &Status) {
         let area = f.area();
         let tall = self.album_art && area.width >= TALL_MIN_W && area.height >= TALL_MIN_H;
-        f.render_widget(Block::default().style(Style::default().fg(FG)), area);
+        f.render_widget(Block::default().style(Style::default().fg(th().fg).bg(th().bg)), area);
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1311,11 +1304,11 @@ impl App {
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let left = Line::from(vec![
-            Span::styled(" ▶ plext", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled("   server: ", Style::default().fg(DIM)),
-            Span::styled(&self.header.server_name, Style::default().fg(BRIGHT)),
-            Span::styled("   library: ", Style::default().fg(DIM)),
-            Span::styled(&self.header.library_title, Style::default().fg(BRIGHT)),
+            Span::styled(" ▶ plext", Style::default().fg(th().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("   server: ", Style::default().fg(th().dim)),
+            Span::styled(&self.header.server_name, Style::default().fg(th().bright)),
+            Span::styled("   library: ", Style::default().fg(th().dim)),
+            Span::styled(&self.header.library_title, Style::default().fg(th().bright)),
         ]);
         f.render_widget(Paragraph::new(left), area);
         let count = match (self.view, &self.artists, &self.playlists) {
@@ -1326,8 +1319,8 @@ impl App {
             (_, Loadable::Failed(_), _) => "".into(),
         };
         let right = Line::from(vec![
-            Span::styled(count, Style::default().fg(DIM)),
-            Span::styled("● connected ", Style::default().fg(GOOD)),
+            Span::styled(count, Style::default().fg(th().dim)),
+            Span::styled("● connected ", Style::default().fg(th().good)),
         ])
         .alignment(Alignment::Right);
         f.render_widget(Paragraph::new(right), area);
@@ -1337,9 +1330,9 @@ impl App {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if focused { DIM } else { BORDER }))
+            .border_style(Style::default().fg(if focused { th().dim } else { th().border }))
             .title(title)
-            .title(Line::from(Span::styled(right, Style::default().fg(DIM))).alignment(Alignment::Right))
+            .title(Line::from(Span::styled(right, Style::default().fg(th().dim))).alignment(Alignment::Right))
     }
 
     /// "/ filter", or what you're filtering by, for the left pane `width`
@@ -1386,7 +1379,7 @@ impl App {
         Line::from(vec![
             Span::raw(" "),
             Span::styled(name, title_style(focused)),
-            Span::styled(" · v switches ", Style::default().fg(FAINT)),
+            Span::styled(" · v switches ", Style::default().fg(th().faint)),
         ])
     }
 
@@ -1397,16 +1390,16 @@ impl App {
 
     fn view_switcher_sep(&self, focused: bool, sep: &'static str) -> Line<'static> {
         let on = title_style(focused);
-        let off = Style::default().fg(FAINT);
+        let off = Style::default().fg(th().faint);
         let pick = |v: LeftView| if self.view == v { on } else { off };
         Line::from(vec![
             Span::raw(" "),
             Span::styled("Artists", pick(LeftView::Artists)),
-            Span::styled(sep, Style::default().fg(FAINT)),
+            Span::styled(sep, Style::default().fg(th().faint)),
             Span::styled("Playlists", pick(LeftView::Playlists)),
-            Span::styled(sep, Style::default().fg(FAINT)),
+            Span::styled(sep, Style::default().fg(th().faint)),
             Span::styled("Discover", pick(LeftView::Discover)),
-            Span::styled(sep, Style::default().fg(FAINT)),
+            Span::styled(sep, Style::default().fg(th().faint)),
             Span::styled("Search", pick(LeftView::Search)),
             Span::raw(" "),
         ])
@@ -1433,7 +1426,7 @@ impl App {
                 block = block.title_bottom(
                     Line::from(Span::styled(
                         format!(" {} of {} ", pos + 1, visible.len()),
-                        Style::default().fg(FAINT),
+                        Style::default().fg(th().faint),
                     ))
                     .alignment(Alignment::Right),
                 );
@@ -1451,10 +1444,10 @@ impl App {
             })
             .collect();
         let items: Vec<ListItem> = match &self.artists {
-            Loadable::Loading => vec![ListItem::new(Span::styled(" Loading artists…", Style::default().fg(DIM)))],
+            Loadable::Loading => vec![ListItem::new(Span::styled(" Loading artists…", Style::default().fg(th().dim)))],
             Loadable::Failed(e) => vec![ListItem::new(Span::styled(
                 format!(" Couldn't load artists: {}", e),
-                Style::default().fg(WARN),
+                Style::default().fg(th().warn),
             ))],
             Loadable::Ready(_) => rows
                 .iter()
@@ -1465,25 +1458,25 @@ impl App {
                         let loading = open && matches!(self.albums.get(&a.key), Some(Loadable::Loading));
                         let marker = if open { "▾ " } else { "▸ " };
                         let style = if open {
-                            Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD)
+                            Style::default().fg(th().bright).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(FG)
+                            Style::default().fg(th().fg)
                         };
                         let mut spans = vec![
-                            Span::styled(marker, Style::default().fg(if open { ACCENT } else { FAINT })),
+                            Span::styled(marker, Style::default().fg(if open { th().accent } else { th().faint })),
                             Span::styled(a.title.clone(), style),
                         ];
                         if loading {
-                            spans.push(Span::styled("  …", Style::default().fg(FAINT)));
+                            spans.push(Span::styled("  …", Style::default().fg(th().faint)));
                         }
                         if let Some(Loadable::Failed(_)) = self.albums.get(&a.key) {
-                            spans.push(Span::styled("  (failed to load)", Style::default().fg(WARN)));
+                            spans.push(Span::styled("  (failed to load)", Style::default().fg(th().warn)));
                         }
                         ListItem::new(Line::from(spans))
                     }
                     Row::Heading(_, kind) => ListItem::new(Line::from(Span::styled(
                         format!("    {}", kind.group_title()),
-                        Style::default().fg(FAINT).add_modifier(Modifier::BOLD),
+                        Style::default().fg(th().faint).add_modifier(Modifier::BOLD),
                     ))),
                     Row::Album(i, j) => {
                         let al = self.album(i, j).unwrap();
@@ -1491,11 +1484,11 @@ impl App {
                         let grouped = grouped_artists.contains(&i);
                         let mut spans = vec![Span::raw(if grouped { "      " } else { "    " })];
                         if playing {
-                            spans.push(Span::styled("♪ ", Style::default().fg(ACCENT)));
+                            spans.push(Span::styled("♪ ", Style::default().fg(th().accent)));
                         }
-                        spans.push(Span::styled(al.title.clone(), Style::default().fg(DIM)));
+                        spans.push(Span::styled(al.title.clone(), Style::default().fg(th().dim)));
                         if let Some(y) = al.year {
-                            spans.push(Span::styled(format!(" ({})", y), Style::default().fg(FAINT)));
+                            spans.push(Span::styled(format!(" ({})", y), Style::default().fg(th().faint)));
                         }
                         ListItem::new(Line::from(spans))
                     }
@@ -1508,8 +1501,8 @@ impl App {
             .scroll_padding(3)
             .highlight_style(
                 Style::default()
-                    .bg(SEL_BG)
-                    .fg(BRIGHT)
+                    .bg(th().sel)
+                    .fg(th().bright)
                     .add_modifier(if self.focus == Focus::Tree { Modifier::BOLD } else { Modifier::empty() }),
             );
         f.render_stateful_widget(list, area, &mut self.tree_state);
@@ -1519,13 +1512,13 @@ impl App {
         let (title, right) = match self.right_album() {
             Some((artist, al)) => {
                 let name = Span::styled(al.title.clone(), title_style(self.focus == Focus::Tracks));
-                let by = Span::styled(format!(" · {}", artist), Style::default().fg(DIM));
+                let by = Span::styled(format!(" · {}", artist), Style::default().fg(th().dim));
                 let mut extra = Vec::new();
                 if let Some(y) = al.year {
-                    extra.push(Span::styled(format!(" · {}", y), Style::default().fg(DIM)));
+                    extra.push(Span::styled(format!(" · {}", y), Style::default().fg(th().dim)));
                 }
                 if let Some(kind) = al.kind.display_label() {
-                    extra.push(Span::styled(format!(" · {}", kind), Style::default().fg(DIM)));
+                    extra.push(Span::styled(format!(" · {}", kind), Style::default().fg(th().dim)));
                 }
                 let rights = match self.tracks.get(&al.key) {
                     Some(Loadable::Ready(tr)) => {
@@ -1556,15 +1549,15 @@ impl App {
         let message = |text: String, color: Color| List::new(vec![ListItem::new(Span::styled(text, Style::default().fg(color)))]);
         let tracks = match self.right_album().and_then(|(_, al)| self.tracks.get(&al.key)) {
             None => {
-                f.render_widget(message(" Select an album on the left (→ to expand an artist).".into(), DIM), inner);
+                f.render_widget(message(" Select an album on the left (→ to expand an artist).".into(), th().dim), inner);
                 return;
             }
             Some(Loadable::Loading) => {
-                f.render_widget(message(" Loading tracks…".into(), DIM), inner);
+                f.render_widget(message(" Loading tracks…".into(), th().dim), inner);
                 return;
             }
             Some(Loadable::Failed(e)) => {
-                f.render_widget(message(format!(" Couldn't load tracks: {}", e), WARN), inner);
+                f.render_widget(message(format!(" Couldn't load tracks: {}", e), th().warn), inner);
                 return;
             }
             Some(Loadable::Ready(t)) => t,
@@ -1575,14 +1568,14 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
             .split(inner);
-        let head = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
+        let head = Style::default().fg(th().bright).add_modifier(Modifier::BOLD);
         let rating_head = vec![Span::styled("Rating", head)];
         f.render_widget(
             Paragraph::new(track_line("#", "Title", rating_head, "Format", "Time", inner_w, [head; 4])),
             parts[0],
         );
         f.render_widget(
-            Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(BORDER))),
+            Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(th().border))),
             parts[1],
         );
 
@@ -1603,23 +1596,23 @@ impl App {
                     t.index.map(|i| i.to_string()).unwrap_or_default()
                 };
                 let styles = if playing {
-                    [Style::default().fg(ACCENT).add_modifier(Modifier::BOLD); 4]
+                    [Style::default().fg(th().accent).add_modifier(Modifier::BOLD); 4]
                 } else if selected == Some(i) {
                     // The highlight only sets the background (so the stars keep
                     // their colours); brighten the text here instead.
-                    [Style::default().fg(BRIGHT); 4]
+                    [Style::default().fg(th().bright); 4]
                 } else {
                     [
-                        Style::default().fg(FAINT),
-                        Style::default().fg(FG),
-                        Style::default().fg(DIM),
-                        Style::default().fg(DIM),
+                        Style::default().fg(th().faint),
+                        Style::default().fg(th().fg),
+                        Style::default().fg(th().dim),
+                        Style::default().fg(th().dim),
                     ]
                 };
                 let time = t.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
                 // Unrated tracks leave the column blank to keep the list calm.
                 let stars = match self.rating_of(t) {
-                    Some(r) => star_spans(r, if playing { DIM } else { FAINT }),
+                    Some(r) => star_spans(r, if playing { th().dim } else { th().faint }),
                     None => Vec::new(),
                 };
                 ListItem::new(track_line(&num, &t.title, stars, &t.format_label(), &time, inner_w, styles))
@@ -1627,7 +1620,7 @@ impl App {
             .collect();
         let list = List::new(items)
             .scroll_padding(2)
-            .highlight_style(Style::default().bg(if focused { SEL_BG } else { Color::Reset }));
+            .highlight_style(Style::default().bg(if focused { th().sel } else { th().bg }));
         f.render_stateful_widget(list, parts[2], &mut self.track_state);
     }
 
@@ -1639,7 +1632,7 @@ impl App {
             let total: u64 = items.iter().filter_map(|e| e.track.duration_ms).sum();
             title.push(Span::styled(
                 format!("· {} track{} · {} ", items.len(), if items.len() == 1 { "" } else { "s" }, mmss(total as f64 / 1000.0)),
-                Style::default().fg(DIM),
+                Style::default().fg(th().dim),
             ));
         }
         // On the right: the modes and how to get back, dropping what doesn't fit.
@@ -1667,11 +1660,11 @@ impl App {
 
         if items.is_empty() {
             let lines = vec![
-                Line::from(Span::styled(" The queue is empty.", Style::default().fg(DIM))),
+                Line::from(Span::styled(" The queue is empty.", Style::default().fg(th().dim))),
                 Line::from(""),
                 Line::from(Span::styled(
                     " Press a on an album or track to add it, A to play it next, or Enter to play it now.",
-                    Style::default().fg(FAINT),
+                    Style::default().fg(th().faint),
                 )),
             ];
             f.render_widget(Paragraph::new(lines), inner);
@@ -1682,10 +1675,10 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
             .split(inner);
-        let head = Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD);
+        let head = Style::default().fg(th().bright).add_modifier(Modifier::BOLD);
         f.render_widget(Paragraph::new(queue_line("#", "Title", "Artist", "Album", "Time", inner_w, [head; 5])), parts[0]);
         f.render_widget(
-            Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(BORDER))),
+            Paragraph::new(Span::styled("─".repeat(inner_w), Style::default().fg(th().border))),
             parts[1],
         );
 
@@ -1699,19 +1692,19 @@ impl App {
                 let current = i == self.queue.pos;
                 let num = if current && active { "▶".to_string() } else { (i + 1).to_string() };
                 let styles = if current {
-                    [Style::default().fg(ACCENT).add_modifier(Modifier::BOLD); 5]
+                    [Style::default().fg(th().accent).add_modifier(Modifier::BOLD); 5]
                 } else if i < self.queue.pos {
                     // Already played.
-                    [Style::default().fg(FAINT); 5]
+                    [Style::default().fg(th().faint); 5]
                 } else if selected == Some(i) {
-                    [Style::default().fg(BRIGHT); 5]
+                    [Style::default().fg(th().bright); 5]
                 } else {
                     [
-                        Style::default().fg(FAINT),
-                        Style::default().fg(FG),
-                        Style::default().fg(DIM),
-                        Style::default().fg(DIM),
-                        Style::default().fg(DIM),
+                        Style::default().fg(th().faint),
+                        Style::default().fg(th().fg),
+                        Style::default().fg(th().dim),
+                        Style::default().fg(th().dim),
+                        Style::default().fg(th().dim),
                     ]
                 };
                 let time = t.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
@@ -1720,7 +1713,7 @@ impl App {
             .collect();
         let list = List::new(rows)
             .scroll_padding(2)
-            .highlight_style(Style::default().bg(if focused { SEL_BG } else { Color::Reset }));
+            .highlight_style(Style::default().bg(if focused { th().sel } else { th().bg }));
         f.render_stateful_widget(list, parts[2], &mut self.queue_state);
     }
 
@@ -1761,7 +1754,7 @@ fn modes_label(st: &Status) -> String {
 
 /// Pane titles light up in the accent colour only on the focused pane.
 fn title_style(focused: bool) -> Style {
-    Style::default().fg(if focused { ACCENT } else { BRIGHT }).add_modifier(Modifier::BOLD)
+    Style::default().fg(if focused { th().accent } else { th().bright }).add_modifier(Modifier::BOLD)
 }
 
 /// One row of the track table. `styles` colours the number, title, format and
@@ -1800,10 +1793,10 @@ fn star_spans(rating: u8, empty: Color) -> Vec<Span<'static>> {
     let (full, half) = (r / 2, r % 2);
     let mut spans = Vec::new();
     if full > 0 {
-        spans.push(Span::styled("★".repeat(full), Style::default().fg(ACCENT)));
+        spans.push(Span::styled("★".repeat(full), Style::default().fg(th().accent)));
     }
     if half > 0 {
-        spans.push(Span::styled("★", Style::default().fg(HALF_STAR)));
+        spans.push(Span::styled("★", Style::default().fg(th().half_star)));
     }
     let rest = 5 - full - half;
     if rest > 0 {
@@ -1882,24 +1875,24 @@ fn draw_now_playing(
     art: Option<ArtView>,
 ) {
     let active = matches!(st.state, PlayState::Playing | PlayState::Paused | PlayState::Loading);
-    let edge = if st.state == PlayState::Playing { ACCENT } else if active { DIM } else { BORDER };
+    let edge = if st.state == PlayState::Playing { th().accent } else if active { th().dim } else { th().border };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(edge))
         .title(Line::from(Span::styled(
             " Now Playing ",
-            Style::default().fg(if active { ACCENT } else { DIM }).add_modifier(Modifier::BOLD),
+            Style::default().fg(if active { th().accent } else { th().dim }).add_modifier(Modifier::BOLD),
         )));
     let modes = modes_label(st);
     if (active && st.queue_len > 0) || !modes.is_empty() {
         let mut spans = Vec::new();
         if active && st.queue_len > 0 {
-            spans.push(Span::styled(format!(" track {} of {}", st.queue_pos + 1, st.queue_len), Style::default().fg(DIM)));
+            spans.push(Span::styled(format!(" track {} of {}", st.queue_pos + 1, st.queue_len), Style::default().fg(th().dim)));
         }
         if !modes.is_empty() {
             let sep = if spans.is_empty() { " " } else { " · " };
-            spans.push(Span::styled(format!("{}{}", sep, modes), Style::default().fg(ACCENT)));
+            spans.push(Span::styled(format!("{}{}", sep, modes), Style::default().fg(th().accent)));
         }
         spans.push(Span::raw(" "));
         block = block.title(Line::from(spans).alignment(Alignment::Right));
@@ -1923,7 +1916,7 @@ fn draw_now_playing(
             .split(inner);
         let mut l1 = state_and_title(st, rating);
         if let Some(t) = track {
-            l1.push(Span::styled(format!("   {} — {}", t.artist, t.album), Style::default().fg(DIM)));
+            l1.push(Span::styled(format!("   {} — {}", t.artist, t.album), Style::default().fg(th().dim)));
         }
         f.render_widget(Paragraph::new(Line::from(l1)), rows[0]);
         draw_badge(f, rows[0], st);
@@ -1960,59 +1953,59 @@ fn draw_now_playing(
 
     // Title block: state icon and title, then artist and album lined up under the title.
     let (icon, icon_color) = match st.state {
-        PlayState::Playing => ("▶ ", ACCENT),
-        PlayState::Paused => ("‖ ", DIM),
-        PlayState::Loading => ("… ", DIM),
-        PlayState::Stopped => ("■ ", FAINT),
+        PlayState::Playing => ("▶ ", th().accent),
+        PlayState::Paused => ("‖ ", th().dim),
+        PlayState::Loading => ("… ", th().dim),
+        PlayState::Stopped => ("■ ", th().faint),
     };
     let mut l0 = vec![Span::styled(icon, Style::default().fg(icon_color).add_modifier(Modifier::BOLD))];
     match track {
         Some(t) => {
             l0.push(Span::styled(
                 truncate(&t.title, lw.saturating_sub(2 + 7).max(4)),
-                Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD),
+                Style::default().fg(th().bright).add_modifier(Modifier::BOLD),
             ));
             l0.push(Span::raw("  "));
-            l0.extend(star_spans(rating.flatten().unwrap_or(0), BORDER));
+            l0.extend(star_spans(rating.flatten().unwrap_or(0), th().border));
         }
-        None => l0.push(Span::styled("Stopped", Style::default().fg(FAINT))),
+        None => l0.push(Span::styled("Stopped", Style::default().fg(th().faint))),
     }
     f.render_widget(Paragraph::new(Line::from(l0)), left(0));
     if let Some(t) = track {
         let room = lw.saturating_sub(2).max(4);
         f.render_widget(
-            Paragraph::new(Span::styled(format!("  {}", truncate(&t.artist, room)), Style::default().fg(BRIGHT))),
+            Paragraph::new(Span::styled(format!("  {}", truncate(&t.artist, room)), Style::default().fg(th().bright))),
             left(1),
         );
         let album = art.album_line.clone().unwrap_or_else(|| t.album.clone());
         f.render_widget(
-            Paragraph::new(Span::styled(format!("  {}", truncate(&album, room)), Style::default().fg(DIM))),
+            Paragraph::new(Span::styled(format!("  {}", truncate(&album, room)), Style::default().fg(th().dim))),
             left(2),
         );
     }
 
     // Up next: the following two tracks, or the end of the album.
     if show_next && track.is_some() {
-        f.render_widget(Paragraph::new(Span::styled("up next", Style::default().fg(FAINT))), right(0));
+        f.render_widget(Paragraph::new(Span::styled("up next", Style::default().fg(th().faint))), right(0));
         if st.repeat == Repeat::One {
-            f.render_widget(Paragraph::new(Span::styled("repeating this track", Style::default().fg(FAINT))), right(1));
+            f.render_widget(Paragraph::new(Span::styled("repeating this track", Style::default().fg(th().faint))), right(1));
         } else if st.next.is_empty() {
-            f.render_widget(Paragraph::new(Span::styled("end of queue", Style::default().fg(FAINT))), right(1));
+            f.render_widget(Paragraph::new(Span::styled("end of queue", Style::default().fg(th().faint))), right(1));
         }
         for (i, n) in st.next.iter().take(if st.repeat == Repeat::One { 0 } else { 2 }).enumerate() {
             let num = n.index.map(|x| x.to_string()).unwrap_or_else(|| (st.queue_pos + 2 + i).to_string());
             let len = n.duration_ms.map(|d| mmss(d as f64 / 1000.0)).unwrap_or_default();
             let title_room = (UP_NEXT_W as usize).saturating_sub(num.chars().count() + 2 + len.chars().count() + 2);
-            let title_color = if i == 0 { FG } else { DIM };
+            let title_color = if i == 0 { th().fg } else { th().dim };
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(format!("{}  ", num), Style::default().fg(FAINT)),
+                    Span::styled(format!("{}  ", num), Style::default().fg(th().faint)),
                     Span::styled(truncate(&n.title, title_room.max(4)), Style::default().fg(title_color)),
                 ])),
                 right(1 + i),
             );
             f.render_widget(
-                Paragraph::new(Span::styled(len, Style::default().fg(FAINT))).alignment(Alignment::Right),
+                Paragraph::new(Span::styled(len, Style::default().fg(th().faint))).alignment(Alignment::Right),
                 right(1 + i),
             );
         }
@@ -2043,23 +2036,23 @@ fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, banner: Option<Bann
             let verdict = if let Route::SoundServer(_) = o.route {
                 Span::raw("")
             } else if st.bit_perfect() {
-                Span::styled("◆ BIT-PERFECT", Style::default().fg(GOOD).add_modifier(Modifier::BOLD))
+                Span::styled("◆ BIT-PERFECT", Style::default().fg(th().good).add_modifier(Modifier::BOLD))
             } else {
-                Span::styled("◇ NOT BIT-PERFECT", Style::default().fg(WARN).add_modifier(Modifier::BOLD))
+                Span::styled("◇ NOT BIT-PERFECT", Style::default().fg(th().warn).add_modifier(Modifier::BOLD))
             };
             let mode = match o.route {
                 Route::Direct => " · exclusive".to_string(),
                 Route::AlsaPlugins => " · via ALSA plugins".to_string(),
                 Route::SoundServer(kind) => format!(" · via {}", kind),
             };
-            let arrow = Span::styled("  →  ", Style::default().fg(DIM));
-            let device = Span::styled(o.label.clone(), Style::default().fg(BRIGHT));
+            let arrow = Span::styled("  →  ", Style::default().fg(th().dim));
+            let device = Span::styled(o.label.clone(), Style::default().fg(th().bright));
             let mut v = Vec::new();
             if let (Route::SoundServer(_), Some(vol)) = (o.route, st.volume) {
                 let vol = if vol.muted { " · muted".to_string() } else { format!(" · vol {}%", vol.percent) };
-                v.push(vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(format!("{}{}", mode, vol), Style::default().fg(DIM))]);
+                v.push(vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(format!("{}{}", mode, vol), Style::default().fg(th().dim))]);
             }
-            v.push(vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(mode, Style::default().fg(DIM))]);
+            v.push(vec![verdict.clone(), arrow.clone(), device.clone(), Span::styled(mode, Style::default().fg(th().dim))]);
             v.push(vec![verdict, arrow, device]);
             v
         }
@@ -2071,20 +2064,20 @@ fn draw_details_tall(f: &mut Frame, area: Rect, st: &Status, banner: Option<Bann
 /// "▶ PLAYING  Title  ★★★★☆" (the title and stars only while something plays).
 fn state_and_title(st: &Status, rating: Option<Option<u8>>) -> Vec<Span<'static>> {
     let (label, label_color) = match st.state {
-        PlayState::Playing => ("▶ PLAYING", ACCENT),
-        PlayState::Paused => ("❚❚ PAUSED", DIM),
-        PlayState::Loading => ("… LOADING", DIM),
-        PlayState::Stopped => ("■ STOPPED", FAINT),
+        PlayState::Playing => ("▶ PLAYING", th().accent),
+        PlayState::Paused => ("❚❚ PAUSED", th().dim),
+        PlayState::Loading => ("… LOADING", th().dim),
+        PlayState::Stopped => ("■ STOPPED", th().faint),
     };
     let mut l1 = vec![Span::styled(
         format!(" {}  ", label),
         Style::default().fg(label_color).add_modifier(Modifier::BOLD),
     )];
     if let Some(t) = st.track.as_ref().filter(|_| st.state != PlayState::Stopped) {
-        l1.push(Span::styled(t.title.clone(), Style::default().fg(BRIGHT).add_modifier(Modifier::BOLD)));
+        l1.push(Span::styled(t.title.clone(), Style::default().fg(th().bright).add_modifier(Modifier::BOLD)));
         // Faint outlines when unrated, so you can see there's a rating to set.
         l1.push(Span::raw("  "));
-        l1.extend(star_spans(rating.flatten().unwrap_or(0), BORDER));
+        l1.extend(star_spans(rating.flatten().unwrap_or(0), th().border));
     }
     l1
 }
@@ -2094,9 +2087,9 @@ fn draw_badge(f: &mut Frame, area: Rect, st: &Status) {
     let chosen_shared = matches!(st.output.as_ref().map(|o| o.route), Some(Route::SoundServer(_)));
     if st.output.is_some() && !chosen_shared {
         let badge = if st.bit_perfect() {
-            Span::styled("◆ BIT-PERFECT ", Style::default().fg(GOOD).add_modifier(Modifier::BOLD))
+            Span::styled("◆ BIT-PERFECT ", Style::default().fg(th().good).add_modifier(Modifier::BOLD))
         } else {
-            Span::styled("◇ NOT BIT-PERFECT ", Style::default().fg(WARN).add_modifier(Modifier::BOLD))
+            Span::styled("◇ NOT BIT-PERFECT ", Style::default().fg(th().warn).add_modifier(Modifier::BOLD))
         };
         f.render_widget(Paragraph::new(Line::from(badge)).alignment(Alignment::Right), area);
     }
@@ -2116,7 +2109,7 @@ fn draw_progress(f: &mut Frame, area: Rect, st: &Status, indent: bool) {
     f.render_widget(
         Paragraph::new(Span::styled(
             if playing { format!("{}{}", if indent { " " } else { "" }, mmss(st.pos)) } else { String::new() },
-            Style::default().fg(BRIGHT),
+            Style::default().fg(th().bright),
         )),
         bar[0],
     );
@@ -2124,15 +2117,15 @@ fn draw_progress(f: &mut Frame, area: Rect, st: &Status, indent: bool) {
     let filled = if playing { ((w as f64) * ratio).round() as usize } else { 0 }.min(w);
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("━".repeat(filled), Style::default().fg(ACCENT)),
-            Span::styled("─".repeat(w - filled), Style::default().fg(BORDER)),
+            Span::styled("━".repeat(filled), Style::default().fg(th().accent)),
+            Span::styled("─".repeat(w - filled), Style::default().fg(th().border)),
         ])),
         bar[1],
     );
     f.render_widget(
         Paragraph::new(Span::styled(
             if playing && dur > 0.0 { format!("{}{}", mmss(dur), if indent { " " } else { "" }) } else { String::new() },
-            Style::default().fg(DIM),
+            Style::default().fg(th().dim),
         ))
         .alignment(Alignment::Right),
         bar[2],
@@ -2190,9 +2183,9 @@ fn fit_pane_titles(
 /// An error (⚠, orange) or what a key just did (✓).
 fn banner_span(b: Banner, indent: &str) -> Span<'static> {
     if b.error {
-        Span::styled(format!("{}⚠ {}", indent, b.text), Style::default().fg(WARN))
+        Span::styled(format!("{}⚠ {}", indent, b.text), Style::default().fg(th().warn))
     } else {
-        Span::styled(format!("{}✓ {}", indent, b.text), Style::default().fg(GOOD))
+        Span::styled(format!("{}✓ {}", indent, b.text), Style::default().fg(th().good))
     }
 }
 
@@ -2209,9 +2202,9 @@ fn draw_details(f: &mut Frame, area: Rect, st: &Status, banner: Option<Banner>) 
     let sources: Vec<String> = source_variants(st).into_iter().map(|s| format!(" {}", s)).collect();
     let rights: Vec<Vec<Span>> = match &st.output {
         Some(o) => {
-            let out = Span::styled("out: ", Style::default().fg(DIM));
-            let device = Span::styled(o.label.clone(), Style::default().fg(BRIGHT));
-            let dim = |t: String| Span::styled(t, Style::default().fg(DIM));
+            let out = Span::styled("out: ", Style::default().fg(th().dim));
+            let device = Span::styled(o.label.clone(), Style::default().fg(th().bright));
+            let dim = |t: String| Span::styled(t, Style::default().fg(th().dim));
             let modes: Vec<String> = match o.route {
                 Route::Direct => vec![
                     format!(" · {} · exclusive · no resample · vol: DAC ", o.fmt.name()),
@@ -2298,7 +2291,7 @@ fn draw_split_line(f: &mut Frame, area: Rect, sources: &[String], rights: Vec<Ve
         .split(area);
     let room = (parts[0].width as usize).saturating_sub(2);
     if room >= 4 && !src.trim().is_empty() {
-        f.render_widget(Paragraph::new(Span::styled(truncate(src, room), Style::default().fg(DIM))), parts[0]);
+        f.render_widget(Paragraph::new(Span::styled(truncate(src, room), Style::default().fg(th().dim))), parts[0]);
     }
     if !right.is_empty() {
         f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), parts[1]);
@@ -2342,14 +2335,14 @@ fn draw_cover(f: &mut Frame, area: Rect, view: &ArtView) {
                         .set_bg(art_color(art.at(x, y + 1), view.truecolor));
                 }
                 None => {
-                    cell.set_symbol(" ").set_bg(SEL_BG);
+                    cell.set_symbol(" ").set_bg(th().sel);
                 }
             }
         }
     }
     if view.art.is_none() && w >= 2 && h >= 1 {
         let cell = &mut buf[(area.x + w / 2 - 1, area.y + h / 2)];
-        cell.set_symbol("♪").set_fg(FAINT);
+        cell.set_symbol("♪").set_fg(th().faint);
     }
 }
 
@@ -2404,7 +2397,7 @@ mod tests {
     }
 
     fn stars_text(r: u8) -> (String, Vec<Color>) {
-        let spans = star_spans(r, FAINT);
+        let spans = star_spans(r, th().faint);
         let text = spans.iter().map(|s| s.content.as_ref()).collect();
         let colors = spans
             .iter()
@@ -2422,7 +2415,7 @@ mod tests {
         assert_eq!(stars_text(6).0, "★★★☆☆");
         let (text, colors) = stars_text(7);
         assert_eq!(text, "★★★★☆");
-        assert_eq!(colors, vec![ACCENT, ACCENT, ACCENT, HALF_STAR, FAINT]);
+        assert_eq!(colors, vec![th().accent, th().accent, th().accent, th().half_star, th().faint]);
     }
 
     fn track(key: &str, index: u32, title: &str, rating: Option<u8>) -> Track {
@@ -2714,7 +2707,7 @@ mod tests {
         app.album_art = true;
         let buf = render_sized(&mut app, &playing_status(&t), 140, 40);
         let (x0, y0) = cover_origin(&buf);
-        assert_eq!(buf[(x0, y0)].bg, SEL_BG);
+        assert_eq!(buf[(x0, y0)].bg, th().sel);
         let rows: String = (y0..y0 + 8).map(|y| row_text(&buf, y)).collect();
         assert!(rows.contains('♪'));
     }
@@ -3753,5 +3746,80 @@ mod tests {
         assert_eq!(app.notice.as_ref().unwrap().text, "Volume 70%");
         key(&mut app, '<');
         assert_eq!(app.notice.as_ref().unwrap().text, "Volume 65%");
+    }
+
+    // ---------- themes ----------
+
+    #[test]
+    fn t_previews_themes_as_you_move_and_esc_puts_back() {
+        let mut app = app_with_album(vec![track("1", 1, "One", None)]);
+        crate::theme::set_current(crate::theme::builtin("plext", true));
+        key(&mut app, 'T');
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains(" Theme ") && screen.contains("✓ Plext") && screen.contains("Nord"), "{}", screen);
+        // The second entry is Plext Light: it's what the screen shows now.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(th().id, "plext-light");
+        assert_eq!(app.theme.settings.theme, None, "only a preview so far");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(th().id, "plext");
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn enter_keeps_a_theme_and_b_leaves_the_background_to_the_terminal() {
+        let mut app = app_with_album(vec![track("1", 1, "One", None)]);
+        key(&mut app, 'T');
+        let nord = crate::theme::choices().iter().position(|c| c.id == "nord").unwrap();
+        for _ in 0..nord {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(th().id, "nord");
+        assert_eq!(th().bg, Color::Rgb(0x2e, 0x34, 0x40));
+        key(&mut app, 'b');
+        assert_eq!(th().bg, Color::Reset);
+        key(&mut app, 'b');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.theme.settings.theme.as_deref(), Some("nord"));
+        assert_eq!(app.theme.settings.background, None, "painting is the default, so nothing is written");
+        assert_eq!(app.notice.as_ref().unwrap().text, "Theme: Nord");
+        // Opening the picker again starts on the theme in use.
+        key(&mut app, 'T');
+        let screen = render(&mut app, &Status::default()).join("\n");
+        assert!(screen.contains("✓ Nord"), "{}", screen);
+        crate::theme::set_current(crate::theme::builtin("plext", true));
+    }
+
+    /// Every theme draws the whole screen in its own colors: with a
+    /// painted background, no cell is left showing the terminal's.
+    #[test]
+    fn every_theme_draws_and_painted_ones_cover_the_whole_screen() {
+        for c in crate::theme::choices() {
+            let mut app = app_with_album(vec![track("1", 1, "One", None), track("2", 2, "Two", None)]);
+            app.use_theme_for_test(c.id);
+            let t = th();
+            for (w, h) in [(140u16, 40u16), (80, 24)] {
+                let buf = render_sized(&mut app, &playing_status(&app_track()), w, h);
+                if t.bg != Color::Reset {
+                    let bare = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| buf[(x, y)].bg == Color::Reset).count();
+                    assert_eq!(bare, 0, "{}: {} cells without the theme's background at {}x{}", c.id, bare, w, h);
+                }
+            }
+            // And the picker and help windows.
+            key(&mut app, 'T');
+            render_sized(&mut app, &Status::default(), 80, 24);
+            press(&mut app, KeyCode::Esc);
+            key(&mut app, '?');
+            let buf = render_sized(&mut app, &Status::default(), 80, 24);
+            if t.bg != Color::Reset {
+                assert!((0..24).all(|y| (0..80).all(|x| buf[(x, y)].bg != Color::Reset)), "{} help window", c.id);
+            }
+            press(&mut app, KeyCode::Esc);
+        }
+        crate::theme::set_current(crate::theme::builtin("plext", true));
+    }
+
+    fn app_track() -> Track {
+        track("1", 1, "One", None)
     }
 }

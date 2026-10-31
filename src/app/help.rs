@@ -90,7 +90,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Ratings",
         &[("1 – 5", "Rate the track that many stars"), ("-  =", "Half a star less / more"), ("0", "Clear the rating")],
     ),
-    ("Other", &[("?  F1", "This help"), ("q  Ctrl+C", "Quit")]),
+    ("Other", &[("T", "Pick a color theme (each one shows as you move)"), ("?  F1", "This help"), ("q  Ctrl+C", "Quit")]),
 ];
 
 const HELP_W: u16 = 78;
@@ -197,8 +197,8 @@ impl App {
     /// are left off the end.
     pub(super) fn draw_keys(&self, f: &mut Frame, area: Rect) {
         let help = Line::from(vec![
-            Span::styled("?", Style::default().fg(FG)),
-            Span::styled(" all keys ", Style::default().fg(FAINT)),
+            Span::styled("?", Style::default().fg(th().fg)),
+            Span::styled(" all keys ", Style::default().fg(th().faint)),
         ]);
         let help_w = help.width() as u16;
         let room = area.width.saturating_sub(help_w + 2) as usize;
@@ -210,8 +210,8 @@ impl App {
                 break;
             }
             used += w;
-            spans.push(Span::styled(k, Style::default().fg(FG)));
-            spans.push(Span::styled(format!(" {}   ", d), Style::default().fg(FAINT)));
+            spans.push(Span::styled(k, Style::default().fg(th().fg)));
+            spans.push(Span::styled(format!(" {}   ", d), Style::default().fg(th().faint)));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
         f.render_widget(Paragraph::new(help).alignment(Alignment::Right), area);
@@ -247,15 +247,15 @@ impl App {
             }
             all.push(Line::from(Span::styled(
                 format!(" {}", section),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(th().accent).add_modifier(Modifier::BOLD),
             )));
             for (k, d) in keys.iter() {
                 if k.is_empty() {
-                    all.push(Line::from(Span::styled(format!("   {}", truncate(d, desc_w + KEY_W)), Style::default().fg(DIM))));
+                    all.push(Line::from(Span::styled(format!("   {}", truncate(d, desc_w + KEY_W)), Style::default().fg(th().dim))));
                 } else {
                     all.push(Line::from(vec![
-                        Span::styled(format!("   {:<KEY_W$}", k), Style::default().fg(BRIGHT)),
-                        Span::styled(truncate(d, desc_w), Style::default().fg(FG)),
+                        Span::styled(format!("   {:<KEY_W$}", k), Style::default().fg(th().bright)),
+                        Span::styled(truncate(d, desc_w), Style::default().fg(th().fg)),
                     ]));
                 }
             }
@@ -270,7 +270,7 @@ impl App {
         let mut lines: Vec<Line> = all.into_iter().skip(scroll).take(body_h).collect();
         lines.push(Line::from(""));
         let more = if max_scroll > 0 { "↑↓ scroll   " } else { "" };
-        lines.push(Line::from(Span::styled(format!(" {}esc close", more), Style::default().fg(FAINT))));
+        lines.push(Line::from(Span::styled(format!(" {}esc close", more), Style::default().fg(th().faint))));
         draw_window(f, " Keys ", lines, w);
     }
 }

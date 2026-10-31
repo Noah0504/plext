@@ -150,6 +150,7 @@ window listing every shortcut.
 | `0` | Clear the track's rating |
 | `Tab` | Switch pane |
 | `/` | Filter the list: artists or playlists (`Esc` clears) |
+| `T` | Pick a color theme: each one shows as you move, `Enter` keeps it |
 | `?` / `F1` | Show every shortcut |
 | `q` / `Ctrl+C` | Quit |
 
@@ -327,6 +328,73 @@ kept) and handed to the desktop as local files, so your Plex token never leaves 
 or on a console with no desktop session there's nothing to register with, and Plext simply
 carries on without it. To turn it off, set `mpris = false`.
 
+## Themes
+
+Press `T` for the theme picker. Each theme shows as you move through the list; `Enter` keeps it
+(and saves it to `config.toml`), `Esc` puts back what you had.
+
+| Theme | Name | |
+| --- | --- | --- |
+| `plext` | Plext (default) | dark |
+| `plext-light` | Plext Light | light |
+| `catppuccin-mocha` | Catppuccin Mocha | dark |
+| `catppuccin-macchiato` | Catppuccin Macchiato | dark |
+| `catppuccin-frappe` | Catppuccin Frappé | dark |
+| `catppuccin-latte` | Catppuccin Latte | light |
+| `dracula` | Dracula | dark |
+| `alucard` | Dracula Light (Alucard) | light |
+| `everforest-dark` | Everforest Dark | dark |
+| `everforest-light` | Everforest Light | light |
+| `github-dark` | GitHub Dark | dark |
+| `github-light` | GitHub Light | light |
+| `gruvbox-dark` | Gruvbox Dark | dark |
+| `gruvbox-light` | Gruvbox Light | light |
+| `kanagawa-wave` | Kanagawa Wave | dark |
+| `kanagawa-lotus` | Kanagawa Lotus | light |
+| `nord` | Nord | dark |
+| `nord-light` | Nord Light | light |
+| `one-dark` | One Dark | dark |
+| `one-light` | One Light | light |
+| `rose-pine` | Rosé Pine | dark |
+| `rose-pine-moon` | Rosé Pine Moon | dark |
+| `rose-pine-dawn` | Rosé Pine Dawn | light |
+| `solarized-dark` | Solarized Dark | dark |
+| `solarized-light` | Solarized Light | light |
+| `tokyo-night` | Tokyo Night | dark |
+| `tokyo-night-storm` | Tokyo Night Storm | dark |
+| `tokyo-night-day` | Tokyo Night Day | light |
+| `terminal` | Terminal colors | either |
+| `auto` | Auto | follows the terminal |
+
+- **Plext** (the default) draws on your terminal's background, as Plext always has. The other
+  themes paint their own background so they look right in any terminal; press `b` in the picker,
+  or set `theme_background = false`, to keep your terminal's background with a theme's colors.
+- **Terminal colors** uses your terminal's own 16-color palette, so Plext matches whatever scheme
+  your terminal has, light or dark.
+- **Auto** asks your terminal whether its background is light or dark when Plext starts, and uses
+  `theme_dark` or `theme_light` (Plext and Plext Light unless you set them). Most terminals
+  answer, tmux included; if yours doesn't, Plext goes by `COLORFGBG`, or else assumes dark.
+
+```toml
+theme = "auto"
+theme_dark = "catppuccin-mocha"
+theme_light = "catppuccin-latte"
+```
+
+To change single colors on top of any theme, add a `[colors]` table at the end of the file. The
+colors are `background`, `text`, `bright` (titles and the highlighted row), `dim`, `faint`,
+`border`, `selection` (behind the highlighted row), `accent`, `good`, `warn` and `half_star`.
+Each takes `"#rrggbb"`, a terminal color name (`"yellow"`, `"bright-black"`…), a 256-color
+number, or `"default"` for the terminal's own:
+
+```toml
+[colors]
+accent = "#e5a00d"
+selection = "bright-black"
+```
+
+The album cover keeps its own colors in every theme, and the bit-perfect badge stays green.
+
 ## Ratings
 
 Plext shows your rating for each track in the track list and next to the title in the
@@ -358,6 +426,10 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 | `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |
 | `album_art` | `true` | Show the album cover as pixel art in a taller now-playing area |
 | `mpris` | `true` | Show in the desktop's media controls and obey media keys |
+| `theme` | `plext` | Color theme: a theme's name, `terminal` or `auto` (see [Themes](#themes)); `T` sets it |
+| `theme_background` | `true` | Themes paint their own background; `false` keeps your terminal's |
+| `theme_dark` / `theme_light` | `plext` / `plext-light` | What `theme = "auto"` uses on dark and light terminals |
+| `[colors]` | | Change single colors on top of the theme (see [Themes](#themes)) |
 
 ## Bit-perfect notes
 

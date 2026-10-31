@@ -15,6 +15,8 @@ mod plex;
 mod pulse;
 mod queue;
 mod report;
+mod termbg;
+mod theme;
 mod volume;
 #[cfg(test)]
 mod test_server;
@@ -117,6 +119,7 @@ fn real_main() -> Result<()> {
             if let Some(p) = log::path() {
                 println!("Log file:    {}", p.display());
             }
+            println!("Theme:       {}", theme_status(&cfg));
             let mode = cli.output.unwrap_or(cfg.output_mode());
             match mode {
                 OutputMode::Bitperfect => {
@@ -233,6 +236,7 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
         cfg.mpris.unwrap_or(true),
         cfg.album_art.unwrap_or(true),
     );
+    app.use_theme(cfg.theme_settings());
     app.restore_queue();
     let result = app.run(&mut terminal);
     ratatui::restore();
@@ -275,6 +279,34 @@ fn inspect_mixes(cfg: &mut Config) -> Result<()> {
     eprintln!("Asking {} about mixes and stations (this can take a few seconds)…\n", server_cfg.name);
     print!("{}", inspect_mixes::report(&server, &library.key));
     Ok(())
+}
+
+/// The theme as `plext status` shows it, with anything wrong in the settings.
+fn theme_status(cfg: &Config) -> String {
+    let settings = cfg.theme_settings();
+    let name = |id: Option<&str>, fallback: &str| -> String {
+        id.and_then(theme::canonical).unwrap_or(fallback).to_string()
+    };
+    let mut out = if settings.is_auto() {
+        format!(
+            "auto (dark: {}, light: {})",
+            name(settings.dark.as_deref(), theme::DEFAULT_DARK),
+            name(settings.light.as_deref(), theme::DEFAULT_LIGHT)
+        )
+    } else {
+        name(settings.theme.as_deref(), theme::DEFAULT_DARK)
+    };
+    if settings.background == Some(false) {
+        out.push_str(", on the terminal's background");
+    }
+    if !settings.colors.is_empty() {
+        out.push_str(&format!(", {} color(s) changed", settings.colors.len()));
+    }
+    let (_, problems) = theme::resolve(&settings, None);
+    for p in problems {
+        out.push_str(&format!("\n             ⚠ {}", p));
+    }
+    out
 }
 
 fn inspect_search(cfg: &mut Config, query: &str) -> Result<()> {

@@ -401,34 +401,34 @@ impl App {
         };
         let line = if s.typing {
             Line::from(vec![
-                Span::styled(" › ", Style::default().fg(ACCENT)),
-                Span::styled(query, Style::default().fg(BRIGHT)),
-                Span::styled("▏", Style::default().fg(ACCENT)),
+                Span::styled(" › ", Style::default().fg(th().accent)),
+                Span::styled(query, Style::default().fg(th().bright)),
+                Span::styled("▏", Style::default().fg(th().accent)),
             ])
         } else if s.query.is_empty() {
             Line::from(vec![
-                Span::styled(" › ", Style::default().fg(FAINT)),
-                Span::styled("f or enter to search", Style::default().fg(FAINT)),
+                Span::styled(" › ", Style::default().fg(th().faint)),
+                Span::styled("f or enter to search", Style::default().fg(th().faint)),
             ])
         } else {
             // The hint only when the whole query fits beside it.
             let hint = if query.chars().count() + 9 <= room { "  f edits" } else { "" };
             let q = truncate(&query, room.saturating_sub(hint.len()));
             Line::from(vec![
-                Span::styled(" › ", Style::default().fg(DIM)),
-                Span::styled(q, Style::default().fg(FG)),
-                Span::styled(hint, Style::default().fg(FAINT)),
+                Span::styled(" › ", Style::default().fg(th().dim)),
+                Span::styled(q, Style::default().fg(th().fg)),
+                Span::styled(hint, Style::default().fg(th().faint)),
             ])
         };
         f.render_widget(Paragraph::new(line), parts[0]);
         f.render_widget(
-            Paragraph::new(Span::styled(status, Style::default().fg(FAINT))).alignment(Alignment::Right),
+            Paragraph::new(Span::styled(status, Style::default().fg(th().faint))).alignment(Alignment::Right),
             parts[0],
         );
 
         let message = |text: String, color: Color| List::new(vec![ListItem::new(Span::styled(text, Style::default().fg(color)))]);
         if let Some(e) = &self.search.error {
-            f.render_widget(message(format!(" Search failed: {}", e), WARN), parts[2]);
+            f.render_widget(message(format!(" Search failed: {}", e), th().warn), parts[2]);
             return;
         }
         let Some(r) = &self.search.results else {
@@ -437,11 +437,11 @@ impl App {
             } else {
                 " Artists, albums and tracks: type a few words."
             };
-            f.render_widget(message(text.into(), DIM), parts[2]);
+            f.render_widget(message(text.into(), th().dim), parts[2]);
             return;
         };
         if r.is_empty() {
-            f.render_widget(message(format!(" Nothing matches \"{}\".", self.search.searched), DIM), parts[2]);
+            f.render_widget(message(format!(" Nothing matches \"{}\".", self.search.searched), th().dim), parts[2]);
             return;
         }
         let rows = self.search_rows();
@@ -451,8 +451,8 @@ impl App {
                 let (name, detail) = match *row {
                     SRow::Heading(t, n) => {
                         return ListItem::new(Line::from(vec![
-                            Span::styled(format!(" {}", t), Style::default().fg(FAINT).add_modifier(Modifier::BOLD)),
-                            Span::styled(format!("  {}", n), Style::default().fg(FAINT)),
+                            Span::styled(format!(" {}", t), Style::default().fg(th().faint).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!("  {}", n), Style::default().fg(th().faint)),
                         ]))
                     }
                     SRow::Artist(i) => (r.artists[i].title.clone(), String::new()),
@@ -476,15 +476,15 @@ impl App {
                 let rest = truncate(&detail, room.saturating_sub(name.chars().count()));
                 ListItem::new(Line::from(vec![
                     Span::raw("   "),
-                    Span::styled(name, Style::default().fg(FG)),
-                    Span::styled(rest, Style::default().fg(DIM)),
+                    Span::styled(name, Style::default().fg(th().fg)),
+                    Span::styled(rest, Style::default().fg(th().dim)),
                 ]))
             })
             .collect();
         let list = List::new(items).scroll_padding(3).highlight_style(
             Style::default()
-                .bg(if focused && !self.search.typing { SEL_BG } else { Color::Reset })
-                .fg(BRIGHT)
+                .bg(if focused && !self.search.typing { th().sel } else { th().bg })
+                .fg(th().bright)
                 .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
         );
         f.render_stateful_widget(list, parts[2], &mut self.search.state);
@@ -512,19 +512,19 @@ impl App {
                         detail.push(k.to_string());
                     }
                     lines.push(Line::from(vec![
-                        Span::styled(a.title.clone(), Style::default().fg(FG)),
+                        Span::styled(a.title.clone(), Style::default().fg(th().fg)),
                         Span::styled(
                             if detail.is_empty() { String::new() } else { format!("  {}", detail.join(" · ")) },
-                            Style::default().fg(DIM),
+                            Style::default().fg(th().dim),
                         ),
                     ]));
                 }
             }
-            Some(Loadable::Failed(e)) => lines.push(Line::from(Span::styled(format!("Couldn't load releases: {}", e), Style::default().fg(WARN)))),
-            _ => lines.push(Line::from(Span::styled("Loading releases…", Style::default().fg(DIM)))),
+            Some(Loadable::Failed(e)) => lines.push(Line::from(Span::styled(format!("Couldn't load releases: {}", e), Style::default().fg(th().warn)))),
+            _ => lines.push(Line::from(Span::styled("Loading releases…", Style::default().fg(th().dim)))),
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("enter  open in Artists    m  artist mix", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled("enter  open in Artists    m  artist mix", Style::default().fg(th().dim))));
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
