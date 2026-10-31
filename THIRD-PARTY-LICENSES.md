@@ -3746,7 +3746,7 @@ SOFTWARE.
 
 ### MIT License
 
-Used by: plext 0.5.0
+Used by: plext 0.6.0
 
 ```
 MIT License
