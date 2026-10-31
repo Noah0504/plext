@@ -1,10 +1,10 @@
 # Plext
 
 A terminal music player for Plex with bit-perfect playback straight to your DAC.
-Browse your album artists and albums, stream lossless and high-res audio untouched,
-all from a single static binary for Linux.
+Browse your artists, albums and playlists, build a queue, start stations and mixes, and stream
+lossless and high-res audio untouched, all from a single static binary for Linux.
 
-![Plext playing a 16-bit/44.1 kHz FLAC album bit-perfect through a USB DAC, with the album cover as pixel art and the next two tracks up next](docs/screenshot.png)
+![Plext playing a live album, 16-bit/44.1 kHz FLAC, bit-perfect through a USB DAC, with the album cover as pixel art beside the track and the next two tracks up next](docs/screenshot.png)
 
 ## Features
 
@@ -48,7 +48,8 @@ all from a single static binary for Linux.
 - For bit-perfect playback, a USB DAC or other sound card that Plext can access directly.
   For desktop sound, PipeWire (with pipewire-pulse, the default on current distributions) or
   PulseAudio
-- Plex Pass only if you want Plex webhooks; everything else works without it
+- Plex Pass for Plex webhooks, and for the mixes and sonic adventures in Discover (they also need
+  sonic analysis turned on for the library). Everything else works without it
 
 ## Install
 
@@ -60,6 +61,7 @@ sudo install plext /usr/local/bin/
 ```
 
 To upgrade, download the new release and run the same two commands; your settings are kept.
+[CHANGELOG.md](CHANGELOG.md) lists what's new in each release.
 
 ## Getting started
 
@@ -67,6 +69,9 @@ To upgrade, download the new release and run the same two commands; your setting
 plext login          # sign in at plex.tv/link, pick your server, library and how to play
 plext                # start playing
 ```
+
+Inside Plext, the bottom line always shows the keys for where you are, and `?` lists them all.
+`v` switches the left pane between your artists, your playlists and Discover (stations and mixes).
 
 The first time, Plext asks how to play your music:
 
@@ -171,7 +176,7 @@ different Plex server is ignored.)
 
 ## Playlists
 
-Press `v` to switch the left pane from your artists to your playlists (and back). Plext lists the
+Press `v` to switch the left pane from your artists to your playlists. Plext lists the
 audio playlists with music from the library you chose; smart playlists are marked *smart*.
 Select one to see its tracks on the right. Playlists play and queue just like albums: `Enter`
 plays one (replacing the queue), `a` adds it to the queue, and `A` plays it next.
@@ -350,6 +355,9 @@ server in its own sample rate and bit depth, and the server takes it from there.
   server moved or your sign-in expired, run `plext login` again.
 - **Media keys don't do anything.** Check that Plext is registered with `playerctl -l` (it lists
   `plext`). If another player also runs, your desktop may send the keys to that one instead.
+- **A mix won't start.** Track radio, artist mixes and sonic adventures need Plex Pass and sonic
+  analysis on the music library; the message in the now-playing bar says which call failed.
+  `plext inspect mixes` shows what your server offers.
 - **A release is in the wrong group.** Plext uses the release type Plex reads from your tags.
   `plext inspect "Artist"` shows what the server reports for each release.
 
