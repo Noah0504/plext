@@ -456,6 +456,11 @@ impl Server {
             .get_json(&format!("{}{}", self.base, path), Some(&self.token))
     }
 
+    /// The server's JSON answer for a path, for diagnostics (`plext inspect mixes`).
+    pub fn get_raw(&self, path: &str) -> Result<Value> {
+        self.get(path)
+    }
+
     pub fn music_libraries(&self) -> Result<Vec<Library>> {
         let v = self.get("/library/sections")?;
         Ok(items(&v, "Directory")
