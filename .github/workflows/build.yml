@@ -186,7 +186,13 @@ jobs:
           cargo test --release --locked --no-run
           # A test that hangs under emulation would otherwise run for hours;
           # the log then names it ("has been running for over 60 seconds").
-          if ! timeout 900 cargo test --release --locked 2>&1 | tee test.log; then
+          # Written to a file, not piped: a hung test left behind by the
+          # time limit would hold a pipe open forever.
+          rc=0
+          timeout -k 10 900 cargo test --release --locked > test.log 2>&1 || rc=$?
+          cat test.log
+          if [ "$rc" != 0 ]; then
+            pkill -9 -f "qemu-" || true
             msg=$(grep -vE '^\s+(Compiling|Downloaded|Downloading) ' test.log | tail -60 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
             echo "::error title=cargo test failed (${{ matrix.name }})::${msg}"
             exit 1
