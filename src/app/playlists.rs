@@ -448,7 +448,8 @@ impl App {
     pub(super) fn toggle_view(&mut self) {
         self.view = match self.view {
             LeftView::Artists => LeftView::Playlists,
-            LeftView::Playlists => LeftView::Artists,
+            LeftView::Playlists => LeftView::Discover,
+            LeftView::Discover => LeftView::Artists,
         };
         self.filter.clear();
         self.filtering = false;
@@ -457,6 +458,10 @@ impl App {
             self.right = RightView::Album;
         }
         self.track_state.select(Some(0));
+        if self.view == LeftView::Discover {
+            // Fetched again each time: the shelves change as you listen.
+            self.load_discover();
+        }
         if self.view == LeftView::Playlists {
             // Fetched again each time, so playlists made elsewhere show up.
             self.load_playlists();
@@ -555,6 +560,7 @@ impl App {
             Action::Play(i) => {
                 let index = i.min(tracks.len() - 1);
                 self.when_loaded.clear();
+                self.radio = None;
                 self.feed = loading.map(|_| Feed { key: key.to_string(), gen, playing: true });
                 self.player.send(Cmd::Play { queue: tracks, index });
                 if let Some((_, total)) = loading {
@@ -803,7 +809,7 @@ impl App {
         let title = if filter_label.chars().count() + 25 > area.width as usize && !filter_label.is_empty() {
             Line::from("")
         } else {
-            self.view_switcher(focused)
+            self.view_switcher_for(focused, area.width)
         };
         let mut block = self.pane(title, filter_label, focused);
         let vis_len = self.visible_playlists().len();

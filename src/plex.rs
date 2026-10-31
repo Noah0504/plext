@@ -14,6 +14,38 @@ pub struct Artist {
     pub title: String,
 }
 
+/// A row of things the server suggests ("Recently Played", "Stations"…).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hub {
+    pub title: String,
+    /// e.g. "music.stations.36"
+    pub id: String,
+    /// What the items are: "album", "artist", "station"…
+    pub kind: String,
+    /// Path for the full list (None when the hub is all there is).
+    pub more: Option<String>,
+    pub items: Vec<HubItem>,
+}
+
+impl Hub {
+    pub fn is_stations(&self) -> bool {
+        self.kind == "station" || self.id.starts_with("music.stations")
+    }
+}
+
+/// One thing in a hub: an album, artist, station…
+#[derive(Debug, Clone, PartialEq)]
+pub struct HubItem {
+    pub title: String,
+    /// The artist, for an album or track.
+    pub by: String,
+    pub kind: String,
+    pub key: String,
+    /// Server path, e.g. "/library/sections/36/stations/1" for a station.
+    pub path: String,
+    pub year: Option<u32>,
+}
+
 /// A playlist on the server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Playlist {
@@ -627,10 +659,98 @@ impl Server {
     }
 
     /// One track's full details (used when a track arrives without its media file).
+    /// The artist (key, name) of a track, from its details.
+    pub fn track_artist(&self, key: &str) -> Result<(String, String)> {
+        let v = self.get(&format!("/library/metadata/{}", encode(key)))?;
+        let m = items(&v, "Metadata").next().ok_or_else(|| anyhow!("track {} not found", key))?;
+        let artist = str_of(&m["grandparentRatingKey"]);
+        if artist.is_empty() {
+            bail!("no artist for track {}", key);
+        }
+        Ok((artist, str_of(&m["grandparentTitle"])))
+    }
+
     pub fn track(&self, key: &str) -> Result<Track> {
         let v = self.get(&format!("/library/metadata/{}", encode(key)))?;
         let t = items(&v, "Metadata").next().map(parse_track);
         t.ok_or_else(|| anyhow!("track {} not found", key))
+    }
+
+    // ---------- discover: hubs, stations, sonic features ----------
+
+    /// The library's suggestion rows, stations included.
+    pub fn hubs(&self, library_key: &str) -> Result<Vec<Hub>> {
+        let v = self.get(&format!("/hubs/sections/{}?includeStations=1&count=12", encode(library_key)))?;
+        Ok(items(&v, "Hub")
+            .map(|h| {
+                let mut entries: Vec<HubItem> = h["Metadata"].as_array().into_iter().flatten().map(parse_hub_item).collect();
+                entries.extend(h["Directory"].as_array().into_iter().flatten().map(parse_hub_item));
+                Hub {
+                    title: str_of(&h["title"]),
+                    id: str_of(&h["hubIdentifier"]),
+                    kind: str_of(&h["type"]),
+                    more: h["key"].as_str().filter(|k| !k.is_empty() && h["more"].as_bool().unwrap_or(false)).map(String::from),
+                    items: entries,
+                }
+            })
+            .collect())
+    }
+
+    /// The full list behind a hub's "more" path.
+    pub fn hub_items(&self, path: &str) -> Result<Vec<HubItem>> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let v = self.get(&format!("{}{}X-Plex-Container-Start=0&X-Plex-Container-Size=100", path, sep))?;
+        let mut out: Vec<HubItem> = items(&v, "Metadata").map(parse_hub_item).collect();
+        out.extend(items(&v, "Directory").map(parse_hub_item));
+        Ok(out)
+    }
+
+    /// A batch of tracks from a station. Each call starts the station
+    /// afresh on the server, which picks a new set.
+    pub fn station_tracks(&self, station_path: &str) -> Result<Vec<Track>> {
+        let uri = format!("server://{}/com.plexapp.plugins.library{}", self.machine_id, station_path);
+        let v = self.send(
+            "POST",
+            &format!("/playQueues?type=audio&shuffle=0&repeat=0&continuous=0&own=1&uri={}", encode(&uri)),
+        )?;
+        Ok(items(&v, "Metadata").filter(|m| m["type"].as_str().map_or(true, |t| t == "track")).map(parse_track).collect())
+    }
+
+    /// Tracks that sound like this one (Plex's sonic analysis), nearest first.
+    pub fn similar_tracks(&self, track_key: &str, limit: usize, max_distance: f32) -> Result<Vec<Track>> {
+        let v = self.get(&format!(
+            "/library/metadata/{}/nearest?limit={}&maxDistance={}",
+            encode(track_key),
+            limit,
+            max_distance
+        ))?;
+        Ok(items(&v, "Metadata").map(parse_track).collect())
+    }
+
+    /// Artists that sound like this one: (key, name), nearest first.
+    pub fn similar_artists(&self, artist_key: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let v = self.get(&format!("/library/metadata/{}/nearest?limit={}&maxDistance=0.25", encode(artist_key), limit))?;
+        Ok(items(&v, "Metadata")
+            .filter(|m| m["type"].as_str().map_or(true, |t| t == "artist"))
+            .map(|m| (str_of(&m["ratingKey"]), str_of(&m["title"])))
+            .collect())
+    }
+
+    /// Every track by an artist.
+    pub fn artist_tracks(&self, artist_key: &str) -> Result<Vec<Track>> {
+        let v = self.get(&format!("/library/metadata/{}/allLeaves", encode(artist_key)))?;
+        Ok(items(&v, "Metadata").map(parse_track).collect())
+    }
+
+    /// A path of tracks that moves smoothly from one track's sound to another's.
+    pub fn sonic_path(&self, library_key: &str, from: &str, to: &str) -> Result<Vec<Track>> {
+        let v = self.get(&format!(
+            "/library/sections/{}/computePath?startID={}&endID={}",
+            encode(library_key),
+            encode(from),
+            encode(to)
+        ))?;
+        Ok(items(&v, "Metadata").map(parse_track).collect())
     }
 
     /// "server://…/library/metadata/1,2,3": how Plex refers to a set of items.
@@ -802,6 +922,22 @@ fn merge(base: Track, full: Track) -> Track {
         container: full.container.or(base.container),
         rating: full.rating.or(base.rating),
         thumb: full.thumb.or(base.thumb),
+    }
+}
+
+fn parse_hub_item(m: &Value) -> HubItem {
+    let by = ["grandparentTitle", "parentTitle"]
+        .iter()
+        .map(|k| str_of(&m[*k]))
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    HubItem {
+        title: str_of(&m["title"]),
+        by,
+        kind: str_of(&m["type"]),
+        key: str_of(&m["ratingKey"]),
+        path: str_of(&m["key"]),
+        year: m["year"].as_u64().map(|y| y as u32),
     }
 }
 
@@ -1022,5 +1158,48 @@ mod tests {
             "DELETE /playlists/30",
         ]);
         assert!(server.create_playlist("Empty", &[]).is_err());
+    }
+
+    #[test]
+    fn discover_calls_parse_what_the_server_returns() {
+        let t = |k: &str, title: &str| json!({"ratingKey": k, "title": title, "type": "track", "grandparentTitle": "Cat Power",
+            "Media": [{"Part": [{"key": format!("/library/parts/{}/f.flac", k)}]}]});
+        let (server, log) = fake_server(vec![
+            ("GET", "/hubs/sections/36?", json!({"MediaContainer": {"Hub": [
+                {"title": "Stations", "hubIdentifier": "music.stations.36", "type": "station", "more": false, "Metadata": [
+                    {"title": "Deep Cuts Radio", "type": "playlist", "key": "/library/sections/36/stations/8", "radio": 1}]},
+                {"title": "Recently Played Music", "hubIdentifier": "music.recent.played.36", "type": "artist", "more": true,
+                 "key": "/library/sections/36/all?viewCount>=1&type=8", "Metadata": [{"title": "The Beatles", "type": "artist", "ratingKey": "186427", "key": "/library/metadata/186427/children"}]},
+            ]}})),
+            ("GET", "/library/sections/36/all?viewCount", json!({"MediaContainer": {"Metadata": [
+                {"title": "Help!", "type": "album", "ratingKey": "186609", "parentTitle": "The Beatles", "year": 1965}]}})),
+            ("POST", "/playQueues?", json!({"MediaContainer": {"playQueueID": 9, "Metadata": [t("1", "Free"), t("2", "Werewolf")]}})),
+            ("GET", "/library/metadata/1/nearest", json!({"MediaContainer": {"Metadata": [t("5", "Lions")]}})),
+            ("GET", "/library/metadata/77/nearest", json!({"MediaContainer": {"Metadata": [{"ratingKey": "78", "title": "The Staves", "type": "artist"}]}})),
+            ("GET", "/library/metadata/77/allLeaves", json!({"MediaContainer": {"Metadata": [t("1", "Free"), t("3", "Fool")]}})),
+            ("GET", "/library/sections/36/computePath", json!({"MediaContainer": {"Metadata": [t("1", "Free"), t("5", "Lions"), t("9", "Old Flowers")]}})),
+        ]);
+        let hubs = server.hubs("36").unwrap();
+        assert!(hubs[0].is_stations() && !hubs[1].is_stations());
+        assert_eq!(hubs[0].items[0].path, "/library/sections/36/stations/8");
+        assert_eq!(hubs[0].more, None);
+        assert_eq!(hubs[1].more.as_deref(), Some("/library/sections/36/all?viewCount>=1&type=8"));
+        let more = server.hub_items(hubs[1].more.as_ref().unwrap()).unwrap();
+        assert_eq!((more[0].title.as_str(), more[0].by.as_str(), more[0].year), ("Help!", "The Beatles", Some(1965)));
+
+        let st = server.station_tracks("/library/sections/36/stations/8").unwrap();
+        assert_eq!(st.len(), 2);
+        assert_eq!(st[1].part_key.as_deref(), Some("/library/parts/2/f.flac"));
+        assert_eq!(server.similar_tracks("1", 25, 0.25).unwrap()[0].title, "Lions");
+        assert_eq!(server.similar_artists("77", 10).unwrap(), [("78".to_string(), "The Staves".to_string())]);
+        assert_eq!(server.artist_tracks("77").unwrap().len(), 2);
+        assert_eq!(server.sonic_path("36", "1", "9").unwrap().len(), 3);
+
+        let l = log.lock().unwrap().clone();
+        let post = l.iter().find(|x| x.starts_with("POST")).unwrap();
+        assert!(post.contains("uri=server%3A%2F%2FMACHINE%2Fcom.plexapp.plugins.library%2Flibrary%2Fsections%2F36%2Fstations%2F8"), "{}", post);
+        assert!(l.iter().any(|x| x == "GET /library/metadata/1/nearest?limit=25&maxDistance=0.25"), "{:?}", l);
+        assert!(l.iter().any(|x| x == "GET /library/sections/36/computePath?startID=1&endID=9"), "{:?}", l);
+        assert!(l.iter().any(|x| x.starts_with("GET /library/sections/36/all?viewCount%3E=1&type=8&X-Plex-Container-Start=0")), "{:?}", l);
     }
 }
