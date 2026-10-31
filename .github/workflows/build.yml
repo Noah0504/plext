@@ -182,7 +182,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          if ! cargo test --release --locked 2>&1 | tee test.log; then
+          # Build first, so the time limit below is for running the tests.
+          cargo test --release --locked --no-run
+          # A test that hangs under emulation would otherwise run for hours;
+          # the log then names it ("has been running for over 60 seconds").
+          if ! timeout 900 cargo test --release --locked 2>&1 | tee test.log; then
             msg=$(grep -vE '^\s+(Compiling|Downloaded|Downloading) ' test.log | tail -60 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
             echo "::error title=cargo test failed (${{ matrix.name }})::${msg}"
             exit 1

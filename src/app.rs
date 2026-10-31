@@ -3552,7 +3552,9 @@ mod tests {
         open_discover(&mut app);
         press(&mut app, KeyCode::Down); // Deep Cuts Radio
         press(&mut app, KeyCode::Enter);
-        let st = pump_mix(&mut app, |a, _| a.player.queue().items.len() >= 4);
+        // Wait on the status itself: the queue changes a moment before the
+        // status reports it, which slow machines (and QEMU) can catch.
+        let st = pump_mix(&mut app, |_, st| st.queue_len >= 4);
         assert!(st.queue_len >= 4);
         assert!(app.notice.as_ref().unwrap().text.contains("keeps going"), "{}", app.notice.as_ref().unwrap().text);
         let post = log.lock().unwrap().iter().find(|l| l.starts_with("POST")).cloned().unwrap();
