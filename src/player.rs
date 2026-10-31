@@ -191,7 +191,16 @@ impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.tx.send(Cmd::Quit);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            // Normally it stops at once. If it's stuck waiting on the server
+            // (retrying a download that won't start), don't hold up quitting:
+            // the process is exiting anyway.
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -211,6 +220,15 @@ enum End {
     /// A problem with the output device: stop the queue.
     Fatal(String),
     Command(Cmd),
+}
+
+enum Between {
+    /// Nothing changed: carry on.
+    Carry,
+    /// The current track changed: start it from the top.
+    Moved,
+    /// Stop playing, handing back a command that interrupted, if any.
+    Stop(Option<Cmd>),
 }
 
 struct Engine {
@@ -375,6 +393,13 @@ impl Engine {
         // repeat on) can't spin forever.
         let mut failures = 0usize;
         let pending = loop {
+            // Keys pressed between tracks (say, while one track after another
+            // fails to load) are handled before starting the next.
+            match self.between_tracks() {
+                Between::Carry => {}
+                Between::Moved => start = 0.0,
+                Between::Stop(c) => break c,
+            }
             let entry = self.queue.lock().unwrap().current().cloned();
             let Some(entry) = entry else {
                 break None;
@@ -453,6 +478,39 @@ impl Engine {
             s.pos = 0.0;
         });
         pending
+    }
+
+    /// Handles commands waiting between two tracks.
+    fn between_tracks(&mut self) -> Between {
+        let mut moved = false;
+        loop {
+            let cmd = match self.rx.try_recv() {
+                Ok(c) => c,
+                Err(TryRecvError::Empty) => return if moved { Between::Moved } else { Between::Carry },
+                Err(TryRecvError::Disconnected) => return Between::Stop(Some(Cmd::Quit)),
+            };
+            match cmd {
+                Cmd::Quit | Cmd::Play { .. } | Cmd::Restore(_) => return Between::Stop(Some(cmd)),
+                Cmd::Stop => return Between::Stop(None),
+                Cmd::Next => {
+                    if !self.with_queue(|q| q.next()) {
+                        return Between::Stop(None);
+                    }
+                    moved = true;
+                }
+                Cmd::Prev => {
+                    self.with_queue(|q| q.prev());
+                    moved = true;
+                }
+                Cmd::Jump(id) => moved |= self.with_queue(|q| q.jump(id)),
+                c if is_edit(&c) => {
+                    moved |= apply_edit(&self.queue, c);
+                    self.publish();
+                }
+                // Pausing or seeking applies to a track that's playing.
+                _ => {}
+            }
+        }
     }
 
     fn flush(&mut self) {

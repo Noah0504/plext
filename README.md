@@ -169,6 +169,11 @@ audio playlists with music from the library you chose; smart playlists are marke
 Select one to see its tracks on the right. Playlists play and queue just like albums: `Enter`
 plays one (replacing the queue), `a` adds it to the queue, and `A` plays it next.
 
+Big playlists (Plex's own smart playlists can run to thousands of tracks) load in pages: the
+first couple of hundred tracks show straight away, and the title counts up as the rest arrive.
+You don't have to wait. `Enter` or `a` starts with what's loaded, and the rest joins the queue
+as it comes in, mixed in at random if shuffle is on.
+
 To add to a playlist, press `P` on an album, a track, a playlist, or a track in the queue. A
 window lists your playlists, plus **New playlist…**, which asks for a name. In the queue view,
 `S` saves the whole queue as a new playlist.

@@ -2813,8 +2813,7 @@ mod tests {
             ("POST", "/playlists?", json!({"MediaContainer": {"Metadata": [{"ratingKey": "30", "title": "Fresh", "leafCount": 2}]}})),
         ]);
         let mut app = app_with_album(vec![track("1", 1, "One", None), track("2", 2, "Two", None)]);
-        app.server = Server::new(Plex::new("plext-test"), &base, "token", "MACHINE");
-        app.playlist_tx = playlists::spawn_playlist_worker(app.server.clone(), app.tx.clone());
+        use_server(&mut app, &base);
         (app, log)
     }
 
@@ -3057,9 +3056,15 @@ mod tests {
             vec![("Container-Start=200&", slow_ms), ("/library/parts/", 2000)],
         );
         let mut app = app_with_album(vec![track("1", 1, "One", None)]);
-        app.server = Server::new(Plex::new("plext-test"), &base, "token", "MACHINE");
-        app.playlist_tx = playlists::spawn_playlist_worker(app.server.clone(), app.tx.clone());
+        use_server(&mut app, &base);
         (app, log)
+    }
+
+    /// Points everything at the stand-in server, the player included.
+    fn use_server(app: &mut App, base: &str) {
+        app.server = Server::new(Plex::new("plext-test"), base, "token", "MACHINE");
+        app.playlist_tx = playlists::spawn_playlist_worker(app.server.clone(), app.tx.clone());
+        app.player = Player::spawn(app.server.clone(), crate::output::Target::Alsa("null".into()));
     }
 
     fn shown_len(app: &App) -> usize {
