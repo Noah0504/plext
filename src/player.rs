@@ -82,6 +82,9 @@ pub struct Status {
     /// it isn't reported to Plex as a session).
     pub waiting: bool,
     pub error: Option<String>,
+    /// The volume of Plext's stream in desktop-sound mode (kept up to date
+    /// by the volume thread); None in bit-perfect mode or when unknown.
+    pub volume: Option<crate::pulse::StreamVolume>,
     /// Increases with every new error, so the UI can tell a new one apart.
     pub error_seq: u64,
     /// Increases whenever the position jumps (a seek, or restarting the

@@ -74,6 +74,72 @@ pub fn query() -> Result<ServerSummary> {
     })
 }
 
+/// A stream's volume as the desktop's sound settings show it: 100% is
+/// full (the server's "norm"), and the curve is the one their sliders use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamVolume {
+    pub percent: u32,
+    pub muted: bool,
+}
+
+/// The loudest a stream is set: 100%, no boost (which would clip).
+pub const MAX_PERCENT: u32 = 100;
+
+/// A connection for reading and setting a stream's volume, separate from
+/// the one carrying the audio so it never holds up playback.
+pub struct VolumeControl {
+    conn: Conn,
+}
+
+impl VolumeControl {
+    pub fn connect() -> Result<VolumeControl> {
+        Ok(VolumeControl { conn: Conn::connect()? })
+    }
+
+    /// The volume of stream `index` (its loudest channel, as the desktop's
+    /// mixer shows a stream's balance-locked slider).
+    pub fn get(&mut self, index: u32) -> Result<StreamVolume> {
+        let info: pa::SinkInputInfo = self.conn.call_reply(Command::GetSinkInputInfo(index))?;
+        Ok(StreamVolume { percent: percent_of(&info.cvolume), muted: info.muted })
+    }
+
+    /// Sets stream `index` to `percent`, keeping the balance between its
+    /// channels. Returns the volume it now has.
+    pub fn set(&mut self, index: u32, percent: u32) -> Result<StreamVolume> {
+        let info: pa::SinkInputInfo = self.conn.call_reply(Command::GetSinkInputInfo(index))?;
+        if !info.volume_writable {
+            bail!("the sound server doesn't let Plext change its volume");
+        }
+        let volume = scaled(&info.cvolume, percent.min(MAX_PERCENT), info.channel_map.num_channels());
+        self.conn.call_ack(Command::SetSinkInputVolume(pa::SetStreamVolumeParams { index, volume }))?;
+        self.get(index)
+    }
+}
+
+/// The loudest channel, in percent of full.
+fn percent_of(v: &pa::ChannelVolume) -> u32 {
+    let max = v.channels().iter().map(|c| c.as_u32()).max().unwrap_or(0) as u64;
+    ((max * 100 + 0x8000) / 0x10000) as u32
+}
+
+/// `v` with its loudest channel at `percent` and the others in proportion.
+fn scaled(v: &pa::ChannelVolume, percent: u32, channels: u8) -> pa::ChannelVolume {
+    let target = (percent as u64 * 0x10000 / 100) as u32;
+    let old: Vec<u32> = v.channels().iter().map(|c| c.as_u32()).collect();
+    let max = old.iter().copied().max().unwrap_or(0);
+    let mut out = pa::ChannelVolume::empty();
+    if max == 0 || old.is_empty() {
+        for _ in 0..channels.max(1) {
+            out.push(pa::Volume::from_u32_clamped(target));
+        }
+    } else {
+        for c in old {
+            out.push(pa::Volume::from_u32_clamped((c as u64 * target as u64 / max as u64) as u32));
+        }
+    }
+    out
+}
+
 pub struct PulseOutput {
     conn: RefCell<Conn>,
     pub spec: StreamSpec,
@@ -165,6 +231,7 @@ impl PulseOutput {
                 rate: spec.rate,
                 fmt,
                 route: Route::SoundServer(kind),
+                stream: Some(reply.stream_index),
             },
             channel: reply.channel,
             credit: reply.requested_bytes as usize,
@@ -495,6 +562,21 @@ mod tests {
         use ChannelPosition::*;
         assert_eq!(six, [FrontLeft, FrontRight, FrontCenter, Lfe, RearLeft, RearRight]);
         assert_eq!(channel_map(12).num_channels(), 12);
+    }
+
+    #[test]
+    fn volume_percent_is_the_loudest_channel_and_scaling_keeps_the_balance() {
+        let mut v = pa::ChannelVolume::empty();
+        v.push(pa::Volume::from_u32_clamped(0x10000));
+        v.push(pa::Volume::from_u32_clamped(0x8000));
+        assert_eq!(percent_of(&v), 100);
+        let half = scaled(&v, 50, 2);
+        assert_eq!(half.channels().iter().map(|c| c.as_u32()).collect::<Vec<_>>(), [0x8000, 0x4000]);
+        assert_eq!(percent_of(&half), 50);
+        // From silence, every channel gets the same.
+        let from_zero = scaled(&pa::ChannelVolume::muted(2), 30, 2);
+        assert_eq!(percent_of(&from_zero), 30);
+        assert_eq!(from_zero.channels()[0], from_zero.channels()[1]);
     }
 
     #[test]

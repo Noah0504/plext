@@ -80,7 +80,8 @@ The first time, Plext asks how to play your music:
 - **Bit-perfect**: straight to your DAC through ALSA, untouched. Plext has the DAC to itself
   while it plays, and you set the volume on the DAC or amp. Best with a USB DAC.
 - **Desktop sound**: through PipeWire or PulseAudio, to whatever speakers or headphones your
-  desktop uses, alongside other apps and with your usual volume controls. Never bit-perfect,
+  desktop uses, alongside other apps and with your usual volume controls (or `<` / `>` in
+  Plext). Never bit-perfect,
   since the sound server mixes and converts the audio.
 
 Then it asks which device or output to use. Change either later:
@@ -142,6 +143,7 @@ window listing every shortcut.
 | `Space` | Pause / resume |
 | `n` / `p` | Next / previous track (`p` restarts the track if you're more than 3 s in) |
 | `.` `]` / `,` `[` | Seek forward / back 10 s |
+| `<` / `>` | Volume down / up 5% (desktop-sound mode; in bit-perfect mode the DAC or amp sets it) |
 | `s` | Stop (the queue stays; `Space` starts it again) |
 | `1`–`5` | Rate the track that many stars |
 | `-` / `=` | Take away / add half a star (`+` works too) |
@@ -291,15 +293,25 @@ It looks best in a terminal with 24-bit color (GNOME Terminal, Konsole, kitty, W
 Alacritty, foot…); elsewhere Plext uses the nearest of the standard 256 colors. With
 `album_art = false`, Plext always uses the compact bar.
 
+## Volume
+
+In **desktop-sound mode**, `<` and `>` turn Plext's own volume down and up in 5% steps (up to
+100%, never above). It's the same volume your desktop's sound settings show next to "Plext", so
+changing it there works too, and the now-playing bar shows it (`vol 65%`, or `muted`). The sound
+server remembers it for next time.
+
+In **bit-perfect mode** Plext never touches the samples, so there's no volume in Plext: use the
+DAC's or amplifier's volume control.
+
 ## Media keys and desktop controls
 
 While Plext runs, it registers with your desktop as a media player over MPRIS, the standard
 Linux desktops use for this. GNOME and KDE then show the playing track, artist, album and cover
 in their media controls, and route the keyboard's media keys to Plext: play/pause, next,
 previous and stop. Seeking, shuffle and repeat work from those controls too (`playerctl shuffle
-toggle`, `playerctl loop Playlist`). Volume isn't offered there: in
-bit-perfect mode it's up to your DAC or amp, and in desktop-sound mode your desktop's own volume
-controls work as usual.
+toggle`, `playerctl loop Playlist`). In desktop-sound mode they can set Plext's volume too
+(`playerctl -p plext volume 0.5`); in bit-perfect mode the volume is up to your DAC or amp, so
+it's reported as full and can't be changed.
 
 On window managers without built-in media controls (sway, i3, Hyprland…), bind your keys to
 [`playerctl`](https://github.com/altdesktop/playerctl), for example in sway:
