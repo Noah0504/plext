@@ -523,15 +523,16 @@ impl App {
         }
     }
 
-    /// Tops a running mix up when the queue is nearly out.
-    pub(super) fn radio_tick(&mut self, st: &Status) {
-        let Some(radio) = self.radio.as_mut() else { return };
+    /// Tops a running mix up when the queue is nearly out. True when it
+    /// started fetching more.
+    pub(super) fn radio_tick(&mut self, st: &Status) -> bool {
+        let Some(radio) = self.radio.as_mut() else { return false };
         if radio.fetching || st.queue_len == 0 {
-            return;
+            return false;
         }
         let left = st.queue_len.saturating_sub(st.queue_pos + 1);
         if left > TOP_UP_AT {
-            return;
+            return false;
         }
         radio.fetching = true;
         let (gen, source) = (radio.gen, radio.source.clone());
@@ -540,6 +541,7 @@ impl App {
             let r = fetch_batch(&s, &source);
             let _ = tx.send(Msg::Radio(Batch { gen, first: false, result: r }));
         });
+        true
     }
 
     /// Something new is about to replace the queue: stop topping it up.

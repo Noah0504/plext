@@ -117,7 +117,7 @@ pub enum Route {
     SoundServer(&'static str),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputInfo {
     /// Human-friendly name, e.g. the DAC's card name.
     pub label: String,

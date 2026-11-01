@@ -370,7 +370,7 @@ impl App {
         match &self.playlists {
             Some(Loadable::Ready(list)) => {
                 let f = self.filter.to_lowercase();
-                list.iter().filter(|p| f.is_empty() || p.title.to_lowercase().contains(&f)).collect()
+                list.iter().filter(|p| f.is_empty() || super::contains_lowercase(&p.title, &f)).collect()
             }
             _ => Vec::new(),
         }

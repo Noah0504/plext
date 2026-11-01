@@ -59,7 +59,7 @@ pub enum PlayState {
     Paused,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
     pub state: PlayState,
     pub track: Option<Track>,
