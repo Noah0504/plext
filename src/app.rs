@@ -359,7 +359,34 @@ impl App {
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        // Whatever ends the loop (q, a signal, or the terminal going away so
+        // drawing fails), the queue is saved.
+        let result = self.event_loop(terminal);
+        self.queue_saver()();
+        self.player.send(Cmd::Stop);
+        result
+    }
+
+    /// Saves the queue for next time (when it's kept), callable from any
+    /// thread: see `signals::watch_hangup`.
+    pub fn queue_saver(&self) -> impl Fn() + Send + 'static {
+        let (keep, handle, machine_id) = (self.keep_queue, self.player.queue_handle(), self.server.machine_id.clone());
+        move || {
+            if keep {
+                match handle.saved(&machine_id) {
+                    Some(s) => crate::queue::save(&s),
+                    None => crate::queue::forget(),
+                }
+            }
+        }
+    }
+
+    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
+            if let Some(sig) = crate::signals::received() {
+                crate::log::write(&format!("quitting on signal {}", sig));
+                break;
+            }
             while let Ok(m) = self.rx.try_recv() {
                 self.on_msg(m);
             }
@@ -383,13 +410,6 @@ impl App {
                 }
             }
         }
-        if self.keep_queue {
-            match self.player.saved(&self.server.machine_id) {
-                Some(s) => crate::queue::save(&s),
-                None => crate::queue::forget(),
-            }
-        }
-        self.player.send(Cmd::Stop);
         Ok(())
     }
 

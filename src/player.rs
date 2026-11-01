@@ -178,10 +178,25 @@ impl Player {
         QueueView { items: q.items().to_vec(), pos: q.pos(), version: q.version }
     }
 
+    /// A handle for saving the queue from another thread (when the terminal
+    /// goes away, the UI thread may be stuck).
+    pub fn queue_handle(&self) -> QueueHandle {
+        QueueHandle { status: self.status.clone(), queue: self.queue.clone() }
+    }
+}
+
+/// See `Player::queue_handle`.
+#[derive(Clone)]
+pub struct QueueHandle {
+    status: Arc<Mutex<Status>>,
+    queue: Arc<Mutex<Queue>>,
+}
+
+impl QueueHandle {
     /// The queue to save when quitting, with how far into the current track
     /// playback got. None when the queue is empty.
     pub fn saved(&self, machine_id: &str) -> Option<Saved> {
-        let st = self.status();
+        let st = self.status.lock().unwrap().clone();
         let q = self.queue.lock().unwrap();
         let current = q.current()?.track.key.clone();
         let here = matches!(st.state, PlayState::Playing | PlayState::Paused)
@@ -1033,7 +1048,7 @@ mod tests {
         assert!((st.pos - 0.2).abs() < 1e-9);
         assert!(st.output.is_none(), "a waiting queue mustn't hold the DAC");
         // The saved queue round-trips through the player too.
-        let saved = p.saved("machine").unwrap();
+        let saved = p.queue_handle().saved("machine").unwrap();
         assert_eq!(saved.pos, 1);
         assert_eq!(watch(&p, 10, Cmd::TogglePause, |_| {}), ["b", "c"]);
     }

@@ -3,11 +3,18 @@
 //! The decoder reads from a `StreamingFile`, which blocks until the bytes it asks
 //! for have arrived. Keeping the data on disk rather than in memory keeps memory
 //! use flat even for large 24/192 files.
+//!
+//! The files live in ~/.cache/plext/stream (private to the user), not /tmp:
+//! on many systems, Debian 13 and the Raspberry Pi OS built on it among them,
+//! /tmp is in memory, and a hi-res track plus the next one prefetched can fill
+//! it on a small machine. Each file is deleted as soon as it's open, so it
+//! takes no space once Plext is done with it, even after a crash.
 
 use anyhow::Result;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -25,12 +32,28 @@ struct Shared {
     cond: Condvar,
     cancel: AtomicBool,
     total: AtomicU64, // 0 = unknown
-    path: PathBuf,
+    /// For reading, with positioned reads, so any number of readers can
+    /// share it. Its name is already gone from the folder.
+    file: File,
+    /// The file's name, if deleting it straight away failed: deleted then
+    /// when the last reader goes instead.
+    leftover: Option<PathBuf>,
 }
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Some(p) = &self.leftover {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+/// ~/.cache/plext/stream, created private to the user; the system's temp
+/// folder if there is no cache folder.
+fn stream_dir() -> PathBuf {
+    match dirs::cache_dir() {
+        Some(c) => c.join("plext").join("stream"),
+        None => std::env::temp_dir(),
     }
 }
 
@@ -51,26 +74,41 @@ impl Download {
     where
         F: Fn(u64) -> Result<(Box<dyn Read + Send>, Option<u64>)> + Send + 'static,
     {
+        Self::start_in(&stream_dir(), ext, open)
+    }
+
+    /// Like `start`, with the temporary file in `dir`.
+    pub fn start_in<F>(dir: &Path, ext: &str, open: F) -> Result<Download>
+    where
+        F: Fn(u64) -> Result<(Box<dyn Read + Send>, Option<u64>)> + Send + 'static,
+    {
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-        let path = std::env::temp_dir().join(format!(
+        let path = dir.join(format!(
             "plext-{}-{}.{}",
             std::process::id(),
             n,
             if ext.is_empty() { "bin" } else { &ext }
         ));
+        // A new file only (never one that's already there), readable by the
+        // user alone.
         let file = OpenOptions::new()
-            .create(true)
             .write(true)
-            .truncate(true)
+            .create_new(true)
+            .mode(0o600)
             .open(&path)?;
+        let reader = File::open(&path)?;
+        // Both handles keep the data; the name can go now.
+        let leftover = fs::remove_file(&path).err().map(|_| path);
 
         let shared = Arc::new(Shared {
             progress: Mutex::new(Progress::default()),
             cond: Condvar::new(),
             cancel: AtomicBool::new(false),
             total: AtomicU64::new(0),
-            path,
+            file: reader,
+            leftover,
         });
 
         let s = shared.clone();
@@ -92,7 +130,6 @@ impl Download {
     /// A reader over the file that blocks until data is available.
     pub fn reader(&self) -> Result<StreamingFile> {
         Ok(StreamingFile {
-            file: File::open(&self.shared.path)?,
             pos: 0,
             shared: self.shared.clone(),
         })
@@ -179,7 +216,6 @@ where
 
 /// Read + Seek view of a download in progress.
 pub struct StreamingFile {
-    file: File,
     pos: u64,
     shared: Arc<Shared>,
 }
@@ -235,8 +271,7 @@ impl Read for StreamingFile {
             return Ok(0); // end of file
         }
         let n = ((available - self.pos) as usize).min(buf.len());
-        self.file.seek(SeekFrom::Start(self.pos))?;
-        let got = self.file.read(&mut buf[..n])?;
+        let got = self.shared.file.read_at(&mut buf[..n], self.pos)?;
         self.pos += got as u64;
         Ok(got)
     }
@@ -271,5 +306,40 @@ impl symphonia::core::io::MediaSource for StreamingFile {
 
     fn byte_len(&self) -> Option<u64> {
         self.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn streams_through_a_private_file_that_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("plext-stream-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+        let body = data.clone();
+        let dl = Download::start_in(&dir, "flac", move |off| {
+            let rest = body[off as usize..].to_vec();
+            Ok((Box::new(io::Cursor::new(rest)) as Box<dyn Read + Send>, Some(body.len() as u64)))
+        })
+        .unwrap();
+        // The folder is the user's alone, and the file's name is gone at once.
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        // Two readers at once (the decoder, and a seek elsewhere) each see it all.
+        let (mut a, mut b) = (dl.reader().unwrap(), dl.reader().unwrap());
+        b.seek(SeekFrom::Start(500_000)).unwrap();
+        let mut tail = Vec::new();
+        b.read_to_end(&mut tail).unwrap();
+        let mut all = Vec::new();
+        a.read_to_end(&mut all).unwrap();
+        assert!(all == data, "read back {} of {} bytes", all.len(), data.len());
+        assert!(tail[..] == data[500_000..]);
+        assert!(dl.is_complete());
+        drop((a, b, dl));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -15,6 +15,7 @@ mod plex;
 mod pulse;
 mod queue;
 mod report;
+mod signals;
 mod termbg;
 mod theme;
 mod volume;
@@ -225,6 +226,7 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
         library_title: library.title.clone(),
     };
 
+    signals::install();
     let mut terminal = ratatui::init();
     let mut app = app::App::new(
         server,
@@ -238,7 +240,14 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
     );
     app.use_theme(cfg.theme_settings());
     app.restore_queue();
+    signals::watch_hangup(app.queue_saver());
     let result = app.run(&mut terminal);
+    if signals::hung_up() {
+        // The terminal is gone: there's nothing to restore and nowhere to
+        // report a drawing error (printing to it would fail, and abort).
+        let _ = ratatui::try_restore();
+        return Ok(());
+    }
     ratatui::restore();
     result
 }
