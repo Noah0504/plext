@@ -1,9 +1,17 @@
 # Changelog
 
-## Unreleased
+## 1.0.0
+
+Plext 1.0: search, volume control in desktop-sound mode, color themes, Raspberry Pi builds, and a
+round of fixes that make it safer, lighter and more robust. From here on, settings and commands
+stay compatible between versions.
 
 ### New
 
+- **Raspberry Pi builds.** Releases now include `plext-aarch64-linux.tar.gz` for the Pi 3, 4, 5
+  and Zero 2 W on a 64-bit OS, and `plext-armv6-linux.tar.gz` for every Pi on a 32-bit OS, down
+  to the Pi 1 and Zero. The README's new Raspberry Pi section covers which to pick, running Plext
+  over SSH in tmux, and why bit-perfect on a Pi needs a USB or I2S DAC.
 - **Search.** Press `f` anywhere and type to search your library for artists, albums and tracks
   (Plex's own search, so tracks turn up by their artist or album too). Results come as you pause.
   Play an album, or a track's album from that track, with `Enter`; queue with `a` / `A`; add to a
@@ -22,12 +30,65 @@
   `theme_background = false`, and a `[colors]` table changes single colors.
 - `plext inspect search <words>` shows what your server's search returns, for troubleshooting.
   `plext inspect` now also takes an artist name without quotes (`plext inspect Cat Power`).
+- **`plext device` shows what each device can play**: its widest sample size and highest sample
+  rate, "in use by another program", or that it can't play bit-perfect at all (the HDMI audio
+  on a Raspberry Pi takes no plain PCM). Setup's device list shows the same, and when no device
+  is set, Plext's automatic choice skips the ones that can't play bit-perfect.
 
 ### Changed
 
+- **Lighter and snappier.** Plext used to redraw the whole screen ten times a second, idle or
+  not. It now draws only when something on screen changes, and only builds the rows of long
+  lists that can be on screen. Idle, it uses almost no CPU; with thousands of artists, each
+  redraw takes about half the time.
+- **Tracks start faster.** Downloads share one connection to your server instead of opening a
+  new one (and an encrypted handshake) for every track.
+- **A track your DAC can't play is skipped** (say, 96 kHz on a DAC that tops out at 48 kHz), with
+  a message naming it, instead of stopping the whole queue.
+- **Streaming files moved out of `/tmp`.** Tracks stream into `~/.cache/plext/stream`, private to
+  you, and each file is deleted as soon as it's open, so it takes no space once Plext is done
+  with it, even after a crash. On many systems `/tmp` is in memory, where a high-res track and
+  the next one could fill it on a small machine.
+- **Stations and mixes** keep the last 200 tracks played in the queue rather than growing it for
+  as long as they run.
 - The `plext inspect` commands now all start the same way: they say they only read from your
   server, and where to report a problem (the output of `plext inspect mixes` used to ask you to
   paste it into a chat, a leftover from testing).
+
+### Fixed
+
+- **Closing the terminal while Plext was running left it running in the background at full CPU,
+  forever, without saving the queue.** It now saves the queue and quits. This includes an SSH
+  connection dropping. `kill` also quits cleanly now, saving the queue and restoring the
+  terminal.
+- Saving settings could leave `config.toml` readable by other users for a moment, and a crash
+  part way through could lose your sign-in. It's now written privately and swapped in whole.
+
+### Security
+
+- **Your Plex sign-in token goes only to your server.** Plext used to check that the saved
+  server address still worked by sending it the token. If that address was a plain `http://`
+  one on your home network and your computer was on another network, whatever answered there
+  got the token. Plext now asks the server who it is first (which needs no token) and only
+  carries on if it's yours. Encrypted addresses are always tried before plain http.
+- Plext refuses redirects from the server, which could otherwise carry the token to another
+  site, and refuses server-supplied paths that would point to another host.
+- Album covers larger than any real cover (over 4096×4096 pixels or 64 MB) are refused before
+  they're decoded.
+- Names and text from the server printed by `plext status`, `plext login` and `plext inspect`
+  can no longer carry terminal escape sequences (the player screen already filtered them).
+
+### Upgrading from 0.6
+
+Download the new release and install it the same way; your settings and saved queue are kept.
+Nothing to change: settings and commands are the same as in 0.6. Stream files from earlier
+versions may be left in `/tmp` as `plext-*` files; they're safe to delete (a reboot usually clears
+them anyway).
+
+### Known limitations
+
+- DSD isn't supported yet.
+- The Raspberry Pi builds are tested in emulation; reports from real Pis are welcome.
 
 ## 0.6.0
 

@@ -2,9 +2,10 @@
 
 A terminal music player for Plex with bit-perfect playback straight to your DAC.
 Browse your artists, albums and playlists, build a queue, start stations and mixes, and stream
-lossless and high-res audio untouched, all from a single static binary for Linux.
+lossless and high-res audio untouched, all from a single static binary for Linux, on a PC or a
+Raspberry Pi.
 
-![Plext playing a live album, 16-bit/44.1 kHz FLAC, bit-perfect through a USB DAC, with the album cover as pixel art beside the track and the next two tracks up next](docs/screenshot.png)
+![Plext playing Iron & Wine's The Creek Drank the Cradle, 16-bit/44.1 kHz FLAC, bit-perfect through a Schiit Modi+ USB DAC, with the artist list on the left, the album's tracks and ratings on the right, the album cover as pixel art beside the track and the next two tracks up next](docs/screenshot.png)
 
 ## Features
 
@@ -44,7 +45,7 @@ lossless and high-res audio untouched, all from a single static binary for Linux
 
 ## Requirements
 
-- Linux on x86_64 (any distribution; the binary has no dependencies)
+- Linux on x86_64, or a Raspberry Pi (any distribution; the binary has no dependencies)
 - A Plex Media Server with a music library, and a Plex account
 - For bit-perfect playback, a USB DAC or other sound card that Plext can access directly.
   For desktop sound, PipeWire (with pipewire-pulse, the default on current distributions) or
@@ -54,7 +55,15 @@ lossless and high-res audio untouched, all from a single static binary for Linux
 
 ## Install
 
-Download `plext-x86_64-linux.tar.gz` from the [Releases](../../releases) page, then:
+Download the file for your computer from the [Releases](../../releases) page:
+
+| Computer | `uname -m` says | Download |
+|---|---|---|
+| A PC (Intel or AMD) | `x86_64` | `plext-x86_64-linux.tar.gz` |
+| Raspberry Pi 3, 4, 5 or Zero 2 W on a 64-bit OS | `aarch64` | `plext-aarch64-linux.tar.gz` |
+| Any Raspberry Pi on a 32-bit OS, including the Pi 1, Zero and Zero W | `armv6l` or `armv7l` | `plext-armv6-linux.tar.gz` |
+
+Then, with your file's name:
 
 ```sh
 tar xzf plext-x86_64-linux.tar.gz
@@ -63,6 +72,29 @@ sudo install plext /usr/local/bin/
 
 To upgrade, download the new release and run the same two commands; your settings are kept.
 [CHANGELOG.md](CHANGELOG.md) lists what's new in each release.
+
+## Raspberry Pi
+
+A Pi with a USB DAC makes a good dedicated player: Plext runs on the Pi and the music plays
+through its DAC, and you control it from any computer over SSH.
+
+- **Run it inside tmux or screen**, so it keeps playing when you disconnect. Over SSH on the
+  Pi, `tmux new -A -s plext plext` starts Plext, or reattaches to it if it's already running.
+  If the connection drops without tmux, Plext saves the queue and quits, and picks up where you
+  left off next time.
+- **Bit-perfect needs a USB DAC or an I2S DAC HAT.** The Pi's HDMI audio doesn't take plain PCM
+  samples, so it can't play bit-perfect, and the Pi 4's headphone jack is 16-bit only (the Pi 5
+  has none). `plext device` shows what each output can play and marks the ones that can't.
+- **Desktop sound** works on Raspberry Pi OS with a desktop (it uses PipeWire).
+- Media keys and desktop media controls aren't available over SSH; Plext carries on without
+  them.
+- Tracks stream to `~/.cache/plext/stream` while they play (a 24/192 track is around 300 MB) and
+  take no space once Plext is done with them. On a Pi 1 or the original Zero, high-res files may
+  be too much for the single slow core.
+
+The Pi builds are tested in emulation of each build's oldest supported chip (Cortex-A53 for
+64-bit, ARM1176 for 32-bit). If you run Plext on a Pi, an
+[issue](https://github.com/Noah0504/plext/issues) saying how it went is welcome.
 
 ## Getting started
 
@@ -90,12 +122,13 @@ Then it asks which device or output to use. Change either later:
 plext output                       # ask again
 plext output system                # switch to desktop sound
 plext output bitperfect            # switch to bit-perfect
-plext device                       # list the devices for the current mode
+plext device                       # list the devices for the current mode, and what each can play
 plext device hw:CARD=DAC,DEV=0     # bit-perfect: choose your DAC
 plext device default               # desktop sound: follow the desktop's default output
 ```
 
-In bit-perfect mode, if no device is set, Plext picks the first USB audio device it finds. In
+In bit-perfect mode, if no device is set, Plext picks the first USB audio device it finds that
+can play bit-perfect. In
 desktop-sound mode it follows your desktop's default output unless you pick one, so it moves to
 your headphones when the desktop does. You can also move Plext to another output from your
 sound settings while it plays.
@@ -178,9 +211,10 @@ puts the original order back. With shuffle on, playing an album starts with the 
 and shuffles the rest. **Repeat** (`r`) cycles through off, the whole queue, and the current
 track. Both show at the top right of the now-playing bar, and in your desktop's media controls.
 
-When you quit, the queue is saved to `~/.local/state/plext/queue.json`. Next time Plext starts
-with it paused at the same track and position; press `Space` to carry on. (A queue saved from a
-different Plex server is ignored.)
+When you quit, or close the terminal, the queue is saved to `~/.local/state/plext/queue.json`.
+Next time Plext starts with it paused at the same track and position; press `Space` to carry on.
+(A queue saved from a different Plex server is ignored.) While a station or mix plays, the queue
+keeps the last 200 tracks played.
 
 ## Playlists
 
@@ -441,7 +475,8 @@ server in its own sample rate and bit depth, and the server takes it from there.
 - **Volume** stays at full digital scale; use your DAC's or amplifier's volume control.
 - **Narrower DAC containers.** 16-bit sources sent to a 32-bit-only DAC are padded with zero bits,
   which preserves every original bit. If a DAC can't accept a source's bit depth or sample rate
-  natively, Plext tells you rather than converting silently.
+  natively, Plext tells you and skips to the next track rather than converting silently.
+  `plext device` shows each device's widest sample size and highest sample rate.
 - **Lossy files** (MP3, AAC, Vorbis) play normally but are never shown as bit-perfect.
 - **DSD** isn't supported yet.
 
@@ -464,6 +499,8 @@ their output: it shows names from your library, but never your sign-in token.
   connections Plext recovered from.
 - **Can't reach the server.** Plext tries the server's other addresses automatically. If your
   server moved or your sign-in expired, run `plext login` again.
+- **"Can't play bit-perfect" next to a device.** That output doesn't take plain PCM samples, as
+  with the HDMI audio on a Raspberry Pi. Use a USB or I2S DAC, or `plext output system`.
 - **Media keys don't do anything.** Check that Plext is registered with `playerctl -l` (it lists
   `plext`). If another player also runs, your desktop may send the keys to that one instead.
 - **A mix won't start.** Track radio, artist mixes and sonic adventures need Plex Pass and sonic

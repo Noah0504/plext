@@ -1,6 +1,6 @@
 [package]
 name = "plext"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2021"
 description = "A terminal music player for Plex with bit-perfect playback straight to your DAC"
 license = "MIT"
