@@ -468,7 +468,13 @@ fn setup_output(cfg: &mut Config) -> Result<()> {
                      (not bit-perfect). Connect your DAC and run `plext device` to choose it."
                 );
             } else {
-                let names: Vec<String> = devices.iter().map(|d| format!("{:<26} {}", d.name, d.desc)).collect();
+                let names: Vec<String> = devices
+                    .iter()
+                    .map(|d| {
+                        let fit = output::probe(&d.name).describe();
+                        format!("{:<26} {}{}", d.name, d.desc, if fit.is_empty() { String::new() } else { format!("  ({})", fit) })
+                    })
+                    .collect();
                 let default = cfg
                     .device
                     .as_deref()
@@ -519,6 +525,13 @@ fn device_cmd(cfg: &mut Config, mode_override: Option<OutputMode>, name: Option<
         cfg.device = Some(n.clone());
         cfg.save()?;
         println!("Output device set to {}", n);
+        if output::probe(&n) == output::Fitness::NoPcm {
+            println!(
+                "Note: {} takes no plain PCM, so Plext can't play to it bit-perfect (HDMI on a \
+                 Raspberry Pi is like this). Use a USB or I2S DAC, or `plext output system`.",
+                n
+            );
+        }
         return Ok(());
     }
     let devices = output::list_devices();
@@ -526,10 +539,14 @@ fn device_cmd(cfg: &mut Config, mode_override: Option<OutputMode>, name: Option<
         println!("No ALSA hardware playback devices found.");
         return Ok(());
     }
-    println!("Hardware output devices (bit-perfect capable):\n");
+    println!("Hardware output devices:\n");
     for d in &devices {
         let mark = if cfg.device.as_deref() == Some(d.name.as_str()) { "*" } else { " " };
+        let fit = output::probe(&d.name).describe();
         println!(" {} {:<28} {}", mark, shown(&d.name), shown(&d.desc));
+        if !fit.is_empty() {
+            println!("   {:<28} {}", "", fit);
+        }
     }
     match &cfg.device {
         Some(d) => println!("\nCurrent: {}", d),
