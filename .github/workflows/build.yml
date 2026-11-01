@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Publishing a release on GitHub builds the binary and attaches it to the release.
+  # Publishing a release on GitHub builds the binaries and attaches them to the release.
   release:
     types: [published]
   workflow_dispatch:
@@ -89,3 +89,138 @@ jobs:
           files: |
             plext-x86_64-linux.tar.gz
             plext-x86_64-linux.tar.gz.sha256
+
+  # Arm (Raspberry Pi), cross-compiled with a musl cross toolchain and tested
+  # under QEMU emulating the oldest CPU each build supports, so an
+  # instruction those CPUs lack fails the tests here rather than on a Pi:
+  #   aarch64: Pi 3, 4, 5 and Zero 2 W on a 64-bit OS (Cortex-A53)
+  #   armv6:   every Pi on a 32-bit OS, down to the Pi 1 and Zero (ARM1176).
+  #            No separate armv7 build: armv6 runs on the Pi 2 and newer too.
+  linux-arm:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64
+            target: aarch64-unknown-linux-musl
+            image: aarch64-musl
+            qemu: qemu-aarch64
+            qemu_cpu: cortex-a53
+            cflags: "-march=armv8-a"
+            rustflags: ""
+          - name: armv6
+            target: arm-unknown-linux-musleabihf
+            image: arm-musleabihf
+            qemu: qemu-arm
+            qemu_cpu: arm1176
+            # Rust's arm-unknown-linux-musleabihf baseline: ARMv6 with VFPv2.
+            cflags: "-march=armv6kz -mfpu=vfp -mfloat-abi=hard -marm"
+            # alsa-lib's atomics can become libgcc calls on 32-bit Arm, and
+            # Rust doesn't link libgcc on its own.
+            rustflags: "-C link-arg=-lgcc"
+    runs-on: ubuntu-latest
+    container: ghcr.io/rust-cross/rust-musl-cross:${{ matrix.image }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      RUSTFLAGS: "-C target-feature=+crt-static ${{ matrix.rustflags }}"
+      PKG_CONFIG_ALL_STATIC: "1"
+      PKG_CONFIG_ALLOW_CROSS: "1"
+    steps:
+      - name: Install build and test tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            curl ca-certificates bzip2 file pkg-config qemu-user ffmpeg alsa-utils git
+
+      - uses: actions/checkout@v4
+
+      - name: Find the cross compiler
+        shell: bash
+        run: |
+          cc=$(command -v ${{ matrix.target }}-gcc || ls /usr/local/musl/bin/*-gcc 2>/dev/null | head -1)
+          [ -n "$cc" ] || { echo "no cross gcc found"; ls /usr/local/musl/bin || true; exit 1; }
+          echo "CROSS_CC=$cc" >> "$GITHUB_ENV"
+          "$cc" --version | head -1
+          # The CPU the toolchain targets by default (must be armv6 for the Pi 1/Zero build).
+          "$cc" -Q --help=target 2>/dev/null | grep -E '^\s+-m(arch|cpu|fpu|float-abi)=' || true
+          rustc --version
+          rustup target add ${{ matrix.target }} || true
+          t=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${t}_RUNNER=${{ matrix.qemu }} -cpu ${{ matrix.qemu_cpu }}" >> "$GITHUB_ENV"
+          # The image points pkg-config at its own sysroot; look for the
+          # alsa-lib built below instead.
+          u=$(echo "${{ matrix.target }}" | tr '-' '_')
+          for v in "${{ matrix.target }}" "$u"; do
+            echo "PKG_CONFIG_PATH_${v}=/opt/alsa/lib/pkgconfig" >> "$GITHUB_ENV"
+            echo "PKG_CONFIG_LIBDIR_${v}=/opt/alsa/lib/pkgconfig" >> "$GITHUB_ENV"
+            echo "PKG_CONFIG_SYSROOT_DIR_${v}=/" >> "$GITHUB_ENV"
+          done
+
+      - name: Build static alsa-lib ${{ env.ALSA_VERSION }}
+        shell: bash
+        run: |
+          curl -fsSL "https://www.alsa-project.org/files/pub/lib/alsa-lib-${ALSA_VERSION}.tar.bz2" | tar xj -C /tmp
+          cd /tmp/alsa-lib-${ALSA_VERSION}
+          # Installed into /opt/alsa, but looking for its configuration where
+          # Raspberry Pi OS (and every other distro) keeps it.
+          ./configure --host=${{ matrix.target }} CC="$CROSS_CC" CFLAGS="-O2 ${{ matrix.cflags }}" \
+            --prefix=/opt/alsa --sysconfdir=/etc --with-configdir=/usr/share/alsa \
+            --enable-static --disable-shared --disable-python --disable-topology \
+            --disable-ucm --disable-aload --without-debug
+          make -j"$(nproc)"
+          make install
+
+      - name: Test (under QEMU, ${{ matrix.qemu_cpu }})
+        shell: bash
+        run: |
+          set -o pipefail
+          # Build first, so the time limit below is for running the tests.
+          cargo test --release --locked --no-run
+          # A test that hangs under emulation would otherwise run for hours;
+          # the log then names it ("has been running for over 60 seconds").
+          # Written to a file, not piped: a hung test left behind by the
+          # time limit would hold a pipe open forever.
+          rc=0
+          timeout -k 10 900 cargo test --release --locked > test.log 2>&1 || rc=$?
+          cat test.log
+          if [ "$rc" != 0 ]; then
+            pkill -9 -f "qemu-" || true
+            msg=$(grep -vE '^\s+(Compiling|Downloaded|Downloading) ' test.log | tail -60 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
+            echo "::error title=cargo test failed (${{ matrix.name }})::${msg}"
+            exit 1
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --locked
+          bin=target/${{ matrix.target }}/release/plext
+          file "$bin"
+          if file "$bin" | grep -q "dynamically linked"; then
+            echo "binary is not static"; exit 1
+          fi
+          ${{ matrix.qemu }} -cpu ${{ matrix.qemu_cpu }} "$bin" --version
+          ls -l "$bin"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/plext dist/
+          cp README.md LICENSE THIRD-PARTY-LICENSES.md dist/
+          tar -C dist -czf plext-${{ matrix.name }}-linux.tar.gz plext README.md LICENSE THIRD-PARTY-LICENSES.md
+          sha256sum plext-${{ matrix.name }}-linux.tar.gz > plext-${{ matrix.name }}-linux.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plext-${{ matrix.name }}-linux
+          path: |
+            plext-${{ matrix.name }}-linux.tar.gz
+            plext-${{ matrix.name }}-linux.tar.gz.sha256
+
+      - name: Publish release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            plext-${{ matrix.name }}-linux.tar.gz
+            plext-${{ matrix.name }}-linux.tar.gz.sha256
