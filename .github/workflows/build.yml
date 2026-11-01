@@ -25,7 +25,7 @@ jobs:
       - name: Install build tools
         run: apk add --no-cache build-base musl-dev pkgconf linux-headers curl tar bzip2 file ffmpeg git bash
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Alpine doesn't ship a static libasound, so build one.
       - name: Build static alsa-lib ${{ env.ALSA_VERSION }}
@@ -75,7 +75,7 @@ jobs:
           tar -C dist -czf plext-x86_64-linux.tar.gz plext README.md LICENSE THIRD-PARTY-LICENSES.md
           sha256sum plext-x86_64-linux.tar.gz > plext-x86_64-linux.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: plext-x86_64-linux
           path: |
@@ -84,7 +84,7 @@ jobs:
 
       - name: Publish release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             plext-x86_64-linux.tar.gz
@@ -132,7 +132,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             curl ca-certificates bzip2 file pkg-config qemu-user ffmpeg alsa-utils git
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Find the cross compiler
         shell: bash
@@ -210,7 +210,7 @@ jobs:
           tar -C dist -czf plext-${{ matrix.name }}-linux.tar.gz plext README.md LICENSE THIRD-PARTY-LICENSES.md
           sha256sum plext-${{ matrix.name }}-linux.tar.gz > plext-${{ matrix.name }}-linux.tar.gz.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: plext-${{ matrix.name }}-linux
           path: |
@@ -219,7 +219,7 @@ jobs:
 
       - name: Publish release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             plext-${{ matrix.name }}-linux.tar.gz
