@@ -30,6 +30,9 @@ pub enum Cmd {
     Jump(u64),
     /// Drop everything after the current track.
     ClearUpcoming,
+    /// Keep only this many of the tracks already played (a long-running
+    /// station would otherwise grow the queue without end).
+    ForgetPlayed(usize),
     ToggleShuffle,
     SetShuffle(bool),
     CycleRepeat,
@@ -816,6 +819,7 @@ fn is_edit(cmd: &Cmd) -> bool {
             | Cmd::Remove(_)
             | Cmd::Move { .. }
             | Cmd::ClearUpcoming
+            | Cmd::ForgetPlayed(_)
             | Cmd::ToggleShuffle
             | Cmd::SetShuffle(_)
             | Cmd::CycleRepeat
@@ -840,6 +844,9 @@ fn apply_edit(queue: &Arc<Mutex<Queue>>, cmd: Cmd) -> bool {
         Cmd::Remove(id) => return q.remove(id),
         Cmd::Move { id, by } => q.move_by(id, by),
         Cmd::ClearUpcoming => q.clear_upcoming(),
+        Cmd::ForgetPlayed(keep) => {
+            q.forget_played(keep);
+        }
         Cmd::ToggleShuffle => {
             let on = !q.shuffle();
             q.set_shuffle(on);

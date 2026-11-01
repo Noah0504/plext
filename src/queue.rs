@@ -125,6 +125,21 @@ impl Queue {
         self.changed();
     }
 
+    /// Forgets all but the last `keep` tracks already played (those before
+    /// the current one), so an endless station doesn't grow the queue, and
+    /// everything that copies or saves it, forever. Returns how many went.
+    pub fn forget_played(&mut self, keep: usize) -> usize {
+        let extra = self.pos.saturating_sub(keep);
+        if extra == 0 {
+            return 0;
+        }
+        let gone: std::collections::HashSet<u64> = self.items.drain(..extra).map(|e| e.id).collect();
+        self.pos -= extra;
+        self.unshuffled.retain(|id| !gone.contains(id));
+        self.changed();
+        extra
+    }
+
     /// Adds tracks to the end. Returns how many were added.
     pub fn append(&mut self, tracks: Vec<Track>) -> usize {
         let new = self.entries(tracks);
@@ -631,6 +646,26 @@ mod tests {
         assert_eq!(q.items()[1].track.key, "x");
         q.set_shuffle(false);
         assert_eq!(keys(&q), "a x b c d");
+    }
+
+    #[test]
+    fn a_long_running_station_forgets_old_played_tracks() {
+        let mut q = Queue::new();
+        q.replace(tracks("a b c d e f"), 0);
+        for _ in 0..4 {
+            q.next();
+        }
+        assert_eq!(q.current().unwrap().track.key, "e");
+        assert_eq!(q.forget_played(2), 2, "keeps c and d, the last two played");
+        assert_eq!(keys(&q), "c d e f");
+        assert_eq!(q.current().unwrap().track.key, "e", "still playing the same track");
+        assert_eq!(q.forget_played(2), 0, "nothing more to forget");
+        // Shuffled: the order to go back to loses them too.
+        q.set_shuffle(true);
+        q.forget_played(0);
+        assert_eq!(q.items()[0].track.key, "e");
+        q.set_shuffle(false);
+        assert_eq!(keys(&q), "e f");
     }
 
     #[test]

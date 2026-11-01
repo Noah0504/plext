@@ -58,6 +58,10 @@ const TOP_UP_AT: usize = 3;
 /// Give up after this many top-ups in a row that find nothing new.
 const MAX_DRY: u32 = 3;
 
+/// Tracks already played that a running station keeps in the queue (to go
+/// back to, or see what played); older ones are let go.
+pub(super) const KEEP_PLAYED: usize = 200;
+
 impl App {
     // ---------- loading ----------
 
@@ -520,6 +524,7 @@ impl App {
             self.say(format!("Playing {}: it keeps going until you play something else", title));
         } else {
             self.player.send(Cmd::Append(fresh));
+            self.player.send(Cmd::ForgetPlayed(KEEP_PLAYED));
         }
     }
 
