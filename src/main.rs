@@ -15,6 +15,7 @@ mod plex;
 mod pulse;
 mod queue;
 mod report;
+mod signals;
 mod termbg;
 mod theme;
 mod volume;
@@ -74,7 +75,7 @@ enum Command {
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("plext: {:#}", e);
+        eprintln!("plext: {}", shown(format!("{:#}", e)));
         std::process::exit(1);
     }
 }
@@ -109,11 +110,11 @@ fn real_main() -> Result<()> {
         Some(Command::Status) => {
             println!("Config file: {}", config::path()?.display());
             match &cfg.server {
-                Some(s) => println!("Server:      {} ({})", s.name, s.url),
+                Some(s) => println!("Server:      {} ({})", shown(&s.name), shown(&s.url)),
                 None => println!("Server:      not set — run `plext login`"),
             }
             match &cfg.library {
-                Some(l) => println!("Library:     {}", l.title),
+                Some(l) => println!("Library:     {}", shown(&l.title)),
                 None => println!("Library:     not set"),
             }
             if let Some(p) = log::path() {
@@ -225,6 +226,7 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
         library_title: library.title.clone(),
     };
 
+    signals::install();
     let mut terminal = ratatui::init();
     let mut app = app::App::new(
         server,
@@ -238,7 +240,14 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
     );
     app.use_theme(cfg.theme_settings());
     app.restore_queue();
+    signals::watch_hangup(app.queue_saver());
     let result = app.run(&mut terminal);
+    if signals::hung_up() {
+        // The terminal is gone: there's nothing to restore and nowhere to
+        // report a drawing error (printing to it would fail, and abort).
+        let _ = ratatui::try_restore();
+        return Ok(());
+    }
     ratatui::restore();
     result
 }
@@ -252,7 +261,7 @@ fn connect(plex_client: &Plex, cfg: &mut Config) -> Result<ServerConfig> {
     if plex_client.verify(&server.url, &server.machine_id).is_ok() {
         return Ok(server);
     }
-    print!("Reconnecting to {}… ", server.name);
+    print!("Reconnecting to {}… ", shown(&server.name));
     io::stdout().flush().ok();
     let token = cfg.account_token.clone().context("not signed in; run `plext login`")?;
     let resources = plex_client.servers(&token)?;
@@ -279,8 +288,8 @@ fn inspect_mixes(cfg: &mut Config) -> Result<()> {
     let server_cfg = connect(&plex_client, cfg)?;
     let library = cfg.library.clone().context("no library chosen; run `plext login`")?;
     let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token, &server_cfg.machine_id);
-    eprintln!("Asking {} about mixes and stations (this can take a few seconds)…\n", server_cfg.name);
-    print!("{}", inspect_mixes::report(&server, &library.key));
+    eprintln!("Asking {} about mixes and stations (this can take a few seconds)…\n", shown(&server_cfg.name));
+    print!("{}", shown(inspect_mixes::report(&server, &library.key)));
     Ok(())
 }
 
@@ -317,8 +326,8 @@ fn inspect_search(cfg: &mut Config, query: &str) -> Result<()> {
     let server_cfg = connect(&plex_client, cfg)?;
     let library = cfg.library.clone().context("no library chosen; run `plext login`")?;
     let server = Server::new(plex_client, &server_cfg.url, &server_cfg.token, &server_cfg.machine_id);
-    eprintln!("Searching {} for \"{}\"…\n", library.title, query);
-    print!("{}", inspect_search::report(&server, &library.key, query));
+    eprintln!("Searching {} for \"{}\"…\n", shown(&library.title), shown(query));
+    print!("{}", shown(inspect_search::report(&server, &library.key, query)));
     Ok(())
 }
 
@@ -334,19 +343,19 @@ fn inspect(cfg: &mut Config, name: &str) -> Result<()> {
         .find(|a| a.title.to_lowercase() == wanted)
         .or_else(|| artists.iter().find(|a| a.title.to_lowercase().contains(&wanted)))
         .with_context(|| format!("no artist matching \"{}\"", name))?;
-    print!("{}", inspect::header(&format!("releases check for \"{}\"", artist.title)));
-    println!("{} (ratingKey {})\n", artist.title, artist.key);
+    print!("{}", inspect::header(&format!("releases check for \"{}\"", shown(&artist.title))));
+    println!("{} (ratingKey {})\n", shown(&artist.title), shown(&artist.key));
     let albums = server.albums(&library.key, &artist.key)?;
     let raw = server.album_details_raw(&library.key, &artist.key)?;
     for al in &albums {
-        println!("{} ({})  → shown as: {}", al.title, al.year.map(|y| y.to_string()).unwrap_or_default(),
+        println!("{} ({})  → shown as: {}", shown(&al.title), al.year.map(|y| y.to_string()).unwrap_or_default(),
             al.kind.label().unwrap_or("Album"));
         if let Some(m) = raw.iter().find(|m| m["ratingKey"].as_str() == Some(al.key.as_str())) {
             if let Some(obj) = m.as_object() {
                 for (k, v) in obj {
                     let kl = k.to_lowercase();
                     if kl.contains("format") || kl.contains("type") || kl.contains("release") || kl == "subtype" {
-                        println!("    {}: {}", k, v);
+                        println!("    {}: {}", shown(k), shown(v));
                     }
                 }
             }
@@ -392,12 +401,12 @@ fn login(cfg: &mut Config) -> Result<()> {
             .collect::<Vec<_>>(),
     )?;
     let res = &servers[idx];
-    print!("Connecting to {}… ", res.name);
+    print!("Connecting to {}… ", shown(&res.name));
     io::stdout().flush().ok();
     let url = plex_client
         .find_working_url(res)
         .with_context(|| format!("couldn't reach \"{}\" on any of its addresses", res.name))?;
-    println!("ok ({})", url);
+    println!("ok ({})", shown(&url));
     cfg.server = Some(ServerConfig {
         name: res.name.clone(),
         machine_id: res.machine_id.clone(),
@@ -459,7 +468,13 @@ fn setup_output(cfg: &mut Config) -> Result<()> {
                      (not bit-perfect). Connect your DAC and run `plext device` to choose it."
                 );
             } else {
-                let names: Vec<String> = devices.iter().map(|d| format!("{:<26} {}", d.name, d.desc)).collect();
+                let names: Vec<String> = devices
+                    .iter()
+                    .map(|d| {
+                        let fit = output::probe(&d.name).describe();
+                        format!("{:<26} {}{}", d.name, d.desc, if fit.is_empty() { String::new() } else { format!("  ({})", fit) })
+                    })
+                    .collect();
                 let default = cfg
                     .device
                     .as_deref()
@@ -510,6 +525,13 @@ fn device_cmd(cfg: &mut Config, mode_override: Option<OutputMode>, name: Option<
         cfg.device = Some(n.clone());
         cfg.save()?;
         println!("Output device set to {}", n);
+        if output::probe(&n) == output::Fitness::NoPcm {
+            println!(
+                "Note: {} takes no plain PCM, so Plext can't play to it bit-perfect (HDMI on a \
+                 Raspberry Pi is like this). Use a USB or I2S DAC, or `plext output system`.",
+                n
+            );
+        }
         return Ok(());
     }
     let devices = output::list_devices();
@@ -517,10 +539,14 @@ fn device_cmd(cfg: &mut Config, mode_override: Option<OutputMode>, name: Option<
         println!("No ALSA hardware playback devices found.");
         return Ok(());
     }
-    println!("Hardware output devices (bit-perfect capable):\n");
+    println!("Hardware output devices:\n");
     for d in &devices {
         let mark = if cfg.device.as_deref() == Some(d.name.as_str()) { "*" } else { " " };
-        println!(" {} {:<28} {}", mark, d.name, d.desc);
+        let fit = output::probe(&d.name).describe();
+        println!(" {} {:<28} {}", mark, shown(&d.name), shown(&d.desc));
+        if !fit.is_empty() {
+            println!("   {:<28} {}", "", fit);
+        }
     }
     match &cfg.device {
         Some(d) => println!("\nCurrent: {}", d),
@@ -559,7 +585,7 @@ fn sink_cmd(cfg: &mut Config, name: Option<String>) -> Result<()> {
     for k in &s.sinks {
         let mark = if cfg.sink.as_deref() == Some(k.name.as_str()) { "*" } else { " " };
         let default = if s.default_sink.as_deref() == Some(k.name.as_str()) { "  (desktop default)" } else { "" };
-        println!(" {} {}{}\n     {}", mark, k.desc, default, k.name);
+        println!(" {} {}{}\n     {}", mark, shown(&k.desc), default, shown(&k.name));
     }
     match &cfg.sink {
         Some(k) => println!("\nCurrent: {}", k),
@@ -568,6 +594,13 @@ fn sink_cmd(cfg: &mut Config, name: Option<String>) -> Result<()> {
     println!("Choose one with:  plext device <name>   (or `plext device default` to follow the desktop)");
     println!("For bit-perfect playback straight to a DAC:  plext output bitperfect");
     Ok(())
+}
+
+/// Text from the server (or a device) made safe to print: control
+/// characters are dropped, newlines and tabs kept, so a name can't carry
+/// escape sequences that re-title the terminal, hide text or worse.
+fn shown(text: impl std::fmt::Display) -> String {
+    text.to_string().chars().filter(|&c| !c.is_control() || c == '\n' || c == '\t').collect()
 }
 
 fn choose(prompt: &str, options: &[String]) -> Result<usize> {
@@ -581,13 +614,13 @@ fn choose_default(prompt: &str, options: &[String], default: usize) -> Result<us
 
 fn choose_inner(prompt: &str, options: &[String], default: Option<usize>) -> Result<usize> {
     if options.len() == 1 {
-        println!("{} {}", prompt, options[0]);
+        println!("{} {}", prompt, shown(&options[0]));
         return Ok(0);
     }
     println!("{}", prompt);
     for (i, o) in options.iter().enumerate() {
         let mark = if default == Some(i) { "*" } else { " " };
-        println!(" {}{}) {}", mark, i + 1, o);
+        println!(" {}{}) {}", mark, i + 1, shown(o));
     }
     loop {
         match default {
@@ -607,5 +640,16 @@ fn choose_inner(prompt: &str, options: &[String], default: Option<usize>) -> Res
                 return Ok(n - 1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shown_tests {
+    #[test]
+    fn printing_server_text_drops_escape_sequences() {
+        assert_eq!(super::shown("Daft Punk\x1b]0;owned\x07 — Discovery"), "Daft Punk]0;owned — Discovery");
+        assert_eq!(super::shown("a\u{9b}31mb"), "a31mb", "8-bit control introducer too");
+        assert_eq!(super::shown("line one\n\tline two"), "line one\n\tline two");
+        assert_eq!(super::shown("Sigur Rós"), "Sigur Rós");
     }
 }

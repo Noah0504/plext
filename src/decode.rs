@@ -16,7 +16,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::core::units::{Time, TimeBase};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceInfo {
     pub codec: String,
     pub lossless: bool,

@@ -98,6 +98,19 @@ impl SampleFmt {
     }
 }
 
+/// The output works, but can't play this track's format (a sample rate or
+/// bit depth the DAC doesn't support): skip the track, not the queue.
+#[derive(Debug)]
+pub struct Unsupported(pub String);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
 /// The stream format a track needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSpec {
@@ -117,7 +130,7 @@ pub enum Route {
     SoundServer(&'static str),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputInfo {
     /// Human-friendly name, e.g. the DAC's card name.
     pub label: String,
@@ -270,14 +283,14 @@ impl AlsaOutput {
             }
         }
         let fmt = chosen.ok_or_else(|| {
-            anyhow!(
+            anyhow::Error::new(Unsupported(format!(
                 "{} can't play {}-bit / {} Hz / {} ch without conversion ({})",
-                device,
+                friendly_name(device),
                 spec.bits,
                 spec.rate,
                 spec.channels,
                 last_err
-            )
+            )))
         })?;
 
         let can_pause = pcm
@@ -432,17 +445,76 @@ pub fn list_devices() -> Vec<DeviceEntry> {
     out
 }
 
-/// Picks a sensible default: the first USB hardware device, if any.
+/// Picks a sensible default: the first USB hardware device that can take
+/// plain PCM, if any.
 pub fn guess_device() -> Option<String> {
     list_devices()
         .into_iter()
-        .find(|d| d.desc.to_lowercase().contains("usb"))
+        .filter(|d| d.desc.to_lowercase().contains("usb"))
+        .find(|d| probe(&d.name) != Fitness::NoPcm)
         .map(|d| d.name)
+}
+
+/// What a hardware device can do for bit-perfect playback, found by asking it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fitness {
+    /// Takes plain PCM samples: its widest sample size and highest rate.
+    Ready { bits: u32, max_rate: u32 },
+    /// Opens, but takes no plain PCM samples. A Raspberry Pi's HDMI is like
+    /// this: it only takes IEC958 (S/PDIF-style) frames.
+    NoPcm,
+    /// Another program has it open, so it couldn't be asked.
+    Busy,
+    /// Couldn't be opened or asked.
+    Unknown,
+}
+
+impl Fitness {
+    /// A few words for device lists.
+    pub fn describe(&self) -> String {
+        match self {
+            Fitness::Ready { bits, max_rate: 0 } => format!("up to {}-bit", bits),
+            Fitness::Ready { bits, max_rate } => format!("up to {}-bit / {} kHz", bits, crate::plex::khz(*max_rate)),
+            Fitness::NoPcm => "can't play bit-perfect (takes no plain PCM; HDMI on a Raspberry Pi is like this)".into(),
+            Fitness::Busy => "in use by another program".into(),
+            Fitness::Unknown => String::new(),
+        }
+    }
+}
+
+/// Opens `device` briefly (without waiting if it's busy) and asks what it
+/// can play.
+pub fn probe(device: &str) -> Fitness {
+    let pcm = match PCM::new(device, Direction::Playback, true) {
+        Ok(p) => p,
+        Err(e) if e.errno() == libc_ebusy() => return Fitness::Busy,
+        Err(_) => return Fitness::Unknown,
+    };
+    let Ok(hwp) = HwParams::any(&pcm) else { return Fitness::Unknown };
+    let _ = hwp.set_rate_resample(false);
+    use SampleFmt::*;
+    match [S32, S24Packed, S24In32, S16].into_iter().find(|f| hwp.test_format(f.alsa()).is_ok()) {
+        Some(f) => Fitness::Ready { bits: f.bits(), max_rate: hwp.get_rate_max().unwrap_or(0) },
+        None => Fitness::NoPcm,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devices_say_what_they_can_play() {
+        if AlsaOutput::open("null", StreamSpec { rate: 44_100, channels: 2, bits: 16 }).is_err() {
+            eprintln!("skipping: ALSA null device unavailable");
+            return;
+        }
+        assert!(matches!(probe("null"), Fitness::Ready { bits: 32, .. }), "{:?}", probe("null"));
+        assert_eq!(probe("hw:CARD=NoSuchCard,DEV=0"), Fitness::Unknown);
+        assert_eq!(Fitness::Ready { bits: 24, max_rate: 96_000 }.describe(), "up to 24-bit / 96 kHz");
+        assert!(Fitness::NoPcm.describe().contains("can't play bit-perfect"));
+        assert_eq!(Fitness::Unknown.describe(), "");
+    }
 
     #[test]
     fn encode_layouts() {

@@ -107,17 +107,22 @@ impl App {
         });
     }
 
-    /// Searches once you stop typing for a moment.
-    pub(super) fn search_tick(&mut self) {
-        let Some(at) = self.search.edited_at else { return };
+    /// Searches once you stop typing for a moment. True when it started
+    /// one (the screen then shows it's searching).
+    pub(super) fn search_tick(&mut self) -> bool {
+        let Some(at) = self.search.edited_at else { return false };
         if at.elapsed() < TYPING_PAUSE {
-            return;
+            return false;
         }
         let q = self.search.query.trim();
         if q == self.search.searched {
             self.search.edited_at = None;
+            false
         } else if q.is_empty() || q.chars().count() >= MIN_CHARS {
             self.run_search();
+            true
+        } else {
+            false
         }
     }
 

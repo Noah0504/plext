@@ -58,6 +58,10 @@ const TOP_UP_AT: usize = 3;
 /// Give up after this many top-ups in a row that find nothing new.
 const MAX_DRY: u32 = 3;
 
+/// Tracks already played that a running station keeps in the queue (to go
+/// back to, or see what played); older ones are let go.
+pub(super) const KEEP_PLAYED: usize = 200;
+
 impl App {
     // ---------- loading ----------
 
@@ -520,18 +524,20 @@ impl App {
             self.say(format!("Playing {}: it keeps going until you play something else", title));
         } else {
             self.player.send(Cmd::Append(fresh));
+            self.player.send(Cmd::ForgetPlayed(KEEP_PLAYED));
         }
     }
 
-    /// Tops a running mix up when the queue is nearly out.
-    pub(super) fn radio_tick(&mut self, st: &Status) {
-        let Some(radio) = self.radio.as_mut() else { return };
+    /// Tops a running mix up when the queue is nearly out. True when it
+    /// started fetching more.
+    pub(super) fn radio_tick(&mut self, st: &Status) -> bool {
+        let Some(radio) = self.radio.as_mut() else { return false };
         if radio.fetching || st.queue_len == 0 {
-            return;
+            return false;
         }
         let left = st.queue_len.saturating_sub(st.queue_pos + 1);
         if left > TOP_UP_AT {
-            return;
+            return false;
         }
         radio.fetching = true;
         let (gen, source) = (radio.gen, radio.source.clone());
@@ -540,6 +546,7 @@ impl App {
             let r = fetch_batch(&s, &source);
             let _ = tx.send(Msg::Radio(Batch { gen, first: false, result: r }));
         });
+        true
     }
 
     /// Something new is about to replace the queue: stop topping it up.

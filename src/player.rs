@@ -30,6 +30,9 @@ pub enum Cmd {
     Jump(u64),
     /// Drop everything after the current track.
     ClearUpcoming,
+    /// Keep only this many of the tracks already played (a long-running
+    /// station would otherwise grow the queue without end).
+    ForgetPlayed(usize),
     ToggleShuffle,
     SetShuffle(bool),
     CycleRepeat,
@@ -59,7 +62,7 @@ pub enum PlayState {
     Paused,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
     pub state: PlayState,
     pub track: Option<Track>,
@@ -178,10 +181,25 @@ impl Player {
         QueueView { items: q.items().to_vec(), pos: q.pos(), version: q.version }
     }
 
+    /// A handle for saving the queue from another thread (when the terminal
+    /// goes away, the UI thread may be stuck).
+    pub fn queue_handle(&self) -> QueueHandle {
+        QueueHandle { status: self.status.clone(), queue: self.queue.clone() }
+    }
+}
+
+/// See `Player::queue_handle`.
+#[derive(Clone)]
+pub struct QueueHandle {
+    status: Arc<Mutex<Status>>,
+    queue: Arc<Mutex<Queue>>,
+}
+
+impl QueueHandle {
     /// The queue to save when quitting, with how far into the current track
     /// playback got. None when the queue is empty.
     pub fn saved(&self, machine_id: &str) -> Option<Saved> {
-        let st = self.status();
+        let st = self.status.lock().unwrap().clone();
         let q = self.queue.lock().unwrap();
         let current = q.current()?.track.key.clone();
         let here = matches!(st.state, PlayState::Playing | PlayState::Paused)
@@ -562,7 +580,7 @@ impl Engine {
             }
             match Output::open(&self.target, spec) {
                 Ok(o) => self.out = Some(o),
-                Err(e) => return End::Fatal(e.to_string()),
+                Err(e) => return output_failed(track, e),
             }
         }
         let out = self.out.as_mut().unwrap();
@@ -758,6 +776,18 @@ impl Engine {
     }
 }
 
+/// What to do when the output won't open for `track`: a format the output
+/// can't play (say 96 kHz on a DAC that tops out at 48) skips this track,
+/// as the rest may well play; anything else (the device busy or gone)
+/// stops the queue.
+fn output_failed(track: &Track, e: anyhow::Error) -> End {
+    if e.downcast_ref::<crate::output::Unsupported>().is_some() {
+        End::Skip(format!("\"{}\": {}", track.title, e))
+    } else {
+        End::Fatal(e.to_string())
+    }
+}
+
 /// Copies the queue's position, length, up-next and modes into the status.
 fn publish(queue: &Mutex<Queue>, status: &Mutex<Status>) {
     let (pos, len, next, shuffle, repeat, version) = {
@@ -789,6 +819,7 @@ fn is_edit(cmd: &Cmd) -> bool {
             | Cmd::Remove(_)
             | Cmd::Move { .. }
             | Cmd::ClearUpcoming
+            | Cmd::ForgetPlayed(_)
             | Cmd::ToggleShuffle
             | Cmd::SetShuffle(_)
             | Cmd::CycleRepeat
@@ -813,6 +844,9 @@ fn apply_edit(queue: &Arc<Mutex<Queue>>, cmd: Cmd) -> bool {
         Cmd::Remove(id) => return q.remove(id),
         Cmd::Move { id, by } => q.move_by(id, by),
         Cmd::ClearUpcoming => q.clear_upcoming(),
+        Cmd::ForgetPlayed(keep) => {
+            q.forget_played(keep);
+        }
         Cmd::ToggleShuffle => {
             let on = !q.shuffle();
             q.set_shuffle(on);
@@ -884,6 +918,28 @@ mod tests {
             }
         });
         format!("http://{}", addr)
+    }
+
+    fn track_for_test(key: &str) -> Track {
+        Track {
+            key: key.to_string(),
+            title: key.to_string(),
+            album_key: None,
+            artist: "Test".into(),
+            album: "Test".into(),
+            index: None,
+            disc: None,
+            duration_ms: None,
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            channels: None,
+            bitrate_kbps: None,
+            part_key: None,
+            container: None,
+            rating: None,
+            thumb: None,
+        }
     }
 
     /// Three short FLAC tracks, "a" "b" "c", served locally; and a player.
@@ -975,6 +1031,22 @@ mod tests {
     }
 
     #[test]
+    fn a_format_the_output_cant_play_skips_the_track_not_the_queue() {
+        let t = Track { title: "Hi-res".into(), ..track_for_test("a") };
+        let too_many = crate::output::Output::open(
+            &Target::SoundServer { sink: None },
+            StreamSpec { rate: 96_000, channels: 40, bits: 24 },
+        )
+        .err()
+        .expect("40 channels never open");
+        match output_failed(&t, too_many) {
+            End::Skip(why) => assert!(why.contains("Hi-res") && why.contains("40 channels"), "{}", why),
+            _ => panic!("an unplayable format should skip the track"),
+        }
+        assert!(matches!(output_failed(&t, anyhow::anyhow!("hw:1,0 is busy")), End::Fatal(_)), "a busy device stops the queue");
+    }
+
+    #[test]
     fn plays_the_queue_in_order_then_stops_at_the_start() {
         let Some((p, tracks)) = setup() else { return };
         assert_eq!(watch(&p, 10, Cmd::Play { queue: tracks, index: 0 }, |_| {}), ["a", "b", "c"]);
@@ -1033,7 +1105,7 @@ mod tests {
         assert!((st.pos - 0.2).abs() < 1e-9);
         assert!(st.output.is_none(), "a waiting queue mustn't hold the DAC");
         // The saved queue round-trips through the player too.
-        let saved = p.saved("machine").unwrap();
+        let saved = p.queue_handle().saved("machine").unwrap();
         assert_eq!(saved.pos, 1);
         assert_eq!(watch(&p, 10, Cmd::TogglePause, |_| {}), ["b", "c"]);
     }

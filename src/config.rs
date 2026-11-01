@@ -127,15 +127,30 @@ impl Config {
             fs::create_dir_all(dir)?;
         }
         let text = toml::to_string_pretty(self)?;
-        fs::write(&p, text).with_context(|| format!("writing {}", p.display()))?;
-        // The file holds a Plex token, so keep it private to the user.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        write_private(&p, text.as_bytes()).with_context(|| format!("writing {}", p.display()))
     }
+}
+
+/// Replaces `path` with `bytes`, readable by the user alone (the config
+/// holds a Plex token) from the moment it exists. Written to a new file
+/// that then takes the old one's place, so a crash part way leaves the old
+/// config whole rather than half a file.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("toml.tmp");
+    // A leftover from a crash could have looser permissions: start afresh.
+    let _ = fs::remove_file(&tmp);
+    let result = (|| {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn new_client_id() -> String {
@@ -157,6 +172,24 @@ pub fn new_client_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_config_is_private_from_the_start_and_replaced_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("plext-config-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        // An old config readable by anyone, and a loose leftover from a crash.
+        fs::write(&p, "old").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(p.with_extension("toml.tmp"), "junk").unwrap();
+        fs::set_permissions(p.with_extension("toml.tmp"), fs::Permissions::from_mode(0o666)).unwrap();
+        write_private(&p, b"account_token = \"t\"\n").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "account_token = \"t\"\n");
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!p.with_extension("toml.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn output_mode_is_written_in_lowercase_and_defaults_to_bitperfect() {

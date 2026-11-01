@@ -156,6 +156,15 @@ impl PulseOutput {
     /// output when `sink` is None (it then follows the default if the user
     /// changes it).
     pub fn open(sink: Option<&str>, spec: StreamSpec) -> Result<PulseOutput> {
+        let channels = u8::try_from(spec.channels)
+            .ok()
+            .filter(|&c| c >= 1 && c <= 32)
+            .ok_or_else(|| {
+                anyhow::Error::new(crate::output::Unsupported(format!(
+                    "{} channels are more than the sound server takes",
+                    spec.channels
+                )))
+            })?;
         let mut conn = Conn::connect()?;
         let kind = conn.server_kind()?;
 
@@ -165,10 +174,7 @@ impl PulseOutput {
                 SampleFmt::S16 => SampleFormat::S16Le,
                 _ => SampleFormat::S32Le,
             },
-            channels: u8::try_from(spec.channels)
-                .ok()
-                .filter(|&c| c >= 1 && c <= 32)
-                .ok_or_else(|| anyhow!("{} channels are more than the sound server takes", spec.channels))?,
+            channels,
             sample_rate: spec.rate,
         };
         let frame_bytes = fmt.bytes() * spec.channels as usize;

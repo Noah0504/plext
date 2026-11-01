@@ -359,14 +359,49 @@ impl App {
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        // Whatever ends the loop (q, a signal, or the terminal going away so
+        // drawing fails), the queue is saved.
+        let result = self.event_loop(terminal);
+        self.queue_saver()();
+        self.player.send(Cmd::Stop);
+        result
+    }
+
+    /// Saves the queue for next time (when it's kept), callable from any
+    /// thread: see `signals::watch_hangup`.
+    pub fn queue_saver(&self) -> impl Fn() + Send + 'static {
+        let (keep, handle, machine_id) = (self.keep_queue, self.player.queue_handle(), self.server.machine_id.clone());
+        move || {
+            if keep {
+                match handle.saved(&machine_id) {
+                    Some(s) => crate::queue::save(&s),
+                    None => crate::queue::forget(),
+                }
+            }
+        }
+    }
+
+    /// Draws only when something on screen changes: a key, a resize, news
+    /// from a background job, the player's status (the position to the half
+    /// second, so the clock and progress bar move), or a message timing out.
+    /// Idle, Plext draws nothing; playing, about twice a second.
+    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let mut changed = true;
+        let mut drawn_from: Option<(Status, Option<ArtSeen>)> = None;
+        let mut drawn_at = Instant::now();
         while !self.quit {
+            if let Some(sig) = crate::signals::received() {
+                crate::log::write(&format!("quitting on signal {}", sig));
+                break;
+            }
             while let Ok(m) = self.rx.try_recv() {
                 self.on_msg(m);
+                changed = true;
             }
             let status = self.player.status();
             self.refresh_queue(&status);
-            self.radio_tick(&status);
-            self.search_tick();
+            changed |= self.radio_tick(&status);
+            changed |= self.search_tick();
             // Cheap to ask, and the font size can change while we run.
             self.art_cols = art_columns();
             self.update_art(&status);
@@ -374,23 +409,36 @@ impl App {
                 self.seen_error_seq = status.error_seq;
                 self.error_since = Some(Instant::now());
             }
-            terminal.draw(|f| self.draw(f, &status))?;
+            let now = Instant::now();
+            let seen = (on_screen(&status), self.art_seen());
+            let timed_out = self.banner_deadlines().into_iter().flatten().any(|d| d > drawn_at && d <= now);
+            if changed || timed_out || drawn_from.as_ref() != Some(&seen) || now - drawn_at >= REDRAW_ANYWAY {
+                terminal.draw(|f| self.draw(f, &status))?;
+                (changed, drawn_from, drawn_at) = (false, Some(seen), now);
+            }
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(k) = event::read()? {
                     if k.kind == KeyEventKind::Press {
                         self.on_key(k);
                     }
                 }
+                // Keys, and resizes too.
+                changed = true;
             }
         }
-        if self.keep_queue {
-            match self.player.saved(&self.server.machine_id) {
-                Some(s) => crate::queue::save(&s),
-                None => crate::queue::forget(),
-            }
-        }
-        self.player.send(Cmd::Stop);
         Ok(())
+    }
+
+    /// When the banners now up (a player error, a notice) time out.
+    fn banner_deadlines(&self) -> [Option<Instant>; 2] {
+        let error = self.error_since.map(|t| t + ERROR_SHOWN);
+        let notice = self.notice.as_ref().map(|n| n.at + if n.error { ERROR_SHOWN } else { NOTICE_SHOWN });
+        [error, notice]
+    }
+
+    /// What the album cover's state looks like on screen.
+    fn art_seen(&self) -> Option<ArtSeen> {
+        self.art.as_ref().map(|a| (a.thumb.clone(), a.cols, std::mem::discriminant(&a.state)))
     }
 
     /// Brings back the queue from last time (paused where it was left), and
@@ -707,7 +755,7 @@ impl App {
                 let f = self.filter.to_lowercase();
                 a.iter()
                     .enumerate()
-                    .filter(|(_, x)| f.is_empty() || x.title.to_lowercase().contains(&f))
+                    .filter(|(_, x)| f.is_empty() || contains_lowercase(&x.title, &f))
                     .map(|(i, _)| i)
                     .collect()
             }
@@ -1269,7 +1317,7 @@ impl App {
             (RightView::Queue, _) => self.draw_queue(f, main[1], st),
         }
         // Errors stay up long enough to read, even if the next track has started.
-        let recent = |t: Instant| t.elapsed() < Duration::from_secs(15);
+        let recent = |t: Instant| t.elapsed() < ERROR_SHOWN;
         let player_error = st
             .error
             .as_deref()
@@ -1279,7 +1327,7 @@ impl App {
         let notice = self
             .notice
             .as_ref()
-            .filter(|n| if n.error { recent(n.at) } else { n.at.elapsed() < Duration::from_secs(4) })
+            .filter(|n| if n.error { recent(n.at) } else { n.at.elapsed() < NOTICE_SHOWN })
             .map(|n| (Banner { text: n.text.as_str(), error: n.error }, n.at));
         let player_error = player_error.map(|(m, t)| (Banner { text: m, error: true }, t));
         // Show whichever is newer.
@@ -1415,17 +1463,16 @@ impl App {
         };
         let title = if title.width() == 0 { title } else { self.view_switcher_for(self.focus == Focus::Tree, area.width) };
         let mut block = self.pane(title, filter_label, self.focus == Focus::Tree);
-        // Where you are in the (possibly filtered) artist list.
-        let visible = self.visible_artists();
-        if !visible.is_empty() {
-            let cur_artist = match self.current_row() {
-                Some(Row::Artist(i)) | Some(Row::Heading(i, _)) | Some(Row::Album(i, _)) => Some(i),
-                None => None,
-            };
-            if let Some(pos) = cur_artist.and_then(|i| visible.iter().position(|&v| v == i)) {
+        let rows = self.rows();
+        // Where you are in the (possibly filtered) artist list: the artist
+        // rows up to the cursor, of all of them.
+        let artists_shown = rows.iter().filter(|r| matches!(r, Row::Artist(_))).count();
+        if let Some(sel) = self.tree_state.selected().filter(|&s| s < rows.len()) {
+            let pos = rows[..=sel].iter().filter(|r| matches!(r, Row::Artist(_))).count();
+            if pos > 0 {
                 block = block.title_bottom(
                     Line::from(Span::styled(
-                        format!(" {} of {} ", pos + 1, visible.len()),
+                        format!(" {} of {} ", pos, artists_shown),
                         Style::default().fg(th().faint),
                     ))
                     .alignment(Alignment::Right),
@@ -1435,7 +1482,7 @@ impl App {
         self.tree_page = area.height.saturating_sub(3) as usize;
 
         let playing_album = self.player.status().track.map(|t| t.album);
-        let rows = self.rows();
+        let near = rows_near(&self.tree_state, area.height);
         let grouped_artists: std::collections::HashSet<usize> = rows
             .iter()
             .filter_map(|r| match r {
@@ -1451,7 +1498,9 @@ impl App {
             ))],
             Loadable::Ready(_) => rows
                 .iter()
-                .map(|r| match *r {
+                .enumerate()
+                .map(|(n, r)| match *r {
+                    _ if !near.contains(&n) => ListItem::new(Line::default()),
                     Row::Artist(i) => {
                         let a = self.artist(i).unwrap();
                         let open = self.expanded.get(&a.key).copied().unwrap_or(false);
@@ -1583,10 +1632,14 @@ impl App {
         let playing_key = st.track.as_ref().map(|t| t.key.clone());
         let focused = self.focus == Focus::Tracks;
         let selected = self.track_state.selected();
+        let near = rows_near(&self.track_state, parts[2].height);
         let items: Vec<ListItem> = tracks
             .iter()
             .enumerate()
             .map(|(i, t)| {
+                if !near.contains(&i) {
+                    return ListItem::new(Line::default());
+                }
                 let playing = playing_key.as_deref() == Some(t.key.as_str()) && st.state != PlayState::Stopped;
                 let num = if playing {
                     "▶".to_string()
@@ -1684,10 +1737,14 @@ impl App {
 
         let active = st.state != PlayState::Stopped;
         let selected = self.queue_state.selected();
+        let near = rows_near(&self.queue_state, parts[2].height);
         let rows: Vec<ListItem> = items
             .iter()
             .enumerate()
             .map(|(i, e)| {
+                if !near.contains(&i) {
+                    return ListItem::new(Line::default());
+                }
                 let t = &e.track;
                 let current = i == self.queue.pos;
                 let num = if current && active { "▶".to_string() } else { (i + 1).to_string() };
@@ -2301,6 +2358,47 @@ fn draw_split_line(f: &mut Frame, area: Rect, sources: &[String], rights: Vec<Ve
 /// How many columns the cover needs to look square, from the size of a
 /// character cell in pixels. Most terminals report it; when one doesn't,
 /// a typical font's proportions are assumed.
+/// How long an error stays on screen, and a notice (feedback on a key).
+const ERROR_SHOWN: Duration = Duration::from_secs(15);
+const NOTICE_SHOWN: Duration = Duration::from_secs(4);
+
+/// Drawn again at least this often, even when nothing seems to change.
+const REDRAW_ANYWAY: Duration = Duration::from_secs(5);
+
+/// The cover on screen: which, how wide, and in what state.
+type ArtSeen = (String, usize, std::mem::Discriminant<ArtState>);
+
+/// The status as far as the screen shows it: the position only to the half
+/// second.
+fn on_screen(st: &Status) -> Status {
+    let mut s = st.clone();
+    s.pos = (s.pos * 2.0).floor();
+    s
+}
+
+/// Whether `text` contains `lower` (already lowercase), ignoring case. Plain
+/// ASCII, most titles, is compared in place; the rest is lowercased first.
+fn contains_lowercase(text: &str, lower: &str) -> bool {
+    if text.is_ascii() && lower.is_ascii() {
+        let (t, l) = (text.as_bytes(), lower.as_bytes());
+        l.is_empty() || t.windows(l.len()).any(|w| w.eq_ignore_ascii_case(l))
+    } else {
+        text.to_lowercase().contains(lower)
+    }
+}
+
+/// Which rows of a list need their real text this frame. A List lays out
+/// every row but shows only a screenful, and making each row's text is
+/// most of a frame's work in a big library; rows well away from both the
+/// cursor and where the list was last scrolled to can't be on screen, and
+/// are left blank (one empty line each, so the layout is the same).
+fn rows_near(state: &ListState, height: u16) -> std::ops::RangeInclusive<usize> {
+    let h = height as usize;
+    let sel = state.selected().unwrap_or(0);
+    let off = state.offset();
+    off.min(sel).saturating_sub(h)..=off.max(sel) + 2 * h
+}
+
 fn art_columns() -> usize {
     let ratio = ratatui::crossterm::terminal::window_size()
         .ok()
@@ -2471,6 +2569,38 @@ mod tests {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
             .collect()
+    }
+
+    #[test]
+    fn long_lists_show_the_right_rows_wherever_the_cursor_goes() {
+        let mut app = app_with_album(vec![]);
+        app.focus = Focus::Tree;
+        app.artists = Loadable::Ready((0..5000).map(|i| Artist { key: i.to_string(), title: format!("Artist {i:04}") }).collect());
+        let st = Status::default();
+        let names = |screen: &[String]| screen.iter().filter(|l| l.contains("▸ Artist ")).count();
+        let full = names(&render(&mut app, &st));
+        assert!(full > 10);
+        // Rows away from the screen are left blank, so jumping far (End,
+        // a search, PageDown held) must still fill the pane with real names,
+        // the cursor's among them.
+        for to in [4999, 2500, 2510, 2480, 3, 0, 4990] {
+            app.tree_state.select(Some(to));
+            let screen = render(&mut app, &st);
+            let text = screen.join("\n");
+            assert_eq!(names(&screen), full, "blank rows with the cursor at {}:\n{}", to, text);
+            assert!(text.contains(&format!("Artist {to:04}")), "cursor at {}:\n{}", to, text);
+            assert!(text.contains(&format!(" {} of 5000 ", to + 1)), "{}", text);
+        }
+    }
+
+    #[test]
+    fn the_filter_ignores_case_in_any_script() {
+        assert!(contains_lowercase("Beach House", "house"));
+        assert!(contains_lowercase("Beach House", ""));
+        assert!(!contains_lowercase("Beach House", "houses"));
+        assert!(contains_lowercase("Björk", "björk"));
+        assert!(contains_lowercase("SIGUR RÓS", "rós"));
+        assert!(!contains_lowercase("Bjork", "björk"));
     }
 
     #[test]

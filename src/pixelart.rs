@@ -39,9 +39,18 @@ pub fn columns_for(cell_ratio: f64) -> usize {
 
 /// Reads an image file (JPEG or PNG) and makes pixel art `width` pixels wide.
 pub fn from_file(path: &Path, width: usize) -> Result<PixelArt> {
-    let img = image::ImageReader::open(path)
+    // Covers arrive scaled down to 512 pixels; anything near these limits
+    // is a broken or hostile file, refused before memory is set aside for it
+    // (by default the decoder allows up to 512 MB).
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    let mut reader = image::ImageReader::open(path)
         .with_context(|| format!("opening {}", path.display()))?
-        .with_guessed_format()?
+        .with_guessed_format()?;
+    reader.limits(limits);
+    let img = reader
         .decode()
         .with_context(|| format!("decoding {}", path.display()))?
         .to_rgb8();
@@ -277,6 +286,37 @@ mod tests {
         colors.sort();
         colors.dedup();
         assert!(colors.len() <= COLORS && colors.len() >= COLORS / 2, "{} colors", colors.len());
+    }
+
+    #[test]
+    fn huge_images_are_refused_before_decoding() {
+        // A PNG whose header claims 100000×100000 pixels (30 GB decoded).
+        fn crc(data: &[u8]) -> u32 {
+            let mut c = !0u32;
+            for &b in data {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend(100_000u32.to_be_bytes());
+        ihdr.extend(100_000u32.to_be_bytes());
+        ihdr.extend([8, 2, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(13u32.to_be_bytes());
+        png.extend(&ihdr);
+        png.extend(crc(&ihdr).to_be_bytes());
+        png.extend(0u32.to_be_bytes());
+        png.extend(b"IEND");
+        png.extend(crc(b"IEND").to_be_bytes());
+        let path = std::env::temp_dir().join(format!("plext-huge-{}.png", std::process::id()));
+        std::fs::write(&path, &png).unwrap();
+        let e = format!("{:#}", from_file(&path, 16).unwrap_err());
+        let _ = std::fs::remove_file(&path);
+        assert!(e.to_lowercase().contains("limit"), "{}", e);
     }
 
     #[test]
