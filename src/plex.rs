@@ -252,6 +252,11 @@ pub struct Resource {
 #[derive(Clone)]
 pub struct Plex {
     agent: ureq::Agent,
+    /// For media files: longer to connect, and kept apart so a track's
+    /// download never waits on browsing. Shared by every download (clones
+    /// share it), so the next track reuses the connection instead of
+    /// setting up a new one, which costs most on a slow Pi over https.
+    media: ureq::Agent,
     client_id: String,
 }
 
@@ -265,8 +270,15 @@ impl Plex {
             // would carry the token to wherever it points.
             .redirects(0)
             .build();
+        let media = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(30))
+            .user_agent(&format!("{}/{}", PRODUCT, VERSION))
+            .redirects(0)
+            .build();
         Plex {
             agent,
+            media,
             client_id: client_id.to_string(),
         }
     }
@@ -282,7 +294,7 @@ impl Plex {
             .set("X-Plex-Client-Identifier", &self.client_id)
             .set("X-Plex-Platform", "Linux")
             .set("X-Plex-Device", "Linux")
-            .set("X-Plex-Device-Name", &device);
+            .set("X-Plex-Device-Name", device);
         if let Some(t) = token {
             r = r.set("X-Plex-Token", t);
         }
@@ -995,12 +1007,9 @@ impl Server {
     /// Returns a reader positioned at `offset` and the file's total size if known.
     pub fn open_media(&self, part_key: &str, offset: u64) -> Result<(Box<dyn Read + Send>, Option<u64>)> {
         let url = self.url(part_key)?;
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(30))
-            .redirects(0)
-            .build();
-        let mut req = agent
+        let mut req = self
+            .plex
+            .media
             .get(&url)
             .set("X-Plex-Token", &self.token)
             .set("X-Plex-Client-Identifier", &self.plex.client_id)
@@ -1238,12 +1247,16 @@ fn describe(e: ureq::Error) -> anyhow::Error {
     }
 }
 
-fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Linux".to_string())
+/// This computer's name, shown in Plex's list of devices. Read once.
+fn hostname() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Linux".to_string())
+    })
 }
 
 #[cfg(test)]
@@ -1352,6 +1365,50 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
         // Real paths still work.
         assert!(server.hub_items("/hubs/sections/1").is_ok());
+    }
+
+    #[test]
+    fn the_next_track_reuses_the_connection() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = connections.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    // Answers requests on this connection until it closes.
+                    let mut r = BufReader::new(conn.try_clone().unwrap());
+                    let mut w = conn;
+                    loop {
+                        let mut line = String::new();
+                        loop {
+                            let mut h = String::new();
+                            if r.read_line(&mut h).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if h == "\r\n" {
+                                break;
+                            }
+                            line.push_str(&h);
+                        }
+                        let body = b"fLaC-not-really";
+                        let _ = write!(w, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        let _ = w.write_all(body);
+                    }
+                });
+            }
+        });
+        let server = Server::new(Plex::new("plext-test"), &base, "tok", "M");
+        for part in ["/library/parts/1/a.flac", "/library/parts/2/b.flac", "/library/parts/3/c.flac"] {
+            // A clone, as each download gets one.
+            let (mut r, total) = server.clone().open_media(part, 0).unwrap();
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).unwrap();
+            assert_eq!((got.len() as u64, total), (15, Some(15)));
+        }
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1, "one connection for three tracks");
     }
 
     #[test]
