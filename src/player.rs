@@ -577,7 +577,7 @@ impl Engine {
             }
             match Output::open(&self.target, spec) {
                 Ok(o) => self.out = Some(o),
-                Err(e) => return End::Fatal(e.to_string()),
+                Err(e) => return output_failed(track, e),
             }
         }
         let out = self.out.as_mut().unwrap();
@@ -773,6 +773,18 @@ impl Engine {
     }
 }
 
+/// What to do when the output won't open for `track`: a format the output
+/// can't play (say 96 kHz on a DAC that tops out at 48) skips this track,
+/// as the rest may well play; anything else (the device busy or gone)
+/// stops the queue.
+fn output_failed(track: &Track, e: anyhow::Error) -> End {
+    if e.downcast_ref::<crate::output::Unsupported>().is_some() {
+        End::Skip(format!("\"{}\": {}", track.title, e))
+    } else {
+        End::Fatal(e.to_string())
+    }
+}
+
 /// Copies the queue's position, length, up-next and modes into the status.
 fn publish(queue: &Mutex<Queue>, status: &Mutex<Status>) {
     let (pos, len, next, shuffle, repeat, version) = {
@@ -901,6 +913,28 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    fn track_for_test(key: &str) -> Track {
+        Track {
+            key: key.to_string(),
+            title: key.to_string(),
+            album_key: None,
+            artist: "Test".into(),
+            album: "Test".into(),
+            index: None,
+            disc: None,
+            duration_ms: None,
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            channels: None,
+            bitrate_kbps: None,
+            part_key: None,
+            container: None,
+            rating: None,
+            thumb: None,
+        }
+    }
+
     /// Three short FLAC tracks, "a" "b" "c", served locally; and a player.
     fn setup() -> Option<(Player, Vec<Track>)> {
         if !have_ffmpeg() {
@@ -987,6 +1021,22 @@ mod tests {
 
     fn id_of(p: &Player, key: &str) -> u64 {
         p.queue().items.iter().find(|e| e.track.key == key).unwrap().id
+    }
+
+    #[test]
+    fn a_format_the_output_cant_play_skips_the_track_not_the_queue() {
+        let t = Track { title: "Hi-res".into(), ..track_for_test("a") };
+        let too_many = crate::output::Output::open(
+            &Target::SoundServer { sink: None },
+            StreamSpec { rate: 96_000, channels: 40, bits: 24 },
+        )
+        .err()
+        .expect("40 channels never open");
+        match output_failed(&t, too_many) {
+            End::Skip(why) => assert!(why.contains("Hi-res") && why.contains("40 channels"), "{}", why),
+            _ => panic!("an unplayable format should skip the track"),
+        }
+        assert!(matches!(output_failed(&t, anyhow::anyhow!("hw:1,0 is busy")), End::Fatal(_)), "a busy device stops the queue");
     }
 
     #[test]

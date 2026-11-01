@@ -98,6 +98,19 @@ impl SampleFmt {
     }
 }
 
+/// The output works, but can't play this track's format (a sample rate or
+/// bit depth the DAC doesn't support): skip the track, not the queue.
+#[derive(Debug)]
+pub struct Unsupported(pub String);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
 /// The stream format a track needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSpec {
@@ -270,14 +283,14 @@ impl AlsaOutput {
             }
         }
         let fmt = chosen.ok_or_else(|| {
-            anyhow!(
+            anyhow::Error::new(Unsupported(format!(
                 "{} can't play {}-bit / {} Hz / {} ch without conversion ({})",
-                device,
+                friendly_name(device),
                 spec.bits,
                 spec.rate,
                 spec.channels,
                 last_err
-            )
+            )))
         })?;
 
         let can_pause = pcm
