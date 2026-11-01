@@ -94,8 +94,8 @@ jobs:
   # under QEMU emulating the oldest CPU each build supports, so an
   # instruction those CPUs lack fails the tests here rather than on a Pi:
   #   aarch64: Pi 3, 4, 5 and Zero 2 W on a 64-bit OS (Cortex-A53)
-  #   armv7:   Pi 2 and newer on a 32-bit OS (Cortex-A7)
-  #   armv6:   Pi 1, Zero and Zero W (ARM1176); runs on every Pi
+  #   armv6:   every Pi on a 32-bit OS, down to the Pi 1 and Zero (ARM1176).
+  #            No separate armv7 build: armv6 runs on the Pi 2 and newer too.
   linux-arm:
     strategy:
       fail-fast: false
@@ -117,14 +117,6 @@ jobs:
             cflags: "-march=armv6kz -mfpu=vfp -mfloat-abi=hard -marm"
             # alsa-lib's atomics can become libgcc calls on 32-bit Arm, and
             # Rust doesn't link libgcc on its own.
-            rustflags: "-C link-arg=-lgcc"
-          - name: armv7
-            target: armv7-unknown-linux-musleabihf
-            image: armv7-musleabihf
-            qemu: qemu-arm
-            qemu_cpu: cortex-a7
-            # Rust's armv7-unknown-linux-musleabihf baseline: ARMv7-A, VFPv3-D16, no NEON.
-            cflags: "-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
             rustflags: "-C link-arg=-lgcc"
     runs-on: ubuntu-latest
     container: ghcr.io/rust-cross/rust-musl-cross:${{ matrix.image }}
