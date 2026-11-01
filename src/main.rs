@@ -255,7 +255,10 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
 /// Makes sure the saved server URL still works, rediscovering it if needed.
 fn connect(plex_client: &Plex, cfg: &mut Config) -> Result<ServerConfig> {
     let server = cfg.server.clone().context("no server chosen; run `plext login`")?;
-    if plex_client.ping(&server.url, &server.token).is_ok() {
+    // The saved address is used only if this very server answers there:
+    // a LAN address like http://192.168.1.10:32400 can be some other
+    // machine when this computer is on another network.
+    if plex_client.verify(&server.url, &server.machine_id).is_ok() {
         return Ok(server);
     }
     print!("Reconnecting to {}… ", server.name);

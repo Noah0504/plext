@@ -261,6 +261,9 @@ impl Plex {
             .timeout_connect(Duration::from_secs(5))
             .timeout_read(Duration::from_secs(30))
             .user_agent(&format!("{}/{}", PRODUCT, VERSION))
+            // See `Checked`: Plex never redirects, and a followed redirect
+            // would carry the token to wherever it points.
+            .redirects(0)
             .build();
         Plex {
             agent,
@@ -287,7 +290,7 @@ impl Plex {
     }
 
     fn get_json(&self, url: &str, token: Option<&str>) -> Result<Value> {
-        let resp = self.req("GET", url, token).call().map_err(describe)?;
+        let resp = self.req("GET", url, token).call().checked()?;
         let v: Value = resp.into_json().context("invalid JSON from Plex")?;
         Ok(v)
     }
@@ -299,7 +302,7 @@ impl Plex {
         let resp = self
             .req("POST", "https://plex.tv/api/v2/pins", None)
             .send_form(&[("strong", "false")])
-            .map_err(describe)?;
+            .checked()?;
         let v: Value = resp.into_json()?;
         let id = v["id"].as_u64().ok_or_else(|| anyhow!("no pin id in response"))?;
         let code = v["code"]
@@ -322,71 +325,127 @@ impl Plex {
             "https://clients.plex.tv/api/v2/resources?includeHttps=1&includeRelay=1",
             Some(account_token),
         )?;
-        let arr = v.as_array().ok_or_else(|| anyhow!("unexpected resources response"))?;
-        let mut out = Vec::new();
-        for r in arr {
-            let provides = r["provides"].as_str().unwrap_or("");
-            if !provides.split(',').any(|p| p == "server") {
-                continue;
-            }
-            let mut local = Vec::new();
-            let mut remote = Vec::new();
-            let mut relay = Vec::new();
-            for c in r["connections"].as_array().into_iter().flatten() {
-                let uri = c["uri"].as_str().unwrap_or("").to_string();
-                if uri.is_empty() {
-                    continue;
-                }
-                if c["relay"].as_bool().unwrap_or(false) {
-                    relay.push(uri);
-                } else if c["local"].as_bool().unwrap_or(false) {
-                    local.push(uri);
-                    // Plain http on the LAN also works when plex.direct DNS is blocked by the router.
-                    if let (Some(addr), Some(port)) = (c["address"].as_str(), c["port"].as_u64()) {
-                        local.push(format!("http://{}:{}", addr, port));
-                    }
-                } else {
-                    remote.push(uri);
-                }
-            }
-            let mut urls = local;
-            urls.extend(remote);
-            urls.extend(relay);
-            urls.dedup();
-            out.push(Resource {
-                name: r["name"].as_str().unwrap_or("Plex server").to_string(),
-                machine_id: r["clientIdentifier"].as_str().unwrap_or("").to_string(),
-                token: r["accessToken"]
-                    .as_str()
-                    .map(String::from)
-                    .unwrap_or_else(|| account_token.to_string()),
-                owned: r["owned"].as_bool().unwrap_or(false),
-                urls,
-            });
-        }
-        Ok(out)
+        parse_resources(&v, account_token)
     }
 
-    /// Tries each candidate URL and returns the first that answers.
+    /// Tries each candidate URL in order (encrypted local addresses first)
+    /// and returns the first that reaches this very server.
     pub fn find_working_url(&self, res: &Resource) -> Option<String> {
         res.urls
             .iter()
-            .find(|u| self.ping(u, &res.token).is_ok())
+            .find(|u| self.verify(u, &res.machine_id).is_ok())
             .cloned()
     }
 
-    pub fn ping(&self, base: &str, token: &str) -> Result<()> {
+    /// The machine identifier of the Plex server answering at `base`.
+    /// Asked without the token: Plex tells anyone who it is, so nothing
+    /// secret is sent before we know who is listening.
+    pub fn identity(&self, base: &str) -> Result<String> {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(3))
             .timeout_read(Duration::from_secs(4))
+            .redirects(0)
             .build();
-        agent
-            .get(&format!("{}/identity", base))
+        let v: Value = agent
+            .get(&format!("{}/identity", base.trim_end_matches('/')))
             .set("Accept", "application/json")
-            .set("X-Plex-Token", token)
             .call()
-            .map_err(describe)?;
+            .checked()?
+            .into_json()
+            .with_context(|| format!("no Plex server at {}", base))?;
+        v["MediaContainer"]["machineIdentifier"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| anyhow!("no Plex server at {}", base))
+    }
+
+    /// Ok when `base` reaches the server `machine_id` and no other, so the
+    /// token is only ever sent to the server it belongs to (a saved LAN
+    /// address can belong to some other machine on another network).
+    pub fn verify(&self, base: &str, machine_id: &str) -> Result<()> {
+        let found = self.identity(base)?;
+        if machine_id.is_empty() || found != machine_id {
+            bail!("a different Plex server answered at {}", base);
+        }
         Ok(())
+    }
+}
+
+/// The account's servers from plex.tv's resources answer, each with its
+/// addresses best first: encrypted local ones, plain-http local ones,
+/// remote, then relay (last, as it's too slow for lossless audio).
+fn parse_resources(v: &Value, account_token: &str) -> Result<Vec<Resource>> {
+    let arr = v.as_array().ok_or_else(|| anyhow!("unexpected resources response"))?;
+    let mut out = Vec::new();
+    for r in arr {
+        let provides = r["provides"].as_str().unwrap_or("");
+        if !provides.split(',').any(|p| p == "server") {
+            continue;
+        }
+        let mut local = Vec::new();
+        let mut local_http = Vec::new();
+        let mut remote = Vec::new();
+        let mut relay = Vec::new();
+        for c in r["connections"].as_array().into_iter().flatten() {
+            let uri = c["uri"].as_str().unwrap_or("").to_string();
+            if uri.is_empty() {
+                continue;
+            }
+            if c["relay"].as_bool().unwrap_or(false) {
+                relay.push(uri);
+            } else if c["local"].as_bool().unwrap_or(false) {
+                local.push(uri);
+                // Plain http on the LAN also works when plex.direct DNS
+                // is blocked by the router. Tried only after every
+                // encrypted local address.
+                if let (Some(addr), Some(port)) = (c["address"].as_str(), c["port"].as_u64()) {
+                    local_http.push(format!("http://{}:{}", addr, port));
+                }
+            } else {
+                remote.push(uri);
+            }
+        }
+        let mut urls = local;
+        urls.extend(local_http);
+        urls.extend(remote);
+        urls.extend(relay);
+        // Each address once, at its best place.
+        let mut seen = std::collections::HashSet::new();
+        urls.retain(|u| seen.insert(u.clone()));
+        out.push(Resource {
+            name: r["name"].as_str().unwrap_or("Plex server").to_string(),
+            machine_id: r["clientIdentifier"].as_str().unwrap_or("").to_string(),
+            token: r["accessToken"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| account_token.to_string()),
+            owned: r["owned"].as_bool().unwrap_or(false),
+            urls,
+        });
+    }
+    Ok(out)
+}
+
+/// Every Plex response goes through `checked`: errors in words, and
+/// redirects refused. Plex never redirects, and a followed one would carry
+/// the X-Plex-Token header (which ureq doesn't strip) to wherever it points,
+/// even from https to plain http.
+trait Checked {
+    fn checked(self) -> Result<ureq::Response>;
+}
+
+impl Checked for std::result::Result<ureq::Response, ureq::Error> {
+    fn checked(self) -> Result<ureq::Response> {
+        let resp = self.map_err(describe)?;
+        if (300..400).contains(&resp.status()) {
+            bail!(
+                "Plex answered {} with a redirect (to {}), which Plext doesn't follow",
+                resp.get_url(),
+                resp.header("Location").unwrap_or("nowhere")
+            );
+        }
+        Ok(resp)
     }
 }
 
@@ -447,7 +506,7 @@ impl Server {
             .plex
             .req("POST", &url, Some(&self.token))
             .call()
-            .map_err(describe)?;
+            .checked()?;
         let v: Value = resp.into_json()?;
         let id = v["MediaContainer"]["playQueueID"]
             .as_u64()
@@ -483,7 +542,7 @@ impl Server {
             .set("X-Plex-Session-Identifier", session_id)
             .timeout(Duration::from_secs(5))
             .call()
-            .map_err(describe)?;
+            .checked()?;
         Ok(())
     }
 
@@ -500,13 +559,23 @@ impl Server {
             .req("PUT", &url, Some(&self.token))
             .timeout(Duration::from_secs(10))
             .call()
-            .map_err(describe)?;
+            .checked()?;
         Ok(())
     }
 
+    /// The full URL of `path` on this server. Paths that come from the
+    /// server (hub and station keys, media files) must start with "/":
+    /// glued onto the base, anything else could name another host
+    /// ("@example.com/…" or ".example.com/…").
+    fn url(&self, path: &str) -> Result<String> {
+        if !path.starts_with('/') {
+            bail!("Plex sent an unexpected path: {:?}", path);
+        }
+        Ok(format!("{}{}", self.base, path))
+    }
+
     fn get(&self, path: &str) -> Result<Value> {
-        self.plex
-            .get_json(&format!("{}{}", self.base, path), Some(&self.token))
+        self.plex.get_json(&self.url(path)?, Some(&self.token))
     }
 
     /// The server's JSON answer for a path, for diagnostics (`plext inspect mixes`).
@@ -820,13 +889,13 @@ impl Server {
     }
 
     fn send(&self, method: &str, path_and_query: &str) -> Result<Value> {
-        let url = format!("{}{}", self.base, path_and_query);
+        let url = self.url(path_and_query)?;
         let resp = self
             .plex
             .req(method, &url, Some(&self.token))
             .timeout(Duration::from_secs(20))
             .call()
-            .map_err(describe)?;
+            .checked()?;
         // Some of these answer with an empty body.
         let text = resp.into_string().unwrap_or_default();
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
@@ -910,7 +979,7 @@ impl Server {
             .set("Accept", "image/jpeg, image/png, image/*")
             .timeout(Duration::from_secs(15))
             .call()
-            .map_err(describe)?;
+            .checked()?;
         let mut bytes = Vec::new();
         resp.into_reader()
             .take(16 * 1024 * 1024)
@@ -925,10 +994,11 @@ impl Server {
     /// at byte `offset` (used to resume after a dropped connection).
     /// Returns a reader positioned at `offset` and the file's total size if known.
     pub fn open_media(&self, part_key: &str, offset: u64) -> Result<(Box<dyn Read + Send>, Option<u64>)> {
-        let url = format!("{}{}", self.base, part_key);
+        let url = self.url(part_key)?;
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(30))
+            .redirects(0)
             .build();
         let mut req = agent
             .get(&url)
@@ -938,7 +1008,7 @@ impl Server {
         if offset > 0 {
             req = req.set("Range", &format!("bytes={}-", offset));
         }
-        let resp = req.call().map_err(describe)?;
+        let resp = req.call().checked()?;
         let partial = resp.status() == 206;
         let total = if partial {
             // "Content-Range: bytes 1000-1999/2000"
@@ -1190,6 +1260,125 @@ mod tests {
         assert_eq!(parse_rating(&Value::Null), None);
         assert_eq!(parse_track(&json!({"ratingKey": 5, "title": "Free", "userRating": 9.0})).rating, Some(9));
         assert_eq!(parse_track(&json!({"ratingKey": 5, "title": "Free"})).rating, None);
+    }
+
+    /// A server answering every request with `reply(path)` (status line,
+    /// extra header lines, body), recording each request's line and headers.
+    fn raw_server(
+        reply: impl Fn(&str) -> (&'static str, String, String) + Send + Sync + 'static,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, reply) = (log.clone(), std::sync::Arc::new(reply));
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen.lock().unwrap().push(head);
+                let (status, headers, body) = reply(&path);
+                let mut w = conn;
+                let _ = write!(
+                    w,
+                    "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status, headers, body.len(), body
+                );
+            }
+        });
+        (base, log)
+    }
+
+    fn sent_token(log: &std::sync::Mutex<Vec<String>>) -> bool {
+        log.lock().unwrap().iter().any(|h| h.to_ascii_lowercase().contains("x-plex-token"))
+    }
+
+    fn identity_server(machine_id: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        raw_server(move |_| ("200 OK", String::new(), json!({"MediaContainer": {"machineIdentifier": machine_id}}).to_string()))
+    }
+
+    #[test]
+    fn the_token_goes_only_to_the_server_it_belongs_to() {
+        let plex = Plex::new("plext-test");
+        let (ours, ours_log) = identity_server("MACHINE");
+        let (other, other_log) = identity_server("SOMEONE-ELSE");
+        assert!(plex.verify(&ours, "MACHINE").is_ok());
+        assert!(plex.verify(&other, "MACHINE").is_err(), "another server at a saved address");
+        assert!(plex.verify(&ours, "").is_err(), "a server we can't identify");
+        // Picking an address skips the impostor and lands on ours.
+        let res = Resource {
+            name: "Home".into(),
+            machine_id: "MACHINE".into(),
+            token: "secret".into(),
+            owned: true,
+            urls: vec![other.clone(), ours.clone()],
+        };
+        assert_eq!(plex.find_working_url(&res), Some(ours));
+        // Checking who's there never sends the token, to either of them.
+        assert!(!sent_token(&ours_log) && !sent_token(&other_log));
+    }
+
+    #[test]
+    fn redirects_are_refused_so_the_token_stays_put() {
+        let (elsewhere, elsewhere_log) = identity_server("X");
+        let to = elsewhere.clone();
+        let (base, _) = raw_server(move |path| {
+            ("302 Found", format!("Location: {}{}\r\n", to, path), String::new())
+        });
+        let server = Server::new(Plex::new("plext-test"), &base, "secret", "MACHINE");
+        let e = server.music_libraries().unwrap_err().to_string();
+        assert!(e.contains("redirect"), "{}", e);
+        assert!(server.open_media("/library/parts/1/f.flac", 0).is_err());
+        assert!(Plex::new("plext-test").identity(&base).is_err());
+        assert!(elsewhere_log.lock().unwrap().is_empty(), "nothing followed the redirect");
+    }
+
+    #[test]
+    fn paths_from_the_server_must_be_paths_on_it() {
+        let (base, log) = raw_server(|_| ("200 OK", String::new(), "{}".into()));
+        let server = Server::new(Plex::new("plext-test"), &base, "secret", "MACHINE");
+        // Glued onto "http://host:port", these would name another host.
+        assert!(server.hub_items("@example.com/hubs").is_err());
+        assert!(server.open_media(".example.com/f.flac", 0).is_err());
+        assert!(server.get_raw("example.com").is_err());
+        assert!(log.lock().unwrap().is_empty());
+        // Real paths still work.
+        assert!(server.hub_items("/hubs/sections/1").is_ok());
+    }
+
+    #[test]
+    fn addresses_are_tried_encrypted_first_and_relay_last() {
+        let v = json!([{
+            "name": "Home", "clientIdentifier": "M", "provides": "server", "accessToken": "t", "owned": true,
+            "connections": [
+                {"uri": "https://relay.plex.direct:8443", "relay": true},
+                {"uri": "https://1-2-3-4.abc.plex.direct:32400", "local": false, "address": "1.2.3.4", "port": 32400},
+                {"uri": "https://192-168-1-10.abc.plex.direct:32400", "local": true, "address": "192.168.1.10", "port": 32400},
+                {"uri": "https://10-0-0-5.abc.plex.direct:32400", "local": true, "address": "10.0.0.5", "port": 32400},
+                {"uri": "http://10.0.0.5:32400", "local": true, "address": "10.0.0.5", "port": 32400},
+            ]
+        }, {"name": "A player", "provides": "player", "connections": []}]);
+        let res = parse_resources(&v, "account").unwrap();
+        assert_eq!(res.len(), 1, "only servers");
+        assert_eq!(
+            res[0].urls,
+            [
+                "https://192-168-1-10.abc.plex.direct:32400",
+                "https://10-0-0-5.abc.plex.direct:32400",
+                "http://10.0.0.5:32400",
+                "http://192.168.1.10:32400",
+                "https://1-2-3-4.abc.plex.direct:32400",
+                "https://relay.plex.direct:8443",
+            ]
+        );
     }
 
     fn fake_server(routes: Vec<(&'static str, &'static str, Value)>) -> (Server, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
