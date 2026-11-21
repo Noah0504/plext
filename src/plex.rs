@@ -478,6 +478,27 @@ pub struct PlayQueue {
     pub items: Vec<(String, u64)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteQueueInfo {
+    pub id: u64,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteQueuePosition {
+    pub info: RemoteQueueInfo,
+    pub item_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteQueue {
+    pub info: RemoteQueueInfo,
+    pub tracks: Vec<Track>,
+    pub item_ids: Vec<u64>,
+    pub selected: usize,
+    pub shuffled: bool,
+}
+
 impl PlayQueue {
     pub fn item_id(&self, track_key: &str) -> Option<u64> {
         self.items.iter().find(|(k, _)| k == track_key).map(|(_, id)| *id)
@@ -491,9 +512,73 @@ pub struct Timeline<'a> {
     pub state: &'static str, // "playing" | "paused" | "stopped"
     pub time_ms: u64,
     pub queue: Option<&'a PlayQueue>,
+    pub remote: Option<&'a RemoteQueuePosition>,
 }
 
 impl Server {
+    /// Fetch every window in server order. In particular, never treat the
+    /// first (possibly centered) window as the complete cast playlist.
+    pub fn remote_queue(&self, id: u64) -> Result<RemoteQueue> {
+        let page = |center: Option<u64>, before: bool, after: bool| -> Result<Value> {
+            let mut path = format!("/playQueues/{}?own=1&window=200&includeBefore={}&includeAfter={}", id, u8::from(before), u8::from(after));
+            if let Some(c) = center { path.push_str(&format!("&center={}", c)); }
+            self.get(&path)
+        };
+        let first = page(None, true, true)?;
+        let mc = &first["MediaContainer"];
+        let number = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+        let version = number(&mc["playQueueVersion"]).unwrap_or(0);
+        let selected = number(&mc["playQueueSelectedItemID"]);
+        let total = number(&mc["playQueueTotalCount"]).unwrap_or(0) as usize;
+        let mut metadata: Vec<Value> = items(&first, "Metadata").cloned().collect();
+        let mut seen = std::collections::HashSet::new();
+        for m in &metadata {
+            let item = number(&m["playQueueItemID"]).context("missing play queue item ID")?;
+            if !seen.insert(item) { bail!("duplicate play queue item ID"); }
+        }
+        // Walk outwards from the initial window. The center is an item ID,
+        // never a rating key (a track may occur several times).
+        for backwards in [true, false] {
+            for _ in 0..1000 {
+                if metadata.is_empty() || (total > 0 && metadata.len() >= total) { break; }
+                let edge = if backwards { metadata.first() } else { metadata.last() }.unwrap();
+                let next = page(number(&edge["playQueueItemID"]), backwards, !backwards)?;
+                if number(&next["MediaContainer"]["playQueueVersion"]).unwrap_or(0) != version {
+                    bail!("the cast queue changed while loading; try casting again");
+                }
+                let mut extra = Vec::new();
+                for m in items(&next, "Metadata") {
+                    let item = number(&m["playQueueItemID"]).context("missing play queue item ID")?;
+                    if seen.insert(item) { extra.push(m.clone()); }
+                }
+                if extra.is_empty() { break; }
+                if backwards { extra.append(&mut metadata); metadata = extra; }
+                else { metadata.extend(extra); }
+            }
+        }
+        if total > metadata.len() { bail!("could not load the complete cast queue"); }
+        let mut tracks = Vec::new();
+        let mut item_ids = Vec::new();
+        for m in &metadata {
+            if m["type"].as_str().is_some_and(|t| t != "track") {
+                bail!("Plext only accepts music queues");
+            }
+            let t = parse_track(m);
+            if t.key.is_empty() { bail!("cast queue item has no track key"); }
+            tracks.push(t);
+            item_ids.push(number(&m["playQueueItemID"]).context("missing item ID")?);
+        }
+        let index = selected.and_then(|s| item_ids.iter().position(|i| *i == s)).unwrap_or(0);
+        Ok(RemoteQueue {
+            info: RemoteQueueInfo { id, version }, tracks, item_ids, selected: index,
+            shuffled: mc["playQueueShuffled"].as_bool().unwrap_or_else(|| number(&mc["playQueueShuffled"]) == Some(1)),
+        })
+    }
+
+    pub fn shuffle_remote_queue(&self, id: u64, on: bool) -> Result<RemoteQueue> {
+        self.send("PUT", &format!("/playQueues/{}/{}", id, if on { "shuffle" } else { "unshuffle" }))?;
+        self.remote_queue(id)
+    }
     pub fn new(plex: Plex, base: &str, token: &str, machine_id: &str) -> Server {
         Server {
             plex,
@@ -542,7 +627,10 @@ impl Server {
         if let Some(d) = t.track.duration_ms {
             url.push_str(&format!("&duration={}", d));
         }
-        if let Some(q) = t.queue {
+        if let Some(q) = t.remote {
+            url.push_str(&format!("&containerKey={}&playQueueID={}&playQueueItemID={}&playQueueVersion={}",
+                encode(&format!("/playQueues/{}", q.info.id)), q.info.id, q.item_id, q.info.version));
+        } else if let Some(q) = t.queue {
             url.push_str(&format!("&containerKey={}", encode(&format!("/playQueues/{}", q.id))));
             if let Some(item) = q.item_id(&t.track.key) {
                 url.push_str(&format!("&playQueueItemID={}", item));
@@ -1263,6 +1351,38 @@ fn hostname() -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn companion_queue_loads_windows_in_order_and_retains_duplicate_songs() {
+        let item = |id, key| json!({"type":"track", "ratingKey":key, "playQueueItemID":id});
+        let page = |entries| json!({"MediaContainer": {
+            "playQueueVersion": 3, "playQueueTotalCount": 3,
+            "playQueueSelectedItemID": 102, "Metadata": entries,
+        }});
+        let (base, log) = crate::test_server::start(vec![("GET", "/playQueues/7?", json!({"__seq": [
+            page(vec![item(102, "42")]), page(vec![item(101, "42")]),
+            page(vec![]), page(vec![item(103, "99")]),
+        ]}))]);
+        let server = Server::new(Plex::new("test"), &base, "token", "pms");
+        let q = server.remote_queue(7).unwrap();
+        assert_eq!(q.item_ids, [101, 102, 103]);
+        assert_eq!(q.tracks.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["42", "42", "99"]);
+        assert_eq!(q.selected, 1);
+        assert_eq!(log.lock().unwrap().len(), 4);
+        assert!(log.lock().unwrap()[3].ends_with("&center=102"));
+    }
+
+    #[test]
+    fn companion_reports_the_cast_queue_instead_of_an_unrelated_album_queue() {
+        let (base, log) = crate::test_server::start(vec![]);
+        let server = Server::new(Plex::new("test"), &base, "token", "pms");
+        let t = parse_track(&json!({"ratingKey":"42", "type":"track"}));
+        let remote = RemoteQueuePosition { info: RemoteQueueInfo { id: 7, version: 4 }, item_id: 102 };
+        server.report_timeline(&Timeline { track: &t, state: "playing", time_ms: 12500, queue: None, remote: Some(&remote) }, "session").unwrap();
+        let requests = log.lock().unwrap();
+        assert!(requests[0].contains("playQueueID=7&playQueueItemID=102&playQueueVersion=4"));
+        assert!(requests[0].contains("time=12500"));
+    }
 
     #[test]
     fn user_rating_parses_to_half_star_steps() {

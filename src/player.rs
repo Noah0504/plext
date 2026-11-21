@@ -15,6 +15,13 @@ use std::time::Duration;
 pub enum Cmd {
     /// Replace the queue with these tracks and play from `index`.
     Play { queue: Vec<Track>, index: usize },
+    /// Companion casts start at the supplied offset in one operation, before
+    /// opening the output (rather than racing Play followed by SeekTo).
+    PlayAt { queue: Vec<Track>, index: usize, offset: f64 },
+    PlayRemote { queue: crate::plex::RemoteQueue, offset: f64 },
+    RefreshRemote(crate::plex::RemoteQueue),
+    /// Acknowledges commands previously consumed by the player thread.
+    Barrier(Sender<()>),
     /// Add tracks to the end of the queue.
     Append(Vec<Track>),
     /// Add tracks right after the current one.
@@ -64,6 +71,7 @@ pub enum PlayState {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
+    pub remote: Option<crate::plex::RemoteQueuePosition>,
     pub state: PlayState,
     pub track: Option<Track>,
     pub pos: f64,
@@ -196,6 +204,11 @@ pub struct QueueHandle {
 }
 
 impl QueueHandle {
+    pub fn view(&self) -> QueueView {
+        let q = self.queue.lock().unwrap();
+        QueueView { items: q.items().to_vec(), pos: q.pos(), version: q.version }
+    }
+
     /// The queue to save when quitting, with how far into the current track
     /// playback got. None when the queue is empty.
     pub fn saved(&self, machine_id: &str) -> Option<Saved> {
@@ -282,6 +295,17 @@ impl Engine {
                     self.parked = None;
                     pending = self.play(0.0);
                 }
+                Cmd::PlayAt { queue, index, offset } => {
+                    self.with_queue(|q| q.replace(queue, index));
+                    self.parked = None;
+                    pending = self.play(offset);
+                }
+                Cmd::PlayRemote { queue, offset } => {
+                    self.with_queue(|q| q.replace_remote(queue, false));
+                    self.parked = None;
+                    pending = self.play(offset);
+                }
+                Cmd::Barrier(ack) => { let _ = ack.send(()); }
                 Cmd::TogglePause | Cmd::Resume => {
                     if !self.queue.lock().unwrap().is_empty() {
                         let from = self.parked.take().unwrap_or(0.0);
@@ -353,8 +377,12 @@ impl Engine {
     /// The status while nothing is playing: stopped, or paused on the
     /// current track when parked.
     fn show_idle(&self) {
-        let current = self.queue.lock().unwrap().current().map(|e| e.track.clone());
+        let (current, remote) = {
+            let q = self.queue.lock().unwrap();
+            (q.current().map(|e| e.track.clone()), remote_position(&q))
+        };
         let mut s = self.status.lock().unwrap();
+        s.remote = remote;
         s.output = None;
         match (self.parked, current) {
             (Some(p), Some(t)) => {
@@ -511,7 +539,8 @@ impl Engine {
                 Err(TryRecvError::Disconnected) => return Between::Stop(Some(Cmd::Quit)),
             };
             match cmd {
-                Cmd::Quit | Cmd::Play { .. } | Cmd::Restore(_) => return Between::Stop(Some(cmd)),
+                Cmd::Quit | Cmd::Play { .. } | Cmd::PlayAt { .. } | Cmd::PlayRemote { .. } | Cmd::Restore(_) => return Between::Stop(Some(cmd)),
+                Cmd::Barrier(ack) => { let _ = ack.send(()); }
                 Cmd::Stop => return Between::Stop(None),
                 Cmd::Next => {
                     if !self.with_queue(|q| q.next()) {
@@ -548,7 +577,9 @@ impl Engine {
         start_at: f64,
     ) -> End {
         let track = &entry.track;
+        let remote = remote_position(&self.queue.lock().unwrap());
         self.set(|s| {
+            s.remote = remote;
             s.state = PlayState::Loading;
             s.waiting = false;
             s.started += 1;
@@ -710,7 +741,8 @@ impl Engine {
                     }
                     // Already playing; a stray restore is ignored.
                     Cmd::Restore(_) => {}
-                    c @ (Cmd::Play { .. } | Cmd::Quit) => return End::Command(c),
+                    c @ (Cmd::Play { .. } | Cmd::PlayAt { .. } | Cmd::PlayRemote { .. } | Cmd::Quit) => return End::Command(c),
+                    Cmd::Barrier(ack) => { let _ = ack.send(()); }
                     edit => {
                         let gone = apply_edit(&self.queue, edit);
                         publish(&self.queue, &self.status);
@@ -790,7 +822,7 @@ fn output_failed(track: &Track, e: anyhow::Error) -> End {
 
 /// Copies the queue's position, length, up-next and modes into the status.
 fn publish(queue: &Mutex<Queue>, status: &Mutex<Status>) {
-    let (pos, len, next, shuffle, repeat, version) = {
+    let (pos, len, next, shuffle, repeat, version, remote) = {
         let q = queue.lock().unwrap();
         (
             q.pos(),
@@ -799,6 +831,7 @@ fn publish(queue: &Mutex<Queue>, status: &Mutex<Status>) {
             q.shuffle(),
             q.repeat(),
             q.version,
+            remote_position(&q),
         )
     };
     let mut s = status.lock().unwrap();
@@ -808,6 +841,19 @@ fn publish(queue: &Mutex<Queue>, status: &Mutex<Status>) {
     s.shuffle = shuffle;
     s.repeat = repeat;
     s.queue_version = version;
+    // Keep the playing item's identity until the next track starts, but
+    // publish new queue versions and detach on local content edits.
+    match (&s.remote, &remote) {
+        (_, None) => s.remote = None,
+        (Some(a), Some(b)) if a.info.id == b.info.id && a.item_id == b.item_id => s.remote = remote,
+        _ => {}
+    }
+}
+
+fn remote_position(q: &Queue) -> Option<crate::plex::RemoteQueuePosition> {
+    Some(crate::plex::RemoteQueuePosition {
+        info: q.remote.clone()?, item_id: q.current()?.play_queue_item_id?,
+    })
 }
 
 fn is_edit(cmd: &Cmd) -> bool {
@@ -824,6 +870,7 @@ fn is_edit(cmd: &Cmd) -> bool {
             | Cmd::SetShuffle(_)
             | Cmd::CycleRepeat
             | Cmd::SetRepeat(_)
+            | Cmd::RefreshRemote(_)
     )
 }
 
@@ -831,7 +878,15 @@ fn is_edit(cmd: &Cmd) -> bool {
 /// the track that was current. Commands that aren't edits are ignored.
 fn apply_edit(queue: &Arc<Mutex<Queue>>, cmd: Cmd) -> bool {
     let mut q = queue.lock().unwrap();
+    if !matches!(cmd, Cmd::SetRepeat(_) | Cmd::CycleRepeat | Cmd::RefreshRemote(_)) {
+        q.remote = None;
+    }
     match cmd {
+        Cmd::RefreshRemote(pq) => {
+            if q.remote.as_ref().map(|r| r.id) == Some(pq.info.id) {
+                return q.replace_remote(pq, true);
+            }
+        }
         Cmd::Append(t) => {
             q.append(t);
         }
@@ -875,6 +930,21 @@ mod tests {
     use std::net::TcpListener;
     use std::process::Command;
     use std::time::Instant;
+
+    #[test]
+    fn companion_cast_enters_the_audio_engine_and_preserves_server_queue_ids() {
+        let Some((player, tracks)) = setup() else { return };
+        let queue = crate::plex::RemoteQueue {
+            info: crate::plex::RemoteQueueInfo { id: 7, version: 1 },
+            tracks, item_ids: vec![101, 102, 103], selected: 1, shuffled: false,
+        };
+        let seen = watch(&player, 10, Cmd::PlayRemote { queue, offset: 0.1 }, |p| {
+            assert_eq!(p.status().remote.as_ref().unwrap().item_id, 102);
+        });
+        assert_eq!(seen, ["b", "c"]);
+        let view = player.queue();
+        assert_eq!(view.items[2].play_queue_item_id, Some(103));
+    }
 
     fn have_ffmpeg() -> bool {
         Command::new("ffmpeg").arg("-version").output().is_ok()

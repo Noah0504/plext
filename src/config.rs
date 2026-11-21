@@ -29,6 +29,14 @@ pub struct Config {
     pub group_releases: Option<bool>,
     /// Show in the desktop's media controls and obey media keys (MPRIS). Default: on.
     pub mpris: Option<bool>,
+    /// Allow LAN discovery and Plex Companion remote control. Default: off.
+    pub companion: Option<bool>,
+    /// Companion TCP control port. Default: 32500.
+    pub companion_port: Option<u16>,
+    /// Player name shown in Plexamp. Default: Plext.
+    pub companion_name: Option<String>,
+    /// LAN IPv4 address to advertise. Default: auto-detected.
+    pub companion_address: Option<std::net::Ipv4Addr>,
     /// Show the album cover as pixel art beside what's playing. Default: on.
     pub album_art: Option<bool>,
     /// Color theme: a theme's name ("nord", "gruvbox-light"…), "terminal"
@@ -172,6 +180,16 @@ pub fn new_client_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obsolete_companion_token_does_not_require_another_login() {
+        let cfg: Config = toml::from_str("client_id = \"existing-id\"\naccount_token = \"existing-token\"\ncompanion_token = \"obsolete-token\"\n").unwrap();
+        assert_eq!(cfg.client_id, "existing-id");
+        assert_eq!(cfg.account_token.as_deref(), Some("existing-token"));
+        let saved = toml::to_string(&cfg).unwrap();
+        assert!(!saved.contains("companion_token"));
+        assert!(saved.contains("existing-token"));
+    }
 
     #[test]
     fn the_config_is_private_from_the_start_and_replaced_whole() {

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.0
+
+Plext can now serve as a remotely controlled music player on a headless device.
+Connect the device to your DAC or speakers, run Plext over SSH, and use Plexamp on
+your phone to choose music and control playback.
+Plext plays it through the headless device's configured output.
+
+### New
+
+- **Optional Plex Companion receiver.** Start with `--companion` to make Plext discoverable
+  and controllable on your local network. Remote control is off by default and must be enabled
+  explicitly on each launch.
+- **Control playback from Plexamp.** Send tracks, albums and server play queues to Plext;
+  pause and resume, skip tracks, seek, change shuffle and repeat, and refresh the queue. Playback
+  state and position are sent back to the controller, including changes made in the terminal.
+
 ## 1.0.0
 
 Plext 1.0: search, volume control in desktop-sound mode, color themes, Raspberry Pi builds, and a

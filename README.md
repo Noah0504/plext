@@ -40,6 +40,7 @@ Raspberry Pi.
 - **Desktop media controls (MPRIS).** Plext shows up in your desktop's media controls (GNOME's
   top bar and lock screen, KDE's media applet) with the track and album cover, and the keyboard's
   play/pause, next and previous keys control it.
+- **Plexamp remote control.** Start with `--companion` to allow remote control from Plexamp.
 - **Plex sign-in with a link code**, automatic server discovery, LAN and remote connections.
 - **Single static binary**: no dependencies to install.
 
@@ -148,6 +149,7 @@ sound settings while it plays.
 | `plext inspect search <words>` | Show what your server's search finds for those words (for troubleshooting) |
 | `plext --device <name>` | Play through a different device for this session only |
 | `plext --output <mode>` | Use the other mode (`bitperfect` or `system`) for this session only |
+| `plext --companion` | Enable the Plex Companion receiver for this run only |
 
 ## Keys
 
@@ -362,6 +364,35 @@ kept) and handed to the desktop as local files, so your Plex token never leaves 
 or on a console with no desktop session there's nothing to register with, and Plext simply
 carries on without it. To turn it off, set `mpris = false`.
 
+## Control Plext from Plexamp
+
+Plext can serve as a remotely controlled music player on a headless device.
+Connect the device to your DAC or speakers, run Plext over SSH, and use Plexamp on
+your phone to choose music and control playback.
+Plext plays it through the headless device's configured output.
+
+Start with `--companion` to make Plext discoverable and controllable on your local network.
+Remote control is off by default and must be enabled explicitly on each launch.
+
+```sh
+plext --companion --companion-name "Plext"
+```
+
+Command-line options override the saved settings.
+To keep it enabled, add these settings to `~/.config/plext/config.toml`
+
+```toml
+companion = true
+# companion_name = "Plext"            # Default: Plext
+# companion_port = 32500              # Default: 32500
+# companion_address = "192.168.1.110" # Default: auto-detected LAN IPv4 address
+```
+
+The default control port is **TCP 32500**. Discovery uses local GDM: UDP 32412,
+with multicast announcements to 239.0.0.250:32413 and replies to discovery requests.
+
+This implements the [Plex Companion receiver protocol](https://github.com/plexinc/plex-media-player/wiki/Remote-control-API).
+
 ## Themes
 
 Press `T` for the theme picker. Each theme shows as you move through the list; `Enter` keeps it
@@ -455,6 +486,7 @@ holds your Plex sign-in token, so Plext keeps it readable only by you.
 | --- | --- | --- |
 | `output` | `bitperfect` | `bitperfect` (ALSA, straight to the DAC) or `system` (PipeWire/PulseAudio); set it with `plext output` |
 | `device` | first USB DAC | ALSA device for bit-perfect mode; set it with `plext device <name>` |
+| `companion` | `true` | to make Plext discoverable and controllable on your local network. |
 | `sink` | desktop default | PipeWire/PulseAudio output for desktop-sound mode; set it with `plext device <name>` |
 | `report_playback` | `true` | Report playback to Plex (dashboard, history, webhooks) |
 | `group_releases` | `true` | Group an artist's releases under headings (Albums, EPs, Live…). With `false`, they're one list, oldest first |

@@ -38,6 +38,7 @@ const RATING_W: usize = 7;
 pub const SEARCH_LIMIT: usize = 30;
 
 enum Msg {
+    Companion(Cmd, Sender<()>),
     /// A cover finished turning into pixel art (keyed by its Plex thumb path).
     /// The third value is the width in columns it was made for.
     Art(String, usize, Result<PixelArt, String>),
@@ -62,7 +63,7 @@ enum Msg {
     /// What a search found.
     Found(search::Found),
     /// A sonic adventure's path, from the track that was playing.
-    Adventure { from: String, to: String, result: Result<Vec<Track>, String> },
+    Adventure { from: String, to: String, cast_generation: u64, result: Result<Vec<Track>, String> },
     /// A rating change finished saving to Plex (or failed to).
     Rated {
         key: String,
@@ -168,6 +169,8 @@ pub struct App {
     player: Player,
     _reporter: Option<Reporter>,
     _mpris: Option<Mpris>,
+    _companion: Option<crate::companion::Companion>,
+    cast_generation: u64,
     /// Changes Plext's volume in desktop-sound mode (None in bit-perfect mode).
     mixer: Option<Mixer>,
     covers: Option<Covers>,
@@ -295,6 +298,8 @@ impl App {
         let mut app = App {
             _reporter: reporter,
             _mpris: mpris,
+            _companion: None,
+            cast_generation: 0,
             mixer,
             covers,
             album_art,
@@ -358,11 +363,26 @@ impl App {
         app
     }
 
+    pub fn enable_companion(&mut self, settings: crate::companion::Settings) -> Result<()> {
+        let tx = self.tx.clone();
+        let receiver = crate::companion::Companion::spawn(settings, self.server.clone(),
+            self.player.status_handle(), self.player.queue_handle(), self.mixer.clone(), move |cmd| {
+                let (ack, done) = mpsc::channel();
+                tx.send(Msg::Companion(cmd, ack)).map_err(|_| anyhow::anyhow!("UI has stopped"))?;
+                done.recv_timeout(Duration::from_secs(5)).map_err(|_| anyhow::anyhow!("player is busy"))?;
+                Ok(())
+            })?;
+        self._companion = Some(receiver);
+        Ok(())
+    }
+
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         // Whatever ends the loop (q, a signal, or the terminal going away so
         // drawing fails), the queue is saved.
         let result = self.event_loop(terminal);
         self.queue_saver()();
+        // Stop accepting network commands before shutting down the player.
+        self._companion = None;
         self.player.send(Cmd::Stop);
         result
     }
@@ -600,6 +620,17 @@ impl App {
 
     fn on_msg(&mut self, m: Msg) {
         match m {
+            Msg::Companion(cmd, ack) => {
+                if matches!(cmd, Cmd::PlayAt { .. } | Cmd::PlayRemote { .. }) {
+                    self.cast_generation = self.cast_generation.wrapping_add(1);
+                    self.new_queue();
+                    self.when_loaded.clear();
+                    self.playlist_when_loaded.clear();
+                    self.search.cancel_pending_play();
+                }
+                self.player.send(cmd);
+                self.player.send(Cmd::Barrier(ack));
+            }
             Msg::Art(thumb, cols, r) => {
                 if let Some(slot) = self.art.as_mut().filter(|a| a.thumb == thumb && a.cols == cols) {
                     slot.state = match r {
@@ -677,7 +708,9 @@ impl App {
             Msg::Shelf(id, r) => self.on_shelf(id, r),
             Msg::Radio(b) => self.on_radio(b),
             Msg::Found(r) => self.on_found(r),
-            Msg::Adventure { from, to, result } => self.on_adventure(from, to, result),
+            Msg::Adventure { from, to, cast_generation, result } => {
+                if cast_generation == self.cast_generation { self.on_adventure(from, to, result); }
+            }
             Msg::Rated { key, wanted, previous, result } => {
                 if let Some(n) = self.pending_ratings.get_mut(&key) {
                     *n = n.saturating_sub(1);
@@ -2560,6 +2593,31 @@ mod tests {
         app.shown_album = Some(("Cat Power".into(), album));
         app.focus = Focus::Tracks;
         app
+    }
+
+    #[test]
+    fn companion_cast_cancels_pending_local_playback_and_reaches_player() {
+        let mut app = app_with_album(vec![track("1", 1, "Local", None)]);
+        app.when_loaded.push(("100".into(), Action::Play(0)));
+        app.playlist_when_loaded.push(("20".into(), Action::Play(0)));
+        let (ack, done) = mpsc::channel();
+        app.on_msg(Msg::Companion(Cmd::PlayRemote {
+            queue: crate::plex::RemoteQueue {
+                info: crate::plex::RemoteQueueInfo { id: 7, version: 1 },
+                tracks: vec![track("2", 1, "Cast", None)], item_ids: vec![102], selected: 0, shuffled: false,
+            }, offset: 0.0,
+        }, ack));
+        done.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(app.when_loaded.is_empty());
+        assert!(app.playlist_when_loaded.is_empty());
+        assert!(app.radio.is_none() && app.feed.is_none());
+        assert_eq!(app.player.queue().items[0].track.key, "2");
+        app.on_msg(Msg::Adventure {
+            from: "1".into(), to: "Old pending request".into(), cast_generation: 0,
+            result: Ok(vec![track("3", 1, "Stale", None)]),
+        });
+        assert_eq!(app.player.queue().items.len(), 1);
+        assert_eq!(app.player.queue().items[0].track.key, "2");
     }
 
     fn render(app: &mut App, st: &Status) -> Vec<String> {

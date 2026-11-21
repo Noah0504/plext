@@ -57,6 +57,10 @@ impl Default for Search {
 }
 
 impl Search {
+    pub(super) fn cancel_pending_play(&mut self) {
+        self.play_when_loaded = None;
+    }
+
     /// The album couldn't load: don't play it when it does.
     pub(super) fn forget_play(&mut self, album: &str) {
         if self.play_when_loaded.as_ref().map(|(a, _)| a == album).unwrap_or(false) {

@@ -49,13 +49,15 @@ struct Last {
     state: PlayState,
     pos: f64,
     sent_at: Instant,
+    remote: Option<crate::plex::RemoteQueuePosition>,
+    started: u64,
 }
 
 fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc<AtomicBool>) {
     let mut queues: HashMap<String, Option<PlayQueue>> = HashMap::new();
     let mut last: Option<Last> = None;
 
-    let send = |track: &Track, state: &'static str, pos: f64, queues: &HashMap<String, Option<PlayQueue>>| {
+    let send = |track: &Track, state: &'static str, pos: f64, queues: &HashMap<String, Option<PlayQueue>>, remote: Option<&crate::plex::RemoteQueuePosition>| {
         let queue = track
             .album_key
             .as_ref()
@@ -66,6 +68,7 @@ fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc
             state,
             time_ms: (pos.max(0.0) * 1000.0) as u64,
             queue,
+            remote,
         };
         // Reporting is best-effort: a failure must never interrupt playback.
         let _ = server.report_timeline(&t, &session_id);
@@ -85,9 +88,9 @@ fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc
 
         // The previous track ended, was skipped, or playback stopped.
         if let Some(l) = &last {
-            let same = current.map(|t| t.key == l.track.key).unwrap_or(false);
+            let same = current.map(|t| t.key == l.track.key && st.started == l.started).unwrap_or(false);
             if !same {
-                send(&l.track, "stopped", l.pos, &queues);
+                send(&l.track, "stopped", l.pos, &queues, l.remote.as_ref());
                 last = None;
             }
         }
@@ -98,23 +101,26 @@ fn run(server: Server, status: Arc<Mutex<Status>>, session_id: String, stop: Arc
                 None => true,
                 Some(l) => {
                     l.state != st.state
+                        || l.remote != st.remote
                         || (st.pos - l.pos).abs() > 3.0 // a seek (pos is tracked every tick)
                         || (st.state == PlayState::Playing && l.sent_at.elapsed() >= INTERVAL)
                 }
             };
             if due {
-                if let Some(album) = &track.album_key {
+                if let Some(album) = track.album_key.as_ref().filter(|_| st.remote.is_none()) {
                     if !queues.contains_key(album) {
                         let q = server.create_play_queue(album).ok();
                         queues.insert(album.clone(), q);
                     }
                 }
-                send(track, state, st.pos, &queues);
+                send(track, state, st.pos, &queues, st.remote.as_ref());
                 last = Some(Last {
                     track: track.clone(),
                     state: st.state,
                     pos: st.pos,
                     sent_at: Instant::now(),
+                    remote: st.remote.clone(),
+                    started: st.started,
                 });
             } else if let Some(l) = last.as_mut() {
                 l.pos = st.pos;

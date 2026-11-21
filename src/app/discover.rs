@@ -445,9 +445,10 @@ impl App {
         }
         self.say(format!("Finding a way from {} to {}…", from.title, target.title));
         let (s, lib, tx) = (self.server.clone(), self.library_key.clone(), self.tx.clone());
+        let cast_generation = self.cast_generation;
         thread::spawn(move || {
             let r = s.sonic_path(&lib, &from.key, &target.key).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Adventure { from: from.key, to: target.title, result: r });
+            let _ = tx.send(Msg::Adventure { from: from.key, to: target.title, cast_generation, result: r });
         });
     }
 

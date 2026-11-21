@@ -40,10 +40,15 @@ impl Repeat {
 pub struct Entry {
     pub id: u64,
     pub track: Track,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_queue_item_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Queue {
+    /// A server queue cast by a Companion controller. Local content edits
+    /// detach it rather than advertising a server queue we no longer follow.
+    pub remote: Option<crate::plex::RemoteQueueInfo>,
     items: Vec<Entry>,
     /// Index of the current track in `items`. Equal to `items.len()` only
     /// when the queue is empty.
@@ -100,7 +105,7 @@ impl Queue {
             .into_iter()
             .map(|track| {
                 self.next_id += 1;
-                Entry { id: self.next_id, track }
+                Entry { id: self.next_id, track, play_queue_item_id: None }
             })
             .collect()
     }
@@ -108,6 +113,7 @@ impl Queue {
     /// Replaces the queue with `tracks`, starting at `index`. With shuffle
     /// on, that track plays first and the rest follow in shuffled order.
     pub fn replace(&mut self, tracks: Vec<Track>, index: usize) {
+        self.remote = None;
         self.items = self.entries(tracks);
         self.pos = index.min(self.items.len().saturating_sub(1));
         if self.items.is_empty() {
@@ -123,6 +129,30 @@ impl Queue {
             self.shuffle_upcoming();
         }
         self.changed();
+    }
+
+    /// Reuses entry IDs on refresh, so refreshing metadata/upcoming tracks
+    /// doesn't interrupt the currently decoding track. Duplicate songs have
+    /// distinct server item IDs.
+    pub fn replace_remote(&mut self, pq: crate::plex::RemoteQueue, refresh: bool) -> bool {
+        let same = self.remote.as_ref().map(|r| r.id) == Some(pq.info.id);
+        let old = self.current().and_then(|e| e.play_queue_item_id);
+        let mut previous = if same { std::mem::take(&mut self.items) } else { Vec::new() };
+        self.items = pq.tracks.into_iter().zip(pq.item_ids).map(|(track, item_id)| {
+            let id = previous.iter().position(|e| e.play_queue_item_id == Some(item_id))
+                .map(|i| previous.swap_remove(i).id)
+                .unwrap_or_else(|| { self.next_id += 1; self.next_id });
+            Entry { id, track, play_queue_item_id: Some(item_id) }
+        }).collect();
+        self.pos = if refresh && same {
+            self.items.iter().position(|e| e.play_queue_item_id == old).unwrap_or(pq.selected)
+        } else { pq.selected };
+        self.pos = self.pos.min(self.items.len().saturating_sub(1));
+        self.shuffle = pq.shuffled;
+        self.unshuffled = self.ids();
+        self.remote = Some(pq.info);
+        self.changed();
+        refresh && old != self.current().and_then(|e| e.play_queue_item_id)
     }
 
     /// Forgets all but the last `keep` tracks already played (those before
@@ -488,6 +518,27 @@ pub fn load(machine_id: &str) -> Option<Saved> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_refresh_keeps_duplicate_item_identity_and_playback_position() {
+        use crate::plex::{RemoteQueue, RemoteQueueInfo};
+        let make = |version, item_ids: Vec<u64>, selected| RemoteQueue {
+            info: RemoteQueueInfo { id: 7, version },
+            tracks: item_ids.iter().map(|_| t("42")).collect(), item_ids, selected, shuffled: false,
+        };
+        let mut q = Queue::new();
+        q.replace_remote(make(1, vec![101, 102, 103], 1), false);
+        let current_id = q.current().unwrap().id;
+        assert_eq!(q.current().unwrap().play_queue_item_id, Some(102));
+        // PMS's selected item can be stale; keep the item actually decoding.
+        assert!(!q.replace_remote(make(2, vec![103, 102, 104], 0), true));
+        assert_eq!(q.current().unwrap().id, current_id);
+        assert_eq!(q.current().unwrap().play_queue_item_id, Some(102));
+        assert_eq!(q.remote.as_ref().unwrap().version, 2);
+        assert!(q.replace_remote(make(3, vec![103, 104], 0), true), "removing the playing item requests reload");
+        q.replace(vec![t("9")], 0);
+        assert!(q.remote.is_none(), "local playback detaches the remote queue");
+    }
 
     fn t(key: &str) -> Track {
         Track {

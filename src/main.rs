@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod companion;
 mod covers;
 mod decode;
 mod download;
@@ -34,8 +35,14 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "plext", version, about = "A terminal music player for Plex with bit-perfect playback")]
+#[command(
+    name = "plext",
+    version,
+    about = "A terminal music player for Plex with bit-perfect playback"
+)]
 struct Cli {
+    #[command(flatten)]
+    companion: CompanionArgs,
     /// Device to play through for this session: an ALSA device in bit-perfect
     /// mode (e.g. hw:CARD=DAC,DEV=0), a PipeWire/PulseAudio output in system mode
     #[arg(short, long, global = true)]
@@ -47,6 +54,52 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(clap::Args, Default)]
+struct CompanionArgs {
+    /// Enable remote control (default: true)
+    #[arg(short = 'c', long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    companion: Option<bool>,
+    /// TCP control port (default: 32500)
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    companion_port: Option<u16>,
+    /// Player name shown on the Plexamp (default: Plext)
+    #[arg(long)]
+    companion_name: Option<String>,
+    /// This machine's LAN IPv4 address to advertise (auto-detected by default)
+    #[arg(long)]
+    companion_address: Option<std::net::Ipv4Addr>,
+}
+
+impl CompanionArgs {
+    fn is_present(&self) -> bool {
+        self.companion.is_some()
+            || self.companion_port.is_some()
+            || self.companion_name.is_some()
+            || self.companion_address.is_some()
+    }
+
+    fn settings(&self, cfg: &Config, server_url: &str) -> Result<Option<companion::Settings>> {
+        if !self.companion.or(cfg.companion).unwrap_or(false) {
+            return Ok(None);
+        }
+        let address = match self.companion_address.or(cfg.companion_address) {
+            Some(ip) => ip,
+            None => companion::local_address(server_url)?,
+        };
+        companion::Settings::new(
+            self.companion_port.or(cfg.companion_port).unwrap_or(32500),
+            self.companion_name
+                .as_ref()
+                .or(cfg.companion_name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "Plext".into()),
+            address,
+            cfg.client_id.clone(),
+        )
+        .map(Some)
+    }
 }
 
 #[derive(Subcommand)]
@@ -82,6 +135,9 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.companion.is_present() && cli.command.is_some() {
+        bail!("Companion options are playback options; use `plext -c`");
+    }
     let mut cfg = Config::load()?;
 
     match cli.command {
@@ -167,7 +223,7 @@ fn real_main() -> Result<()> {
                 inspect(&mut cfg, name.strip_prefix("artist:").unwrap_or(&name))
             }
         }
-        None => run(&mut cfg, cli.output, cli.device),
+        None => run(&mut cfg, cli.output, cli.device, cli.companion),
     }
 }
 
@@ -206,7 +262,7 @@ fn sink_desc(s: &pulse::ServerSummary, name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Option<String>) -> Result<()> {
+fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Option<String>, companion: CompanionArgs) -> Result<()> {
     if cfg.account_token.is_none() || cfg.server.is_none() || cfg.library.is_none() {
         println!("Welcome to Plext! Let's connect to your Plex server first.\n");
         login(cfg)?;
@@ -215,6 +271,11 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
     let plex_client = Plex::new(&cfg.client_id);
     let server_cfg = connect(&plex_client, cfg)?;
     let library = cfg.library.clone().context("no library chosen; run `plext login`")?;
+
+    let receiver = companion.settings(cfg, &server_cfg.url)?;
+    if let Some(settings) = &receiver {
+        log::write(&format!("companion: LAN discovery for {} at {}", settings.name, settings.uri()));
+    }
 
     let mode = mode_override.unwrap_or(cfg.output_mode());
     let target = target_for(cfg, mode, device_override);
@@ -227,7 +288,6 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
     };
 
     signals::install();
-    let mut terminal = ratatui::init();
     let mut app = app::App::new(
         server,
         library.key,
@@ -240,6 +300,8 @@ fn run(cfg: &mut Config, mode_override: Option<OutputMode>, device_override: Opt
     );
     app.use_theme(cfg.theme_settings());
     app.restore_queue();
+    if let Some(settings) = receiver { app.enable_companion(settings)?; }
+    let mut terminal = ratatui::init();
     signals::watch_hangup(app.queue_saver());
     let result = app.run(&mut terminal);
     if signals::hung_up() {
